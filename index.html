@@ -160,7 +160,7 @@
         <i class="ph ph-chat-circle-dots"></i>
         <span class="em" id="chat-title">new session</span>
         <span class="sep">·</span>
-        <span id="chat-meta">local</span>
+        <span id="chat-meta" aria-live="polite"></span>
       </div>
       <div class="actions">
         <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
@@ -204,6 +204,10 @@
         <span class="provider-session-banner-text" id="provider-session-banner-text"></span>
         <button type="button" class="chip" id="btn-provider-new-session" hidden>Start new session</button>
       </div>
+      <div class="provider-session-unavailable" id="provider-session-unavailable" hidden>
+        <span class="provider-session-unavailable-text" id="provider-session-unavailable-text"></span>
+        <button type="button" class="chip" id="btn-provider-reconnect">Open Settings</button>
+      </div>
 
       <div class="composer-wrap">
         <div class="composer">
@@ -242,7 +246,7 @@
           <div class="composer-foot">
             <span class="composer-hint">⌘⏎ send · Shift⏎ newline</span>
             <div class="composer-foot-actions">
-              <button class="model-pill" id="model-pill" title="Click to change model"><span class="model-pill-name">select model</span><i class="ph ph-caret-down model-pill-caret"></i></button>
+              <button class="model-pill" id="model-pill" type="button" title="Session provider" aria-label="Session provider"><span class="model-pill-name"></span><i class="ph ph-caret-down model-pill-caret"></i></button>
               <div class="model-pill-menu" id="model-pill-menu" role="listbox" aria-label="Pick a model"></div>
               <button class="btn accent hidden" id="btn-stop" title="Stop streaming"><i class="ph-fill ph-stop"></i></button>
               <button class="btn accent" id="btn-send" title="Send (⌘⏎)"><i class="ph-bold ph-arrow-up"></i></button>
@@ -549,9 +553,10 @@
   <div class="drawer-body" id="settings-body">
     <div class="form-group">Provider</div>
     <div class="form-row" id="provider-section">
-      <label for="set-provider">Inference provider</label>
-      <select id="set-provider" aria-describedby="set-provider-hint provider-status-line provider-readiness"></select>
-      <span class="hint" id="set-provider-hint">Choose Local llama.cpp or Codex via ChatGPT. Signing in with ChatGPT does not change this selection. OpenAI API keys remain a separate experimental option.</span>
+      <label for="set-provider">Default inference provider (new sessions)</label>
+      <select id="set-provider" aria-describedby="set-provider-hint provider-status-line provider-readiness provider-session-context"></select>
+      <span class="hint" id="set-provider-hint">Chooses the provider for <em>new</em> sessions only. The open session keeps its bound provider until you start a new one. Signing in with ChatGPT does not change this selection. OpenAI API keys remain a separate experimental option.</span>
+      <div id="provider-session-context" class="hint" style="margin-top:8px;" role="status" aria-live="polite"></div>
       <div id="provider-readiness" class="hint" style="margin-top:6px;" role="status" aria-live="polite" aria-atomic="true"></div>
       <div id="provider-status-line" class="hint" style="margin-top:4px;" role="status" aria-live="polite"></div>
       <div id="openai-key-row" style="display:none;margin-top:10px;">

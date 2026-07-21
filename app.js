@@ -2069,8 +2069,7 @@
     }
 
     applyTheme(state.settings.theme || "light");
-    renderStatus();
-    renderModelPill();
+    refreshSessionProviderUI();
     renderChatList();
     renderWorkspace();
     reflectIdeToggles();
@@ -2216,7 +2215,7 @@
     const ta = $("#composer-input");
     ta.value = "";
     autoResize(ta);
-    updateProviderSessionBanner();
+    refreshSessionProviderUI();
   }
 
   function selectChat(id) {
@@ -2307,7 +2306,7 @@
       state.mobileTab = "chat";
       applyMobileTab();
     }
-    updateProviderSessionBanner();
+    refreshSessionProviderUI();
     // start context-stats polling
     clearInterval(state._ctxPoll);
     state._ctxPoll = setInterval(async () => {
@@ -2979,16 +2978,14 @@
     }
 
     const tokTip = m.tokens ? ` title="${m.tokens.toLocaleString()} tokens"` : "";
-    const agentLabel = m.role === "user"
-      ? "you"
-      : (m.provider_label || m.providerLabel || _providerLabelForId(m.provider_id) || state.settings.model || "agent");
+    const agentLabel = assistantResponseLabel(m);
     row.innerHTML = `
       ${avatar}
       <div class="bubble-col">
         ${thoughtChip}
         <div class="bubble ${m.role === "user" ? "user" : "agent"}">${renderMarkdown(visible)}</div>
         ${cascadeChips}
-        <div class="bubble-meta"${tokTip}>${agentLabel} · ${relTime(m.t)}</div>
+        <div class="bubble-meta"${tokTip}>${esc(agentLabel)} · ${relTime(m.t)}</div>
       </div>`;
     
     // (Cascade click listeners are now handled via event delegation on #chat-inner)
@@ -3336,22 +3333,117 @@
     return null;
   }
 
-  /** Session-bound provider (source of truth for routing this chat). */
+  /**
+   * Session-bound provider for the open chat.
+   * Legacy chats without inference_provider_id → local_llama (never Settings).
+   * Returns null only before a chat is selected (avoids false local/Codex flash).
+   */
   function _sessionInferenceProviderId() {
-    const chat = state.chatId && state.chats?.chats?.[state.chatId];
-    const sid = chat?.inference_provider_id;
+    if (!state.chatId || !state.chats?.chats) return null;
+    const chat = state.chats.chats[state.chatId];
+    if (!chat) return null;
+    const sid = chat.inference_provider_id;
     if (sid === "codex_chatgpt" || sid === "local_llama" || sid === "openai") return sid;
-    return _activeInferenceProviderId();
+    // Legacy migration: missing metadata ⇒ Local (document in session_binding.py).
+    if (typeof sid === "string" && sid.trim()) return sid.trim();
+    return "local_llama";
   }
 
   function _sessionInferenceProviderLabel() {
-    const chat = state.chatId && state.chats?.chats?.[state.chatId];
+    const pid = _sessionInferenceProviderId();
+    if (!pid) return "";
+    const chat = state.chats?.chats?.[state.chatId];
     if (chat?.inference_provider_label) return chat.inference_provider_label;
-    return _providerLabelForId(_sessionInferenceProviderId()) || "agent";
+    return _providerLabelForId(pid) || pid;
   }
 
   function _activeInferenceProviderId() {
     return state.settings?.provider_id || state.selectedProviderId || "local_llama";
+  }
+
+  /** Safe model label from the last assistant turn that carries verified metadata. */
+  function _sessionVerifiedModelLabel() {
+    const msgs = state.messages || [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (!m || m.role !== "assistant") continue;
+      const label = m.model_label || m.modelLabel;
+      if (typeof label === "string" && label.trim()) return label.trim();
+    }
+    return null;
+  }
+
+  function _codexSessionUnavailableReason() {
+    if (_sessionInferenceProviderId() !== "codex_chatgpt") return null;
+    const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
+    if (cx && cx.selectable) return null;
+    return (cx && (cx.selectionDisabledReason || cx.disabledReason))
+      || "Codex is unavailable. Reconnect in Settings — this session stays Codex and will not fall back to local.";
+  }
+
+  function assistantResponseLabel(m) {
+    if (!m || m.role === "user") return "you";
+    const pid = m.provider_id || m.providerId || null;
+    const label = m.provider_label || m.providerLabel || _providerLabelForId(pid);
+    const modelLabel = (typeof (m.model_label || m.modelLabel) === "string")
+      ? String(m.model_label || m.modelLabel).trim()
+      : "";
+    // Never invent cloud model names (e.g. GPT-4). Only show model_label when
+    // the backend persisted it on this response.
+    if (label) {
+      if (modelLabel) return `${label} · ${shortenModelName(modelLabel)}`;
+      return label;
+    }
+    // Legacy assistant bubble without provider metadata → Local.
+    if (modelLabel) return `Local llama.cpp · ${shortenModelName(modelLabel)}`;
+    const localStem = state.settings?.model
+      ? shortenModelName(String(state.settings.model).split(/[\\/]/).pop())
+      : "";
+    return localStem ? `Local llama.cpp · ${localStem}` : "Local llama.cpp";
+  }
+
+  function updateChatMeta() {
+    const el = $("#chat-meta");
+    if (!el) return;
+    const pid = _sessionInferenceProviderId();
+    if (!pid) {
+      el.textContent = "";
+      el.title = "";
+      return;
+    }
+    const label = _sessionInferenceProviderLabel();
+    el.textContent = label;
+    el.title = `This session uses ${label}`;
+    el.dataset.providerId = pid;
+  }
+
+  function updateProviderSessionContext() {
+    const el = $("#provider-session-context");
+    if (!el) return;
+    const settingsPid = _activeInferenceProviderId();
+    const settingsLabel = _providerLabelForId(settingsPid) || settingsPid;
+    const sessionPid = _sessionInferenceProviderId();
+    const sessionLabel = sessionPid
+      ? (_sessionInferenceProviderLabel() || _providerLabelForId(sessionPid) || sessionPid)
+      : "(no session open)";
+    el.innerHTML =
+      `<strong>Default for new sessions:</strong> ${esc(settingsLabel)}<br>` +
+      `<strong>This session:</strong> ${esc(sessionLabel)}`;
+  }
+
+  function updateProviderSessionUnavailable() {
+    const bar = $("#provider-session-unavailable");
+    const textEl = $("#provider-session-unavailable-text");
+    if (!bar || !textEl) return;
+    const reason = _codexSessionUnavailableReason();
+    if (!reason) {
+      bar.hidden = true;
+      textEl.textContent = "";
+      return;
+    }
+    // Keep session labelled Codex — never relabel as Local.
+    textEl.textContent = reason;
+    bar.hidden = false;
   }
 
   function updateProviderSessionBanner() {
@@ -3359,25 +3451,24 @@
     const textEl = $("#provider-session-banner-text");
     const btn = $("#btn-provider-new-session");
     if (!banner || !textEl) return;
-    const chat = state.chatId && state.chats?.chats?.[state.chatId];
-    if (!chat || !chat.inference_provider_id) {
+    const sessionPid = _sessionInferenceProviderId();
+    if (!sessionPid) {
       banner.hidden = true;
       if (btn) btn.hidden = true;
       return;
     }
-    const sessionPid = chat.inference_provider_id;
     const settingsPid = _activeInferenceProviderId();
     if (sessionPid === settingsPid) {
       banner.hidden = true;
       if (btn) btn.hidden = true;
       return;
     }
-    const sessionLabel = chat.inference_provider_label
+    const sessionLabel = _sessionInferenceProviderLabel()
       || _providerLabelForId(sessionPid)
       || sessionPid;
     const settingsLabel = _providerLabelForId(settingsPid) || settingsPid;
     textEl.textContent =
-      `This session uses ${sessionLabel}. Start a new session to use ${settingsLabel}.`;
+      `This session uses ${sessionLabel}. New sessions will use ${settingsLabel}.`;
     banner.hidden = false;
     if (btn) {
       btn.hidden = false;
@@ -3387,6 +3478,16 @@
           ? "Start new Local session"
           : "Start new session";
     }
+  }
+
+  /** Refresh all chrome that reflects the session-bound provider. */
+  function refreshSessionProviderUI() {
+    updateChatMeta();
+    updateProviderSessionBanner();
+    updateProviderSessionUnavailable();
+    updateProviderSessionContext();
+    renderModelPill();
+    renderStatus();
   }
 
   async function startNewSessionForSettingsProvider() {
@@ -3402,7 +3503,7 @@
       }
     }
     await newChat();
-    updateProviderSessionBanner();
+    refreshSessionProviderUI();
   }
 
   // ---------- send / stream ----------
@@ -4732,14 +4833,15 @@
       const lastRow = rows.reverse().find(r => r.querySelector(".bubble.agent"));
       if (lastRow) {
         const meta = lastRow.querySelector(".bubble-meta");
-        if (meta && msg.tokens) {
-          meta.title = `${msg.tokens.toLocaleString()} tokens${msg.prompt_tokens ? ` (prompt: ${msg.prompt_tokens.toLocaleString()})` : ""}`;
-        }
-        if (meta && msg.provider_label) {
-          const tip = meta.title || "";
-          meta.textContent = `${msg.provider_label} · ${relTime(msg.t)}`;
+        if (meta) {
+          const tip = (msg.tokens)
+            ? `${msg.tokens.toLocaleString()} tokens${msg.prompt_tokens ? ` (prompt: ${msg.prompt_tokens.toLocaleString()})` : ""}`
+            : (meta.title || "");
+          meta.textContent = `${assistantResponseLabel(msg)} · ${relTime(msg.t)}`;
           if (tip) meta.title = tip;
         }
+        renderModelPill();
+        renderStatus();
         // Final-event bubble re-render: the streaming deltas can race or miss
         // a fence boundary, leaving the bubble blank when the model emitted
         // pure-code (one giant ```html```) or only-thinking-then-fence. The
@@ -4787,11 +4889,12 @@
       renderRegenerateChip();
     } else if (evt.type === "notice") {
       if (evt.code === "provider_session_mismatch") {
-        updateProviderSessionBanner();
+        refreshSessionProviderUI();
         toast(evt.note || "", "info", 5200, "provider-session-mismatch");
       } else {
         toast(evt.note || "", "info", 3000, "ctx-notice");
-      } else if (evt.type === "breach") {
+      }
+    } else if (evt.type === "breach") {
       // Cyber-range / CTF: a FLAG{...} was captured in a tool response = a
       // confirmed breach. Advance the attack-chain rail and surface a toast.
       attackRailBreach(row, evt.stage);
@@ -6998,27 +7101,27 @@
     const status = $("#provider-status-line");
     if (status) {
       if (!current) {
-        status.textContent = "Using Local llama.cpp.";
+        status.textContent = "Default for new sessions: Local llama.cpp.";
       } else if (current.providerId === "codex_chatgpt") {
         if (current.selectable) {
-          status.textContent = "Codex via ChatGPT is selected. Chat uses your connected ChatGPT plan — not the local model.";
+          status.textContent = "Default for new sessions: Codex via ChatGPT (ChatGPT plan). The open session keeps its own provider until you start a new one.";
         } else {
           const why = current.selectionDisabledReason
             || (current.inferenceAvailability && current.inferenceAvailability.selectionDisabledReason)
             || current.disabledReason
             || "unavailable";
-          status.textContent = `Codex is selected but unavailable (${why}). Choose Local llama.cpp to chat locally, or fix Codex readiness above.`;
+          status.textContent = `Codex is the default for new sessions but is unavailable (${why}). Existing Codex sessions stay labelled Codex and will not fall back to local.`;
         }
       } else if (!current.available) {
         status.textContent = current.disabledReason || "This provider is unavailable.";
       } else if (current.providerId === "local_llama") {
-        status.textContent = "Local llama.cpp — runs on this machine. No cloud account required.";
+        status.textContent = "Default for new sessions: Local llama.cpp — runs on this machine. No cloud account required.";
       } else if (current.providerId === "openai") {
         const bits = [];
         if (current.credentialStored) bits.push(current.credentialValidated ? "key validated" : "key stored");
         else bits.push("not connected");
         if (current.experimental) bits.push("experimental");
-        status.textContent = `OpenAI API — ${bits.join(", ")}. Billed separately by OpenAI.`;
+        status.textContent = `Default for new sessions: OpenAI API — ${bits.join(", ")}. Billed separately by OpenAI.`;
       } else {
         status.textContent = current.authenticated ? "Connected." : "Not connected.";
       }
@@ -7026,6 +7129,8 @@
         status.textContent = (status.textContent ? status.textContent + " " : "") + state.providerWarning;
       }
     }
+    updateProviderSessionContext();
+    updateProviderSessionUnavailable();
     const isOpenAI = !!(current && current.providerId === "openai");
     const isCodex = !!(current && current.providerId === "codex_chatgpt");
     const keyRow = $("#openai-key-row");
@@ -7689,7 +7794,7 @@
       state.selectedProviderId = state.settings.provider_id;
       await loadProviders();
       populateProviderForm();
-      updateProviderSessionBanner();
+      refreshSessionProviderUI();
       toast("provider updated", "ok", 1800);
     } catch (e) {
       toast("provider update failed", "error");
@@ -8680,8 +8785,27 @@
     
     const isStreaming = !!state.streaming || stateStr === "streaming";
     const statusText = stateStr || (isStreaming ? "streaming" : "idle");
-    
-    const modelName = state.settings.model || "no model loaded";
+
+    const sessionPid = _sessionInferenceProviderId();
+    const sessionLabel = _sessionInferenceProviderLabel();
+    let modelName = "";
+    if (!sessionPid) {
+      modelName = "…";
+    } else if (sessionPid === "codex_chatgpt") {
+      const verified = _sessionVerifiedModelLabel();
+      modelName = verified
+        ? `${sessionLabel} · ${shortenModelName(verified)}`
+        : sessionLabel || "Codex via ChatGPT";
+    } else if (sessionPid === "openai") {
+      const om = state.settings.openai_model || _sessionVerifiedModelLabel() || "";
+      modelName = om
+        ? `${sessionLabel} · ${shortenModelName(om)}`
+        : (sessionLabel || "OpenAI API");
+    } else {
+      const local = state.settings.model || state.loadedModel || "";
+      const short = local ? shortenModelName(String(local).split(/[\\/]/).pop()) : "no model loaded";
+      modelName = `${sessionLabel || "Local llama.cpp"} · ${short}`;
+    }
     
     const ctxUse = computeCtxUsage();
     const ctxLimit = ctxUse.capacity >= 1024 ? Math.round(ctxUse.capacity / 1024) + "k" : ctxUse.capacity;
@@ -9115,7 +9239,70 @@
 
   function renderModelPill() {
     const pill = $("#model-pill");
+    if (!pill) return;
     const nameEl = pill.querySelector(".model-pill-name") || pill;
+    const caret = pill.querySelector(".model-pill-caret");
+    const sessionPid = _sessionInferenceProviderId();
+
+    // Close any open model menu when the session provider is not local.
+    const menu = $("#model-pill-menu");
+    if (sessionPid && sessionPid !== "local_llama") {
+      menu?.classList.remove("open");
+      pill.classList.remove("open");
+    }
+
+    // Remove vision badge when not in local selectable mode.
+    let badge = pill.querySelector(".model-pill-vision");
+
+    if (!sessionPid) {
+      // Avoid flashing the local Qwen name before chat metadata loads.
+      nameEl.textContent = "";
+      pill.title = "Loading session…";
+      pill.classList.add("is-provider-locked");
+      pill.setAttribute("aria-disabled", "true");
+      pill.dataset.mode = "loading";
+      if (caret) caret.hidden = true;
+      if (badge) badge.remove();
+      return;
+    }
+
+    if (sessionPid === "codex_chatgpt") {
+      const verified = _sessionVerifiedModelLabel();
+      const base = _sessionInferenceProviderLabel() || "Codex via ChatGPT";
+      nameEl.textContent = verified ? `${base} · ${shortenModelName(verified)}` : base;
+      const unavail = _codexSessionUnavailableReason();
+      pill.title = unavail
+        ? `This session uses Codex via ChatGPT — ${unavail}`
+        : "This session uses Codex via ChatGPT. Start a new session to use a local GGUF model.";
+      pill.classList.add("is-provider-locked");
+      pill.classList.toggle("is-unavailable", !!unavail);
+      pill.setAttribute("aria-disabled", "true");
+      pill.dataset.mode = "codex";
+      if (caret) caret.hidden = true;
+      if (badge) badge.remove();
+      return;
+    }
+
+    if (sessionPid === "openai") {
+      const om = state.settings.openai_model || _sessionVerifiedModelLabel() || "";
+      const base = _sessionInferenceProviderLabel() || "OpenAI API";
+      nameEl.textContent = om ? `${base} · ${shortenModelName(om)}` : base;
+      pill.title = "This session uses OpenAI API. Local GGUF selection does not apply.";
+      pill.classList.add("is-provider-locked");
+      pill.classList.remove("is-unavailable");
+      pill.setAttribute("aria-disabled", "true");
+      pill.dataset.mode = "openai";
+      if (caret) caret.hidden = true;
+      if (badge) badge.remove();
+      return;
+    }
+
+    // Local session — interactive GGUF model selector.
+    pill.classList.remove("is-provider-locked", "is-unavailable");
+    pill.removeAttribute("aria-disabled");
+    pill.dataset.mode = "local";
+    if (caret) caret.hidden = false;
+
     const loadedPath = state.loadedModel || state.settings.model_path || state.settings.model || "";
     if (loadedPath) {
       const fullName = String(loadedPath).split(/[\\/]/).pop();
@@ -9132,15 +9319,15 @@
     // Vision badge — small "eye" chip glued to the pill when the loaded model
     // has its own vision tower (mmproj). Hover tells the user images are
     // going straight to the chat model rather than the OCR fallback.
-    let badge = pill.querySelector(".model-pill-vision");
+    badge = pill.querySelector(".model-pill-vision");
     const wantBadge = !!state.visionCapable && !!loadedPath;
     if (wantBadge && !badge) {
       badge = document.createElement("span");
       badge.className = "model-pill-vision";
       badge.innerHTML = '<i class="ph ph-eye"></i>';
       // Insert before the caret so the order reads name → badge → caret.
-      const caret = pill.querySelector(".model-pill-caret");
-      if (caret) pill.insertBefore(badge, caret);
+      const caretEl = pill.querySelector(".model-pill-caret");
+      if (caretEl) pill.insertBefore(badge, caretEl);
       else pill.appendChild(badge);
     } else if (!wantBadge && badge) {
       badge.remove();
@@ -9325,6 +9512,23 @@
     }
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
+      // Codex / OpenAI sessions: pill is an indicator only — local GGUF
+      // selection must not imply it controls this session.
+      if (pill.classList.contains("is-provider-locked") || pill.dataset.mode !== "local") {
+        menu.classList.remove("open");
+        btn.classList.remove("open");
+        const sessionPid = _sessionInferenceProviderId();
+        if (sessionPid === "codex_chatgpt") {
+          const unavail = _codexSessionUnavailableReason();
+          if (unavail) {
+            toast(unavail, "warn", 4200, "codex-session-unavail");
+            openSettings();
+          } else {
+            toast("This session uses Codex. Start a new session to change the local model.", "info", 3200, "codex-pill-locked");
+          }
+        }
+        return;
+      }
       const willOpen = !menu.classList.contains("open");
       if (willOpen) {
         renderModelMenu();
@@ -9729,6 +9933,9 @@
     });
     $("#btn-provider-new-session")?.addEventListener("click", () => {
       startNewSessionForSettingsProvider();
+    });
+    $("#btn-provider-reconnect")?.addEventListener("click", () => {
+      openSettings();
     });
     $("#btn-cmd-history")?.addEventListener("click", openCmdHistory);
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);

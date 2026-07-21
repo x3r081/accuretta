@@ -3765,6 +3765,46 @@ button {
   flex-shrink: 0;
 }
 
+.provider-session-unavailable {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 6px 20px 0;
+  max-width: 820px;
+  margin: 0 auto;
+  font-size: 12px;
+  color: var(--danger, #b42318);
+  line-height: 1.4;
+}
+.provider-session-unavailable[hidden] {
+  display: none !important;
+}
+
+.model-pill.is-provider-locked {
+  cursor: default;
+  opacity: 0.95;
+}
+.model-pill.is-provider-locked:hover {
+  border-color: var(--border);
+  background: var(--bg-inset);
+  color: var(--fg);
+}
+.model-pill.is-provider-locked .model-pill-caret {
+  display: none;
+}
+.model-pill.is-unavailable {
+  border-color: color-mix(in srgb, var(--danger, #b42318) 45%, var(--border));
+}
+.model-pill[data-mode="codex"]::before {
+  background: var(--accent);
+}
+.model-pill[data-mode="loading"]::before {
+  background: var(--fg-muted);
+  box-shadow: none;
+}
+
 .app.sidebar-collapsed .composer {
   max-width: 980px;
 }

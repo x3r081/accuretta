@@ -4,6 +4,14 @@ Rule: each chat/session binds ``inference_provider_id`` at creation from
 Settings. Later Settings changes do not migrate existing sessions. New
 messages always dispatch to the session-bound provider — never both, never
 silent Codex→local fallback.
+
+Legacy migration (UI + ensure_session_provider):
+- Chats without ``inference_provider_id`` are treated as Local llama.cpp
+  unless a ``codex_thread_id`` or message ``provider_id`` proves otherwise.
+- Missing metadata must never be inferred from the current Settings
+  selection (that would flash Codex UI on old local sessions, or the reverse).
+- On first touch, unbound legacy chats are persisted as Local (or Codex if
+  a thread/message signal exists). Only *new* chats inherit Settings.
 """
 
 from __future__ import annotations
@@ -52,7 +60,7 @@ def mismatch_notice(session_provider_id: str, settings_provider_id: str) -> Opti
         return None
     return (
         f"This session uses {provider_display_name(sid)}. "
-        f"Start a new session to use {provider_display_name(gid)}."
+        f"New sessions will use {provider_display_name(gid)}."
     )
 
 
@@ -128,8 +136,11 @@ def ensure_session_provider(
         pid = bind_inference_provider(chat, settings_pid)
         return pid, provider_display_name(pid), None
 
+    # Legacy unbound: infer from thread/message metadata; otherwise Local —
+    # never inherit current Settings (would silently migrate old local chats
+    # when the user has switched the default provider).
     legacy = _infer_legacy_provider_id(chat)
-    pid = bind_inference_provider(chat, legacy or settings_pid)
+    pid = bind_inference_provider(chat, legacy or DEFAULT_PROVIDER_ID)
     return pid, provider_display_name(pid), mismatch_notice(pid, settings_pid)
 
 

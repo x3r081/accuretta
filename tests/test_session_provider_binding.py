@@ -65,6 +65,7 @@ class SessionBindingUnitTest(unittest.TestCase):
         self.assertIsNotNone(notice)
         self.assertIn("Local llama.cpp", notice)
         self.assertIn("Codex via ChatGPT", notice)
+        self.assertIn("New sessions will use", notice)
 
     def test_settings_change_does_not_migrate_codex_session(self):
         chat = {"id": "e2", "messages": []}
