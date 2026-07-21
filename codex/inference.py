@@ -141,7 +141,12 @@ class CodexInferenceService:
                 "ChatGPT authentication required for Codex inference",
                 event_type=CodexInferenceEventType.AUTHENTICATION_REQUIRED,
             )
-        params = build_thread_start_params(model=model, cwd=cwd)
+        params = build_thread_start_params(
+            model=model,
+            cwd=cwd,
+            sandbox="read-only",
+            approval_policy="on-request",
+        )
         try:
             result = self._session.rpc.request("thread/start", params, timeout=60.0)
             parsed = parse_thread_start_result(result)

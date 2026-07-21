@@ -13778,13 +13778,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         model = "codex"
 
     # Label the turn for the UI (text, not color alone).
-    if provider_id == CODEX_PROVIDER_ID:
-        emit({
-            "type": "provider",
-            "providerId": CODEX_PROVIDER_ID,
-            "providerDisplayName": CODEX_DISPLAY_NAME,
-        })
-    elif provider_id == DEFAULT_PROVIDER_ID:
+    if provider_id == DEFAULT_PROVIDER_ID:
         emit({
             "type": "provider",
             "providerId": DEFAULT_PROVIDER_ID,
@@ -13799,16 +13793,37 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
     # Restore persisted Codex thread binding for this Accuretta conversation.
     codex_thread_id = None
+    codex_cwd = None
     if provider_id == CODEX_PROVIDER_ID:
         try:
             from providers.codex_provider import bind_codex_thread
+            from providers.codex_workspace import bind_codex_cwd, resolve_codex_workspace
             _crec = (get_chats().get("chats") or {}).get(chat_id) or {}
             raw_tid = _crec.get("codex_thread_id")
             if isinstance(raw_tid, str) and raw_tid.strip():
                 codex_thread_id = raw_tid.strip()
                 bind_codex_thread(chat_id, codex_thread_id)
+            raw_cwd = _crec.get("codex_cwd")
+            if isinstance(raw_cwd, str) and raw_cwd.strip():
+                codex_cwd = raw_cwd.strip()
+            binding = resolve_codex_workspace(chat_id=chat_id, preferred_cwd=codex_cwd)
+            if binding.ok and binding.cwd:
+                codex_cwd = binding.cwd
+                bind_codex_cwd(chat_id, codex_cwd)
+            emit({
+                "type": "provider",
+                "providerId": CODEX_PROVIDER_ID,
+                "providerDisplayName": CODEX_DISPLAY_NAME,
+                "workspace": binding.to_safe_dict(),
+            })
         except Exception:
             codex_thread_id = None
+            codex_cwd = None
+            emit({
+                "type": "provider",
+                "providerId": CODEX_PROVIDER_ID,
+                "providerDisplayName": CODEX_DISPLAY_NAME,
+            })
 
     turn_correlation = f"{chat_id}:{uuid.uuid4().hex[:10]}"
 
@@ -14033,6 +14048,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         chat_id=chat_id,
                         thread_id=codex_thread_id if provider_id == CODEX_PROVIDER_ID else None,
                         correlation_id=turn_correlation if provider_id == CODEX_PROVIDER_ID else None,
+                        cwd=codex_cwd if provider_id == CODEX_PROVIDER_ID else None,
                     )
                     break
                 except Exception as e:
@@ -14450,6 +14466,9 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     tid = meta.get("threadId") or get_bound_codex_thread(chat_id)
                     if tid:
                         assistant_msg["_codex_thread_id"] = tid
+                    if meta.get("cwd"):
+                        assistant_msg["_codex_cwd"] = meta["cwd"]
+                    assistant_msg["_codex_workspace_mode"] = meta.get("workspaceMode") or "advisory_chat_only"
                 elif provider_id == DEFAULT_PROVIDER_ID:
                     from providers.codex_provider import LOCAL_DISPLAY_NAME
                     assistant_msg["provider_id"] = DEFAULT_PROVIDER_ID
@@ -17730,6 +17749,10 @@ class Handler(BaseHTTPRequestHandler):
                 tid = final.pop("_codex_thread_id", None)
                 if isinstance(tid, str) and tid.strip():
                     chat["codex_thread_id"] = tid.strip()
+                bound_cwd = final.pop("_codex_cwd", None)
+                if isinstance(bound_cwd, str) and bound_cwd.strip():
+                    chat["codex_cwd"] = bound_cwd.strip()
+                final.pop("_codex_workspace_mode", None)
                 chat["messages"].append(msg)
                 chat["updated"] = now_t
                 # Retention cap: keep the chat under CHAT_HISTORY_MAX messages.

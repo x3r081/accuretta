@@ -125,6 +125,7 @@ def open_provider_chat_stream(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     correlation_id: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> Tuple[Any, Iterator[bytes]]:
     """Open a streaming completion for exactly one provider.
 
@@ -204,6 +205,8 @@ def open_provider_chat_stream(
             extra["correlation_id"] = correlation_id
         elif chat_id:
             extra["correlation_id"] = chat_id
+        if cwd:
+            extra["codex_cwd"] = cwd
 
         provider = CodexProvider()
         request = InferenceRequest(

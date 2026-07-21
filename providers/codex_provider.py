@@ -43,6 +43,12 @@ from .codex_readiness import (
     assess_codex_inference_readiness,
     readiness_to_provider_error,
 )
+from .codex_workspace import (
+    bind_codex_cwd,
+    clear_codex_cwd_for_chat,
+    resolve_codex_workspace,
+    workspace_status_for_ui,
+)
 from .errors import (
     AuthenticationRequired,
     ProviderUnavailable,
@@ -88,6 +94,7 @@ def clear_codex_thread_for_chat(chat_id: str) -> None:
         _THREAD_BY_CHAT.pop(str(chat_id), None)
     with _META_LOCK:
         _LAST_TURN_META.pop(str(chat_id), None)
+    clear_codex_cwd_for_chat(chat_id)
 
 
 def pop_codex_turn_meta(chat_id: str) -> Optional[dict]:
@@ -181,6 +188,7 @@ def get_codex_provider_status(*, live: bool = True) -> dict:
     if not ready and readiness.get("selectionDisabledReason"):
         # Prefer precise selection copy when the option is shown disabled.
         dto["disabledReason"] = readiness.get("selectionDisabledReason")
+    dto["workspace"] = workspace_status_for_ui()
     assert_safe_provider_payload(dto)
     return dto
 
@@ -291,6 +299,8 @@ class CodexProvider:
         correlation = str((request.extra or {}).get("correlation_id") or chat_key or "")
         svc = self._svc()
 
+        # Register active turn early so duplicate submissions are rejected
+        # before workspace resolution / thread create work.
         if chat_key:
             with _ACTIVE_LOCK:
                 if chat_key in _ACTIVE_TURN:
@@ -302,6 +312,14 @@ class CodexProvider:
                     yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
                     raise busy
                 _ACTIVE_TURN[chat_key] = svc
+
+        preferred_cwd = (request.extra or {}).get("codex_cwd") or (request.extra or {}).get("cwd")
+        if not isinstance(preferred_cwd, str):
+            preferred_cwd = None
+        workspace = resolve_codex_workspace(chat_id=chat_key or None, preferred_cwd=preferred_cwd)
+        cwd = workspace.cwd if workspace.ok else None
+        if cwd and chat_key:
+            bind_codex_cwd(chat_key, cwd)
 
         try:
             thread_id = None
@@ -316,9 +334,13 @@ class CodexProvider:
                     bind_codex_thread(chat_key, thread_id)
 
             created_fresh = False
+
+            def _create_thread() -> str:
+                return svc.create_thread(model=model, cwd=cwd)
+
             if not thread_id:
                 try:
-                    thread_id = svc.create_thread(model=model)
+                    thread_id = _create_thread()
                     created_fresh = True
                 except CodexInferenceError as exc:
                     msg = user_message_for_codex_error(exc)
@@ -365,7 +387,7 @@ class CodexProvider:
                 if is_invalid_thread_message(err.message) and chat_key:
                     clear_codex_thread_for_chat(chat_key)
                     try:
-                        thread_id = svc.create_thread(model=model)
+                        thread_id = svc.create_thread(model=model, cwd=cwd)
                         created_fresh = True
                         bind_codex_thread(chat_key, thread_id)
                         events, result, err = _run_once(thread_id)
@@ -436,6 +458,9 @@ class CodexProvider:
                 "turnId": result.turn_id or turn_id,
                 "correlationId": correlation,
                 "createdThread": created_fresh,
+                "cwd": cwd,
+                "workspaceMode": workspace.mode,
+                "codingActionsAllowed": False,
             }
             if model:
                 meta["modelLabel"] = str(model)[:120]

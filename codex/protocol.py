@@ -349,14 +349,28 @@ def build_thread_start_params(
     sandbox: str = "read-only",
     approval_policy: str = "on-request",
 ) -> dict:
-    """Build allowlisted thread/start params (stable surface only)."""
+    """Build allowlisted thread/start params (stable surface only).
+
+    Defaults keep Codex in a restrictive posture: read-only sandbox and
+    on-request approvals. Accuretta still declines native approval RPCs
+    (advisory / chat-only for file and shell actions).
+    """
+    # Force safe defaults even if callers pass empty / unknown values.
+    sandbox_val = sandbox if sandbox in {"read-only", "readOnly", "workspace-write", "danger-full-access"} else "read-only"
+    if sandbox_val in {"workspace-write", "danger-full-access"}:
+        # Accuretta does not enable write sandboxes for Codex in this build.
+        sandbox_val = "read-only"
+    approval_val = approval_policy if approval_policy in {
+        "untrusted", "on-failure", "on-request", "never",
+    } else "on-request"
     params: Dict[str, Any] = {
-        "sandbox": sandbox,
-        "approvalPolicy": approval_policy,
+        "sandbox": sandbox_val,
+        "approvalPolicy": approval_val,
     }
     if isinstance(model, str) and model.strip():
         params["model"] = model.strip()
     if isinstance(cwd, str) and cwd.strip():
+        # Caller must already have validated cwd; strip only.
         params["cwd"] = cwd.strip()
     return params
 

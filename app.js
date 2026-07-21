@@ -4146,9 +4146,16 @@
         const meta = row.querySelector(".bubble-meta");
         if (meta) {
           const streaming = meta.classList.contains("streaming");
+          let wsNote = "";
+          if (evt.workspace && evt.workspace.cwd) {
+            wsNote = ` · ${evt.workspace.cwd}`;
+            row._codexWorkspace = evt.workspace.cwd;
+          } else if (evt.workspace && evt.workspace.displayLabel) {
+            wsNote = ` · ${evt.workspace.displayLabel}`;
+          }
           meta.innerHTML = streaming
-            ? `${esc(label)} · streaming<span class="typing"><span></span><span></span><span></span></span>`
-            : esc(label);
+            ? `${esc(label)}${esc(wsNote)} · streaming<span class="typing"><span></span><span></span><span></span></span>`
+            : `${esc(label)}${esc(wsNote)}`;
           if (streaming) meta.classList.add("streaming");
         }
       }
@@ -7072,11 +7079,17 @@
     const version = cx.codexVersion ? `Codex ${cx.codexVersion}` : "Codex version unknown";
     const proc = cx.processState ? `process: ${cx.processState}` : "";
     if (meta) {
+      const ws = cx.workspace || {};
+      const wsBit = ws.cwd
+        ? `workspace: ${ws.cwd}`
+        : (ws.displayLabel || "no workspace bound");
       meta.textContent = [
         cx.installed ? "CLI detected" : "CLI not detected",
         version,
         cx.available ? "provider available" : "provider unavailable",
         proc,
+        wsBit,
+        "Codex actions: advisory chat-only (native writes/shell declined)",
       ].filter(Boolean).join(" · ");
     }
     if (status) {

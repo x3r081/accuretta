@@ -123,16 +123,15 @@ pending device session. OpenAI / local credentials are untouched.
 `account_authentication`, `device_authorization` only — never `inference`,
 `streaming`, `models`, or Copilot.
 
-## ChatGPT / Codex authentication (experimental)
+## ChatGPT / Codex (experimental)
 
 - **id:** `codex_chatgpt`
-- **display name:** ChatGPT / Codex
+- **display name:** Codex via ChatGPT
 - **auth:** Codex-managed ChatGPT (`auth_type: codex_managed_chatgpt`)
 - **API mode:** `codex_app_server` (stdio JSON-RPC)
-- **purpose:** sign in with ChatGPT through the official Codex CLI app-server
-- **does not** enable Codex inference, threads, turns, tools, approvals, or model listing
-- **supports_inference:** `false` (not shown in the chat provider selector)
-- **selectable:** `false`
+- **inference:** capability-gated (`ACCURETTA_CODEX_INFERENCE_ENABLED`); Settings-selectable when ready
+- **workspace:** official `thread/start` `cwd` only — see [codex-workspace-security.md](./codex-workspace-security.md)
+- **tools / writes:** Codex native file/shell approvals are **declined** (advisory chat-only). Accuretta’s local approval gates are unchanged and are not bypassed.
 
 Accuretta never implements ChatGPT OAuth itself. Codex owns client registration,
 browser callback / device authorization, tokens, refresh, logout, and
