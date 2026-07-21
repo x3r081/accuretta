@@ -2216,6 +2216,7 @@
     const ta = $("#composer-input");
     ta.value = "";
     autoResize(ta);
+    updateProviderSessionBanner();
   }
 
   function selectChat(id) {
@@ -2306,6 +2307,7 @@
       state.mobileTab = "chat";
       applyMobileTab();
     }
+    updateProviderSessionBanner();
     // start context-stats polling
     clearInterval(state._ctxPoll);
     state._ctxPoll = setInterval(async () => {
@@ -3217,7 +3219,7 @@
         </div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta streaming">${esc(_providerLabelForId(_activeInferenceProviderId()) || state.settings.model || "agent")} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
+        <div class="bubble-meta streaming">${esc(_sessionInferenceProviderLabel() || state.settings.model || "agent")} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -3334,8 +3336,73 @@
     return null;
   }
 
+  /** Session-bound provider (source of truth for routing this chat). */
+  function _sessionInferenceProviderId() {
+    const chat = state.chatId && state.chats?.chats?.[state.chatId];
+    const sid = chat?.inference_provider_id;
+    if (sid === "codex_chatgpt" || sid === "local_llama" || sid === "openai") return sid;
+    return _activeInferenceProviderId();
+  }
+
+  function _sessionInferenceProviderLabel() {
+    const chat = state.chatId && state.chats?.chats?.[state.chatId];
+    if (chat?.inference_provider_label) return chat.inference_provider_label;
+    return _providerLabelForId(_sessionInferenceProviderId()) || "agent";
+  }
+
   function _activeInferenceProviderId() {
     return state.settings?.provider_id || state.selectedProviderId || "local_llama";
+  }
+
+  function updateProviderSessionBanner() {
+    const banner = $("#provider-session-banner");
+    const textEl = $("#provider-session-banner-text");
+    const btn = $("#btn-provider-new-session");
+    if (!banner || !textEl) return;
+    const chat = state.chatId && state.chats?.chats?.[state.chatId];
+    if (!chat || !chat.inference_provider_id) {
+      banner.hidden = true;
+      if (btn) btn.hidden = true;
+      return;
+    }
+    const sessionPid = chat.inference_provider_id;
+    const settingsPid = _activeInferenceProviderId();
+    if (sessionPid === settingsPid) {
+      banner.hidden = true;
+      if (btn) btn.hidden = true;
+      return;
+    }
+    const sessionLabel = chat.inference_provider_label
+      || _providerLabelForId(sessionPid)
+      || sessionPid;
+    const settingsLabel = _providerLabelForId(settingsPid) || settingsPid;
+    textEl.textContent =
+      `This session uses ${sessionLabel}. Start a new session to use ${settingsLabel}.`;
+    banner.hidden = false;
+    if (btn) {
+      btn.hidden = false;
+      btn.textContent = settingsPid === "codex_chatgpt"
+        ? "Start new Codex session"
+        : settingsPid === "local_llama"
+          ? "Start new Local session"
+          : "Start new session";
+    }
+  }
+
+  async function startNewSessionForSettingsProvider() {
+    const settingsPid = _activeInferenceProviderId();
+    if (settingsPid === "codex_chatgpt") {
+      const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
+      if (!cx || !cx.selectable) {
+        const why = (cx && (cx.selectionDisabledReason || cx.disabledReason))
+          || "Codex is not ready. Open Settings to sign in or check status.";
+        toast(why, "warn", 4200, "codex-not-ready");
+        openSettings();
+        return;
+      }
+    }
+    await newChat();
+    updateProviderSessionBanner();
   }
 
   // ---------- send / stream ----------
@@ -3361,7 +3428,7 @@
     // A new request starts fresh: drop any prior turn's plan panel. The model
     // re-emits update_plan if this task is multi-step.
     renderPlanPanel([]);
-    const providerId = _activeInferenceProviderId();
+    const providerId = _sessionInferenceProviderId();
     if (providerId === "codex_chatgpt") {
       const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
       if (!cx || !cx.selectable) {
@@ -3371,7 +3438,7 @@
         openSettings();
         return;
       }
-    } else if (!state.settings.model) {
+    } else if (providerId !== "openai" && !state.settings.model) {
       toast("Pick a model in Settings first.", "warn", 3200, "no-model");
       openSettings();
       return;
@@ -3426,7 +3493,7 @@
         </div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta streaming">${esc(_providerLabelForId(_activeInferenceProviderId()) || state.settings.model || "agent")} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
+        <div class="bubble-meta streaming">${esc(_sessionInferenceProviderLabel() || state.settings.model || "agent")} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -4587,7 +4654,11 @@
       renderStatus(tps, "idle");
       const meta = bubble.parentElement.querySelector(".bubble-meta");
       if (meta) {
-        meta.textContent = `${state.settings.model} · ${tok} tok · ${tps} tok/s`;
+        const label = (ctx.row && ctx.row._providerLabel)
+          || _sessionInferenceProviderLabel()
+          || state.settings.model
+          || "agent";
+        meta.textContent = `${label} · ${tok} tok · ${tps} tok/s`;
         if (state.streaming && meta.classList.contains("streaming")) {
           const dots = document.createElement("span");
           dots.className = "typing";
@@ -4625,12 +4696,15 @@
         tokens: state._lastMsgTokens || 0,
         prompt_tokens: state._lastMsgPromptTokens || 0,
       };
-      if (row && row._providerLabel) {
+      if (evt.message && (evt.message.provider_id || evt.message.provider_label)) {
+        msg.provider_label = evt.message.provider_label
+          || _providerLabelForId(evt.message.provider_id)
+          || row?._providerLabel;
+        msg.provider_id = evt.message.provider_id || _sessionInferenceProviderId();
+        if (evt.message.model_label) msg.model_label = evt.message.model_label;
+      } else if (row && row._providerLabel) {
         msg.provider_label = row._providerLabel;
-        msg.provider_id = _activeInferenceProviderId();
-      } else if (evt.message && evt.message.provider_label) {
-        msg.provider_label = evt.message.provider_label;
-        msg.provider_id = evt.message.provider_id;
+        msg.provider_id = _sessionInferenceProviderId();
       }
       // Fallback: if stats event never fired (some llama-server versions
       // don't emit timings/usage), use the streaming char estimate so the
@@ -4712,8 +4786,12 @@
       renderCtxGauge();
       renderRegenerateChip();
     } else if (evt.type === "notice") {
-      toast(evt.note || "", "info", 3000, "ctx-notice");
-    } else if (evt.type === "breach") {
+      if (evt.code === "provider_session_mismatch") {
+        updateProviderSessionBanner();
+        toast(evt.note || "", "info", 5200, "provider-session-mismatch");
+      } else {
+        toast(evt.note || "", "info", 3000, "ctx-notice");
+      } else if (evt.type === "breach") {
       // Cyber-range / CTF: a FLAG{...} was captured in a tool response = a
       // confirmed breach. Advance the attack-chain rail and surface a toast.
       attackRailBreach(row, evt.stage);
@@ -7611,6 +7689,7 @@
       state.selectedProviderId = state.settings.provider_id;
       await loadProviders();
       populateProviderForm();
+      updateProviderSessionBanner();
       toast("provider updated", "ok", 1800);
     } catch (e) {
       toast("provider update failed", "error");
@@ -9643,7 +9722,14 @@
       const href = $("#btn-codex-open-verify")?.getAttribute("href");
       if (!href || href === "#") ev.preventDefault();
     });
-    $("#set-provider")?.addEventListener("change", populateProviderForm);
+    $("#set-provider")?.addEventListener("change", () => {
+      populateProviderForm();
+      // Persist selection immediately so Settings is source of truth for new sessions.
+      selectProviderFromUi();
+    });
+    $("#btn-provider-new-session")?.addEventListener("click", () => {
+      startNewSessionForSettingsProvider();
+    });
     $("#btn-cmd-history")?.addEventListener("click", openCmdHistory);
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);

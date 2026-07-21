@@ -332,27 +332,26 @@ def _unregister_cancel(chat_id: str) -> None:
 
 
 def cancel_chat(chat_id: str) -> bool:
-    """Flip the cancel flag and force-close the active provider response
-    for this chat. Returns True if something was cancelled."""
-    with _chat_cancels_lock:
-        entry = _chat_cancels.get(chat_id)
-        if not entry:
-            # Still try Codex cancel in case the turn registered outside this map.
-            try:
-                from providers.codex_provider import cancel_codex_for_chat
-                return bool(cancel_codex_for_chat(chat_id))
-            except Exception:
-                return False
-        entry["cancel"].set()
-        resp = entry.get("resp")
-    if resp is not None:
+    """Flip the cancel flag and stop the active provider turn for this chat.
+
+    Targets the session-bound provider when known — never cancels the other
+    provider's turn by mistake when the session is explicitly local or Codex.
+    """
+    session_pid = None
+    try:
+        chat = ((get_chats().get("chats") or {}).get(chat_id) or {})
+        session_pid = chat.get("inference_provider_id")
+    except Exception:
+        session_pid = None
+
+    def _close_local_resp(resp) -> None:
+        if resp is None:
+            return
         try:
             resp.close()
         except Exception:
             pass
         try:
-            # reach through urllib to the raw socket and hard-shut it so
-            # llama-server notices within one token's worth of time.
             fp = getattr(resp, "fp", None)
             sock = getattr(getattr(fp, "raw", None), "_sock", None)
             if sock:
@@ -367,6 +366,37 @@ def cancel_chat(chat_id: str) -> bool:
                     pass
         except Exception:
             pass
+
+    with _chat_cancels_lock:
+        entry = _chat_cancels.get(chat_id)
+        if entry:
+            entry["cancel"].set()
+            resp = entry.get("resp")
+        else:
+            resp = None
+
+    cancelled = False
+    if session_pid == "codex_chatgpt":
+        _close_local_resp(resp)  # Codex stream handle close → cancel_active_turn
+        try:
+            from providers.codex_provider import cancel_codex_for_chat
+            cancelled = bool(cancel_codex_for_chat(chat_id)) or entry is not None
+        except Exception:
+            cancelled = entry is not None
+        return cancelled
+
+    if session_pid in ("local_llama", "openai"):
+        _close_local_resp(resp)
+        return entry is not None
+
+    # Legacy / unbound: close local handle and try Codex cancel if active.
+    if entry is None and resp is None:
+        try:
+            from providers.codex_provider import cancel_codex_for_chat
+            return bool(cancel_codex_for_chat(chat_id))
+        except Exception:
+            return False
+    _close_local_resp(resp)
     try:
         from providers.codex_provider import cancel_codex_for_chat
         cancel_codex_for_chat(chat_id)
@@ -13748,15 +13778,50 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     from providers.management import get_auth_store_info, resolve_chat_provider
     from providers.openai_provider import OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID
     from providers.selection import DEFAULT_PROVIDER_ID
+    from providers.session_binding import (
+        ensure_session_provider,
+        log_chat_dispatch,
+        settings_inference_provider_id,
+    )
 
+    # Session-bound provider is the dispatch source of truth for this turn.
+    _chat_rec = (get_chats().get("chats") or {}).get(chat_id) or {}
     try:
-        _selection = resolve_chat_provider(settings)
+        provider_id, provider_label, provider_mismatch = ensure_session_provider(
+            _chat_rec, settings, for_new_chat=False
+        )
+        # Persist bind/migration if the in-memory chat dict was updated.
+        try:
+            chats_now = get_chats()
+            if chat_id in (chats_now.get("chats") or {}):
+                chats_now["chats"][chat_id].update({
+                    k: _chat_rec[k]
+                    for k in ("inference_provider_id", "inference_provider_label")
+                    if k in _chat_rec
+                })
+                # Mirror sanitized thread fields
+                if "codex_thread_id" not in _chat_rec:
+                    chats_now["chats"][chat_id].pop("codex_thread_id", None)
+                save_json(CHATS_FILE, chats_now)
+        except Exception:
+            pass
+        _selection = resolve_chat_provider(settings, provider_id=provider_id)
         provider_id = _selection.provider_id
     except Exception as exc:
         from providers.errors import ProviderError
         msg = getattr(exc, "message", None) or str(exc)
         emit({"type": "error", "error": msg, "code": getattr(exc, "code", "provider_error")})
         return None
+
+    turn_correlation = f"{chat_id}:{uuid.uuid4().hex[:10]}"
+    log_chat_dispatch(
+        session_id=chat_id,
+        settings_provider_id=settings_inference_provider_id(settings),
+        dispatched_provider_id=provider_id,
+        turn_id=turn_correlation,
+    )
+    if provider_mismatch:
+        emit({"type": "notice", "note": provider_mismatch, "code": "provider_session_mismatch"})
 
     from providers.codex_provider import CODEX_DISPLAY_NAME, CODEX_PROVIDER_ID, LOCAL_DISPLAY_NAME
 
@@ -13824,8 +13889,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 "providerId": CODEX_PROVIDER_ID,
                 "providerDisplayName": CODEX_DISPLAY_NAME,
             })
+    elif provider_id != DEFAULT_PROVIDER_ID and provider_id != OPENAI_PROVIDER_ID:
+        emit({
+            "type": "provider",
+            "providerId": provider_id,
+            "providerDisplayName": provider_label or provider_id,
+        })
 
-    turn_correlation = f"{chat_id}:{uuid.uuid4().hex[:10]}"
+    # turn_correlation already assigned above for dispatch logging
 
     _chat_emitters[chat_id] = emit
     cancel_ev = _register_cancel(chat_id)
@@ -14454,6 +14525,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     turn_stats["prompt_eval_count"] = turn_prompt_total
                 assistant_msg["_stats"] = turn_stats
                 # Provider label for UI / persistence (never secrets).
+                # Always stamp the provider that actually served this turn —
+                # never re-read Settings afterward.
                 if provider_id == CODEX_PROVIDER_ID:
                     from providers.codex_provider import (
                         CODEX_DISPLAY_NAME,
@@ -14463,6 +14536,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     meta = pop_codex_turn_meta(chat_id) or {}
                     assistant_msg["provider_id"] = CODEX_PROVIDER_ID
                     assistant_msg["provider_label"] = CODEX_DISPLAY_NAME
+                    if meta.get("modelLabel"):
+                        assistant_msg["model_label"] = str(meta["modelLabel"])[:120]
+                    else:
+                        assistant_msg["model_label"] = "Codex"
                     tid = meta.get("threadId") or get_bound_codex_thread(chat_id)
                     if tid:
                         assistant_msg["_codex_thread_id"] = tid
@@ -14473,9 +14550,18 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     from providers.codex_provider import LOCAL_DISPLAY_NAME
                     assistant_msg["provider_id"] = DEFAULT_PROVIDER_ID
                     assistant_msg["provider_label"] = LOCAL_DISPLAY_NAME
+                    if model:
+                        assistant_msg["model_label"] = str(model)[:120]
                 elif provider_id == OPENAI_PROVIDER_ID:
                     assistant_msg["provider_id"] = OPENAI_PROVIDER_ID
                     assistant_msg["provider_label"] = "OpenAI API"
+                    if model:
+                        assistant_msg["model_label"] = str(model)[:120]
+                else:
+                    assistant_msg["provider_id"] = provider_id
+                    assistant_msg["provider_label"] = provider_label or provider_id
+                    if model:
+                        assistant_msg["model_label"] = str(model)[:120]
                 # Lifetime savings: add this turn's tokens to the durable counters
                 # (summed per-round, as a cloud API would bill) and push the new
                 # totals to the widget. Fall back to a char estimate when the
@@ -17094,6 +17180,15 @@ class Handler(BaseHTTPRequestHandler):
                     "messages": [],
                     "origin": origin,
                 }
+                # Bind inference provider from Settings at creation — sessions
+                # keep this provider even if Settings changes later.
+                try:
+                    from providers.session_binding import ensure_session_provider
+                    ensure_session_provider(
+                        chats["chats"][chat_id], get_settings(), for_new_chat=True
+                    )
+                except Exception:
+                    pass
                 chats["order"].insert(0, chat_id)
                 save_json(CHATS_FILE, chats)
             return self._send_json(200, chats["chats"][chat_id])
@@ -17431,13 +17526,24 @@ class Handler(BaseHTTPRequestHandler):
         if not user_text and not images and not regenerate:
             return self._send_json(400, {"error": "empty message"})
 
-        # Provider gate (Phase 5): resolve selected provider before any llama work.
-        # Only LocalLlamaProvider is inference-capable in this release. Chat
-        # orchestration still uses run_chat_turn (compatibility adapter) so the
-        # existing SSE contract, tools, and cancellation stay unchanged.
+        # Provider gate: session-bound inference provider (falls back to Settings
+        # only when creating / migrating a chat). Never silently remaps providers.
+        settings = get_settings()
+        chats_preview = get_chats()
+        chat_preview = (chats_preview.get("chats") or {}).get(chat_id)
         try:
             from providers.management import provider_http_error, resolve_chat_provider
-            resolve_chat_provider(get_settings())
+            from providers.session_binding import (
+                ensure_session_provider,
+                settings_inference_provider_id,
+            )
+            if isinstance(chat_preview, dict):
+                bound_pid, _, _ = ensure_session_provider(
+                    chat_preview, settings, for_new_chat=False
+                )
+            else:
+                bound_pid = settings_inference_provider_id(settings)
+            resolve_chat_provider(settings, provider_id=bound_pid)
         except Exception as exc:
             status, err_body = provider_http_error(exc)
             return self._send_json(status, err_body)
@@ -17485,8 +17591,22 @@ class Handler(BaseHTTPRequestHandler):
                 "updated": int(time.time()),
                 "messages": [],
             }
+            try:
+                from providers.session_binding import ensure_session_provider
+                ensure_session_provider(
+                    chats["chats"][chat_id], get_settings(), for_new_chat=True
+                )
+            except Exception:
+                pass
             chats["order"].insert(0, chat_id)
         chat = chats["chats"][chat_id]
+        # Persist session provider binding (legacy migration / first bind).
+        try:
+            from providers.session_binding import ensure_session_provider
+            ensure_session_provider(chat, get_settings(), for_new_chat=False)
+            save_json(CHATS_FILE, chats)
+        except Exception:
+            pass
         # remember the mode this chat was last used in so the client can
         # restore it on session switch
         chat["last_mode"] = mode
@@ -17746,12 +17866,25 @@ class Handler(BaseHTTPRequestHandler):
                     msg["provider_id"] = final["provider_id"]
                 if final.get("provider_label"):
                     msg["provider_label"] = final["provider_label"]
-                # Persist Codex thread id on the chat (non-secret resume key).
+                if final.get("model_label"):
+                    msg["model_label"] = str(final["model_label"])[:120]
+                # Persist Codex thread id only on Codex-bound sessions.
                 tid = final.pop("_codex_thread_id", None)
-                if isinstance(tid, str) and tid.strip():
+                session_pid = chat.get("inference_provider_id") or final.get("provider_id")
+                if (
+                    session_pid == "codex_chatgpt"
+                    and isinstance(tid, str)
+                    and tid.strip()
+                ):
                     chat["codex_thread_id"] = tid.strip()
+                elif session_pid != "codex_chatgpt":
+                    chat.pop("codex_thread_id", None)
                 bound_cwd = final.pop("_codex_cwd", None)
-                if isinstance(bound_cwd, str) and bound_cwd.strip():
+                if (
+                    session_pid == "codex_chatgpt"
+                    and isinstance(bound_cwd, str)
+                    and bound_cwd.strip()
+                ):
                     chat["codex_cwd"] = bound_cwd.strip()
                 final.pop("_codex_workspace_mode", None)
                 chat["messages"].append(msg)

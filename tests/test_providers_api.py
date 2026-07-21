@@ -252,8 +252,13 @@ class ProviderApiHandlersTest(unittest.TestCase):
 
     def test_chat_gate_on_handler(self):
         h = _FakeHandler()
+        # Session-bound routing: gate uses Settings only when the chat does not
+        # already exist. Isolate chats so a prior local bind cannot mask the
+        # unavailable Settings provider.
+        empty_chats = {"chats": {}, "order": []}
         with mock.patch.object(bridge, "get_settings", return_value={"provider_id": "example_cloud"}):
-            h._handle_chat({"message": "hi", "chat_id": "t1"})
+            with mock.patch.object(bridge, "get_chats", return_value=empty_chats):
+                h._handle_chat({"message": "hi", "chat_id": "gate-unavailable-1"})
         self.assertEqual(h._sent["status"], 409)
         self.assertEqual(h._sent["body"]["error"], "provider_unavailable")
         blob = json.dumps(h._sent["body"]).lower()
@@ -293,10 +298,14 @@ class ProviderUiContractTest(unittest.TestCase):
         self.assertIn('id="set-provider"', html)
         self.assertIn('id="btn-provider-connect"', html)
         self.assertIn('id="set-openai-key"', html)
+        self.assertIn('id="provider-session-banner"', html)
+        self.assertIn('id="btn-provider-new-session"', html)
 
     def test_app_js_loads_providers_api(self):
         js = (Path(__file__).resolve().parent.parent / "app.js").read_text(encoding="utf-8")
         self.assertIn('/api/providers', js)
+        self.assertIn("updateProviderSessionBanner", js)
+        self.assertIn("_sessionInferenceProviderId", js)
         self.assertIn("loadProviders", js)
         self.assertIn("populateProviderForm", js)
         # Must not invent token fields in provider UI code

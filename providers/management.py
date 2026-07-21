@@ -572,9 +572,14 @@ def cancel_device_authorization(provider_id: str, settings: dict) -> dict:
     return payload
 
 
-def resolve_chat_provider(settings: dict):
+def resolve_chat_provider(settings: dict, *, provider_id: Optional[str] = None):
+    """Resolve and assert the provider that will serve this chat turn.
+
+    Pass ``provider_id`` for session-bound dispatch. When omitted, uses Settings
+    (legacy / select APIs). Never remaps Codex ↔ local.
+    """
     ensure_builtin_providers()
-    selection = resolve_provider_selection(settings)
+    selection = resolve_provider_selection(settings, requested_id=provider_id)
     info = get_auth_store_info()
     assert_provider_usable_for_chat(selection, auth_store=info.store)
     return selection
