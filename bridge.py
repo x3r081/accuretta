@@ -14214,6 +14214,27 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         obj = json.loads(data)
                     except Exception:
                         continue
+                    # Accuretta-native notices from provider adapters (e.g. Codex
+                    # waiting for approval). Must be checked before the empty
+                    # choices early-continue.
+                    notice = obj.get("accuretta_notice")
+                    if isinstance(notice, str) and notice.strip():
+                        emit({
+                            "type": "notice",
+                            "note": notice.strip(),
+                            "code": obj.get("accuretta_status") or "provider_status",
+                        })
+                        continue
+                    if isinstance(obj.get("error"), dict):
+                        err_msg = obj["error"].get("message") or "Codex error"
+                        if provider_id == CODEX_PROVIDER_ID:
+                            from providers.codex_errors import user_message_for_codex_error
+                            from providers.errors import ProviderUnavailable
+                            err_msg = user_message_for_codex_error(
+                                ProviderUnavailable(err_msg, provider_id=CODEX_PROVIDER_ID)
+                            )
+                        emit({"type": "error", "error": err_msg, "code": "provider_error"})
+                        continue
                     # llama-server may emit a bare timings object after [DONE]
                     if "timings" in obj and "choices" not in obj:
                         t = obj["timings"]

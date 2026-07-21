@@ -4891,6 +4891,20 @@
       if (evt.code === "provider_session_mismatch") {
         refreshSessionProviderUI();
         toast(evt.note || "", "info", 5200, "provider-session-mismatch");
+      } else if (evt.code === "waiting_for_approval" || /waiting for .*approval/i.test(evt.note || "")) {
+        const row = document.querySelector("#chat-inner .bubble-row:last-child");
+        const span = row?.querySelector(".think-title, .think-line span.shimmer, .think-line span");
+        if (span) {
+          span.classList.add("shimmer");
+          span.textContent = evt.note || "Waiting for approval…";
+        }
+        toast(evt.note || "Waiting for approval…", "info", 4200, "codex-waiting-approval");
+        // Jump to Approvals so the card is visible immediately.
+        try {
+          state.mobileTab = "approvals";
+          applyMobileTab?.();
+          document.querySelector('[data-tab="approvals"]')?.click();
+        } catch (_) {}
       } else {
         toast(evt.note || "", "info", 3000, "ctx-notice");
       }
@@ -4907,7 +4921,20 @@
     } else if (evt.type === "plan") {
       renderPlanPanel(evt.steps || []);
     } else if (evt.type === "error") {
+      bubble.classList.remove("hidden");
       bubble.innerHTML = `<span style="color: var(--danger)">error: ${esc(evt.error)}</span>`;
+      const meta = bubble.parentElement?.querySelector(".bubble-meta");
+      if (meta) {
+        meta.classList.remove("streaming");
+        meta.textContent = `${_sessionInferenceProviderLabel() || state.settings.model || "agent"} · error`;
+      }
+      const thinkLine = (bubble.closest(".bubble-row") || bubble.parentElement)?.querySelector(".think-line");
+      if (thinkLine) {
+        thinkLine.classList.add("done");
+        const span = thinkLine.querySelector(".think-title, span.shimmer, span");
+        if (span) { span.classList.remove("shimmer"); span.textContent = "Stopped"; }
+      }
+      renderStatus(0, "idle");
     }
   }
 

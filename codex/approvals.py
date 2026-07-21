@@ -82,6 +82,26 @@ def sandbox_for_write_mode(mode: str) -> str:
     return "workspace-write"
 
 
+def approval_policy_for_write_mode(mode: str) -> str:
+    """Map write mode → Codex approvalPolicy.
+
+    Codex CLI 0.144.6 with ``workspace-write`` + ``on-request`` does **not**
+    emit ``item/fileChange/requestApproval`` for in-workspace writes (they
+    auto-apply). Accuretta's "ask" mode therefore uses ``untrusted`` so the
+    app-server always requests approval and Accuretta can show the UI.
+    """
+    m = normalize_codex_write_mode(mode)
+    if m == WRITE_MODE_ASK:
+        return "untrusted"
+    return "on-request"
+
+
+# Bounded wait for Accuretta UI while Codex holds a server request open.
+APPROVAL_UI_TIMEOUT_S = 90
+
+KIND_PERMISSIONS = "codex_permissions"
+
+
 def mode_allows_coding_actions(mode: str) -> bool:
     return normalize_codex_write_mode(mode) != WRITE_MODE_CHAT_ONLY
 
@@ -224,9 +244,16 @@ def decide_file_change(
     workspace_cwd: Optional[str],
     item_cache: Optional[Mapping[str, Any]] = None,
     request_approval: Optional[ApprovalRequester] = None,
-    timeout_s: int = 600,
+    timeout_s: int = APPROVAL_UI_TIMEOUT_S,
+    trust_writes: bool = False,
 ) -> dict:
-    """Decide a Codex fileChange / applyPatch approval."""
+    """Decide a Codex fileChange / applyPatch approval.
+
+    Codex 0.144.6 ``item/fileChange/requestApproval`` params typically carry
+    ``threadId``, ``turnId``, ``itemId``, ``reason``, ``grantRoot``,
+    ``startedAtMs`` — not the file paths. Paths come from the preceding
+    ``item/started`` fileChange notification (``item_cache``).
+    """
     m = normalize_codex_write_mode(mode)
     if m == WRITE_MODE_CHAT_ONLY:
         return _decline()
@@ -255,11 +282,18 @@ def decide_file_change(
         # No explicit paths — sandbox confines writes to cwd; allow.
         return _accept()
 
-    # ask mode — prompt Accuretta UI (never auto from Trust writes).
+    # ask mode — Trust writes may auto-approve in-workspace file changes only.
+    summary_paths = paths or (
+        [grant] if isinstance(grant, str) and grant.strip() else [workspace_cwd]
+    )
+    if trust_writes and all_paths_inside_workspace(
+        [p for p in summary_paths if p], workspace_cwd
+    ):
+        return _accept()
+
     if request_approval is None:
         return _decline()
-    summary_paths = paths or ([grant] if isinstance(grant, str) and grant.strip() else [workspace_cwd])
-    preview = ", ".join(summary_paths[:4])
+    preview = ", ".join(str(p) for p in summary_paths[:4])
     if len(summary_paths) > 4:
         preview += f" (+{len(summary_paths) - 4} more)"
     reason = ""
@@ -282,8 +316,11 @@ def decide_file_change(
     except Exception:
         return _decline()
     decision = (result or {}).get("decision")
+    status = (result or {}).get("status")
     if decision == "approve":
         return _accept()
+    if status == "timeout":
+        return _decline()
     return _decline()
 
 
@@ -293,7 +330,7 @@ def decide_command_execution(
     params: Optional[Mapping[str, Any]],
     workspace_cwd: Optional[str],
     request_approval: Optional[ApprovalRequester] = None,
-    timeout_s: int = 600,
+    timeout_s: int = APPROVAL_UI_TIMEOUT_S,
     shell_auto_enabled: bool = False,
 ) -> dict:
     """Decide a Codex shell / commandExecution approval.
@@ -301,6 +338,7 @@ def decide_command_execution(
     Shell always requires an explicit Accuretta approval unless
     ``shell_auto_enabled`` is True (reserved; default False — not exposed yet).
     Commands whose cwd escapes the workspace are always declined.
+    Trust writes never auto-approves shell.
     """
     m = normalize_codex_write_mode(mode)
     if m == WRITE_MODE_CHAT_ONLY:
@@ -337,6 +375,32 @@ def decide_command_execution(
     decision = (result or {}).get("decision")
     if decision == "approve":
         return _accept()
+    return _decline()
+
+
+def decide_permissions_request(
+    *,
+    mode: str,
+    params: Optional[Mapping[str, Any]],
+    workspace_cwd: Optional[str],
+) -> dict:
+    """Handle ``item/permissions/requestApproval`` — never grant outside workspace."""
+    m = normalize_codex_write_mode(mode)
+    if m == WRITE_MODE_CHAT_ONLY:
+        return _decline()
+    if not workspace_cwd or not _normalize_path(workspace_cwd):
+        return _decline()
+    params = params or {}
+    grant = params.get("grantRoot") or params.get("grant_root")
+    if isinstance(grant, str) and grant.strip():
+        if not path_under_workspace(grant, workspace_cwd):
+            return _decline()
+        # In-workspace grant: auto modes may accept; ask still declines elevation
+        # grants without an explicit Accuretta card (fail closed for permissions).
+        if m == WRITE_MODE_WORKSPACE_AUTO:
+            return _accept()
+        return _decline()
+    # No grant root — decline (do not widen sandbox silently).
     return _decline()
 
 

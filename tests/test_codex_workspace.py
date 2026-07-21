@@ -219,6 +219,7 @@ class CodexWorkspaceIntegrationTest(unittest.TestCase):
             )
         self.assertEqual(Path(captured.get("cwd")), self.ws.resolve())
         self.assertEqual(captured.get("sandbox"), "workspace-write")
+        self.assertEqual(captured.get("approval_policy"), "untrusted")
         self.assertTrue(get_bound_codex_cwd("chat-ws"))
         self.assertTrue(get_bound_codex_thread("chat-ws"))
 

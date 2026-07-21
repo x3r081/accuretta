@@ -25,7 +25,7 @@ MSG_SIGN_IN_EXPIRED = (
 MSG_INFERENCE_DISABLED = UI_REASON_INFERENCE_DISABLED
 MSG_UNAVAILABLE = UI_REASON_UNAVAILABLE
 MSG_APP_SERVER_EXITED = (
-    "Codex app-server exited. Use Retry in Settings, then try again."
+    "Codex app-server exited unexpectedly. Use Retry in Settings, then try again."
 )
 MSG_TURN_CANCELLED = "Turn cancelled."
 MSG_THREAD_INVALID = (
@@ -38,6 +38,14 @@ MSG_UNSUPPORTED_MODEL = (
     "Codex will use its default model on the next try — or pick Local llama.cpp."
 )
 MSG_TIMEOUT = "Codex timed out waiting for a reply. Try again, or pick Local llama.cpp."
+MSG_APPROVAL_TIMEOUT = (
+    "The Codex turn timed out while waiting for approval. "
+    "Approve or deny the pending request more quickly, or enable Trust writes "
+    "for in-workspace files."
+)
+MSG_WAITING_APPROVAL = "Codex is waiting for file-write approval."
+MSG_APPROVAL_UI = "The approval request could not be displayed."
+MSG_APPROVAL_REJECTED = "Codex rejected the approval response."
 MSG_BUSY = "A Codex turn is already in progress. Wait for it to finish or press Stop."
 
 
@@ -71,21 +79,40 @@ def user_message_for_codex_error(
     if cancelled:
         return MSG_TURN_CANCELLED
     if isinstance(exc, CodexInferenceError):
+        msg = exc.message or ""
+        low = msg.lower()
         if exc.event_type == CodexInferenceEventType.AUTHENTICATION_REQUIRED:
             return MSG_SIGN_IN_EXPIRED
         if exc.event_type == CodexInferenceEventType.PROCESS_ERROR:
             return MSG_APP_SERVER_EXITED
-        if is_invalid_thread_message(exc.message):
+        if is_invalid_thread_message(msg):
             return MSG_THREAD_INVALID
-        if is_unsupported_model_message(exc.message):
+        if is_unsupported_model_message(msg):
             return MSG_UNSUPPORTED_MODEL
-        if exc.event_type == CodexInferenceEventType.PROTOCOL_ERROR:
-            return MSG_PROTOCOL_FAILURE
-        if "timeout" in (exc.message or "").lower() or "timed out" in (exc.message or "").lower():
+        if "waiting for approval" in low or "approval" in low and "timed out" in low:
+            return MSG_APPROVAL_TIMEOUT
+        if "timed out" in low or "timeout" in low:
+            if "approval" in low:
+                return MSG_APPROVAL_TIMEOUT
             return MSG_TIMEOUT
-        if "already in progress" in (exc.message or "").lower():
+        if "already in progress" in low:
             return MSG_BUSY
-        return sanitize_error_message(exc.message) or MSG_UNAVAILABLE
+        if "could not be displayed" in low:
+            return MSG_APPROVAL_UI
+        if "rejected the approval" in low:
+            return MSG_APPROVAL_REJECTED
+        # Only blame CLI version when the cause is truly an unknown protocol error.
+        if exc.event_type == CodexInferenceEventType.PROTOCOL_ERROR:
+            if "protocol" in low and "version" in low:
+                return MSG_PROTOCOL_FAILURE
+            if "unsupported" in low or "not supported" in low:
+                return MSG_PROTOCOL_FAILURE
+            # Prefer the sanitized specific message over the generic CLI blame.
+            cleaned = sanitize_error_message(msg)
+            if cleaned and cleaned.lower() not in {"codex turn timed out", "turn failed"}:
+                return cleaned
+            return MSG_PROTOCOL_FAILURE
+        return sanitize_error_message(msg) or MSG_UNAVAILABLE
 
     code = getattr(exc, "code", None) or ""
     message = getattr(exc, "message", None) or str(exc)
@@ -98,14 +125,16 @@ def user_message_for_codex_error(
         return MSG_THREAD_INVALID
     if is_unsupported_model_message(message):
         return MSG_UNSUPPORTED_MODEL
-    if "app-server" in low or "process" in low and "exit" in low:
+    if "app-server" in low or ("process" in low and "exit" in low):
         return MSG_APP_SERVER_EXITED
+    if "waiting for approval" in low or ("approval" in low and "timed out" in low):
+        return MSG_APPROVAL_TIMEOUT
     if "timeout" in low or "timed out" in low:
         return MSG_TIMEOUT
-    if "protocol" in low:
-        return MSG_PROTOCOL_FAILURE
     if "already in progress" in low:
         return MSG_BUSY
+    if "protocol" in low and "version" in low:
+        return MSG_PROTOCOL_FAILURE
     return sanitize_error_message(message) or MSG_UNAVAILABLE
 
 

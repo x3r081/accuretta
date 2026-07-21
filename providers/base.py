@@ -33,6 +33,7 @@ class InferenceEventType(str, Enum):
     TEXT_DELTA = "text_delta"
     TOOL_CALL_DELTA = "tool_call_delta"
     USAGE = "usage"
+    STATUS = "status"
     ERROR = "error"
     COMPLETED = "completed"
 

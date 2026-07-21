@@ -21,9 +21,12 @@ from typing import Callable, List, Optional
 
 from .account import CodexAccountError
 from .approvals import (
+    APPROVAL_UI_TIMEOUT_S,
+    approval_policy_for_write_mode,
     cache_file_change_item,
     decide_command_execution,
     decide_file_change,
+    decide_permissions_request,
     get_codex_write_mode,
     map_legacy_decision,
     sandbox_for_write_mode,
@@ -77,6 +80,8 @@ class CodexInferenceService:
         self._active_workspace_cwd: Optional[str] = None
         # itemId → fileChange metadata from item/started (paths for approval).
         self._file_change_items: dict = {}
+        # JSON-RPC request id → pending approval metadata (dedupe / cancel).
+        self._pending_approvals: dict = {}
 
     # ---- availability -----------------------------------------------------
 
@@ -153,11 +158,12 @@ class CodexInferenceService:
                 "ChatGPT authentication required for Codex inference",
                 event_type=CodexInferenceEventType.AUTHENTICATION_REQUIRED,
             )
+        mode = get_codex_write_mode()
         params = build_thread_start_params(
             model=model,
             cwd=cwd,
-            sandbox=sandbox_for_write_mode(get_codex_write_mode()),
-            approval_policy="on-request",
+            sandbox=sandbox_for_write_mode(mode),
+            approval_policy=approval_policy_for_write_mode(mode),
         )
         try:
             result = self._session.rpc.request("thread/start", params, timeout=60.0)
@@ -225,6 +231,7 @@ class CodexInferenceService:
             thread_id = self._active_thread_id
             turn_id = self._active_turn_id
             self._cancel_requested = True
+        self._decline_pending_approvals(reason="cancel")
         if not thread_id or not turn_id:
             return False
         try:
@@ -419,6 +426,10 @@ class CodexInferenceService:
 
         Runs on a worker thread (session dispatches off the stdout reader) so
         Accuretta's blocking approval UI cannot stall Codex I/O.
+
+        Codex CLI 0.144.6 emits ``item/fileChange/requestApproval`` with
+        numeric JSON-RPC ids (often starting at 0). Response shape for v2:
+        ``{"decision": "accept"|"decline"|"cancel"|"acceptForSession"}``.
         """
         req_id = msg.get("id")
         method = str(msg.get("method") or "")
@@ -440,61 +451,176 @@ class CodexInferenceService:
                 pass
             return
 
+        # Deduplicate: only one pending approval per JSON-RPC request id.
         with self._state_lock:
+            if req_id in self._pending_approvals:
+                log.info(
+                    "codex approval: duplicate request id=%s method=%s ignored",
+                    req_id,
+                    method,
+                )
+                return
             workspace_cwd = self._active_workspace_cwd
             item_cache = dict(self._file_change_items)
-        mode = get_codex_write_mode()
+            active_thread = self._active_thread_id
+            active_turn = self._active_turn_id
+            self._pending_approvals[req_id] = {
+                "method": method,
+                "threadId": params.get("threadId") or active_thread,
+                "turnId": params.get("turnId") or active_turn,
+                "itemId": params.get("itemId"),
+                "started": time.time(),
+            }
 
-        def _request_approval(title, command, details=None, timeout_s=600):
+        # Safe protocol diagnostic (no paths/content/tokens).
+        log.info(
+            "codex approval: request id=%s method=%s thread=%s turn=%s item=%s",
+            req_id,
+            method,
+            params.get("threadId") or active_thread,
+            params.get("turnId") or active_turn,
+            params.get("itemId"),
+        )
+
+        mode = get_codex_write_mode()
+        trust_writes = False
+        try:
             import bridge
+            trust_writes = bool(bridge.get_settings().get("auto_approve_write"))
+        except Exception:
+            trust_writes = False
+
+        def _request_approval(title, command, details=None, timeout_s=APPROVAL_UI_TIMEOUT_S):
+            import bridge
+            self._emit(
+                CodexInferenceEvent(
+                    type=CodexInferenceEventType.STATUS,
+                    thread_id=active_thread,
+                    turn_id=active_turn,
+                    status="waiting_for_approval",
+                    message="Codex is waiting for file-write approval.",
+                )
+            )
             return bridge.request_approval(title, command, details, timeout_s)
 
-        if method in {
-            "item/fileChange/requestApproval",
-            "applyPatchApproval",
-        }:
-            decision = decide_file_change(
-                mode=mode,
-                params=params,
-                workspace_cwd=workspace_cwd,
-                item_cache=item_cache,
-                request_approval=_request_approval,
-            )
-            if method == "applyPatchApproval":
-                decision = map_legacy_decision(decision)
-            try:
-                rpc.respond(req_id, decision)
-            except Exception:
-                pass
-            return
-
-        if method in {
-            "item/commandExecution/requestApproval",
-            "execCommandApproval",
-        }:
-            decision = decide_command_execution(
-                mode=mode,
-                params=params,
-                workspace_cwd=workspace_cwd,
-                request_approval=_request_approval,
-            )
-            if method == "execCommandApproval":
-                decision = map_legacy_decision(decision)
-            try:
-                rpc.respond(req_id, decision)
-            except Exception:
-                pass
-            return
-
-        # Unknown / unsupported server requests: reject without hanging the turn.
+        decision: dict = {"decision": "decline"}
         try:
-            rpc.respond_error(
+            if method in {
+                "item/fileChange/requestApproval",
+                "applyPatchApproval",
+            }:
+                decision = decide_file_change(
+                    mode=mode,
+                    params=params,
+                    workspace_cwd=workspace_cwd,
+                    item_cache=item_cache,
+                    request_approval=_request_approval,
+                    timeout_s=APPROVAL_UI_TIMEOUT_S,
+                    trust_writes=trust_writes,
+                )
+                if method == "applyPatchApproval":
+                    decision = map_legacy_decision(decision)
+            elif method in {
+                "item/commandExecution/requestApproval",
+                "execCommandApproval",
+            }:
+                decision = decide_command_execution(
+                    mode=mode,
+                    params=params,
+                    workspace_cwd=workspace_cwd,
+                    request_approval=_request_approval,
+                    timeout_s=APPROVAL_UI_TIMEOUT_S,
+                )
+                if method == "execCommandApproval":
+                    decision = map_legacy_decision(decision)
+            elif method == "item/permissions/requestApproval":
+                decision = decide_permissions_request(
+                    mode=mode,
+                    params=params,
+                    workspace_cwd=workspace_cwd,
+                )
+            else:
+                try:
+                    rpc.respond_error(
+                        req_id,
+                        code=-32601,
+                        message="Server request not supported by Accuretta",
+                    )
+                except Exception:
+                    pass
+                with self._state_lock:
+                    self._pending_approvals.pop(req_id, None)
+                return
+        except Exception as exc:
+            log.info(
+                "codex approval: handler failed id=%s (%s)",
                 req_id,
-                code=-32601,
-                message="Server request not supported by Accuretta",
+                type(exc).__name__,
             )
+            decision = {"decision": "denied"} if method in {
+                "applyPatchApproval", "execCommandApproval",
+            } else {"decision": "decline"}
+        finally:
+            with self._state_lock:
+                self._pending_approvals.pop(req_id, None)
+
+        # Stale: turn/thread moved on — do not apply a late decision.
+        with self._state_lock:
+            cur_thread = self._active_thread_id
+            cur_turn = self._active_turn_id
+        req_thread = params.get("threadId")
+        req_turn = params.get("turnId")
+        if req_thread and cur_thread and req_thread != cur_thread:
+            log.info("codex approval: stale thread for id=%s — declining", req_id)
+            decision = {"decision": "decline"} if method not in {
+                "applyPatchApproval", "execCommandApproval",
+            } else {"decision": "denied"}
+        elif req_turn and cur_turn and req_turn != cur_turn:
+            log.info("codex approval: stale turn for id=%s — declining", req_id)
+            decision = {"decision": "decline"} if method not in {
+                "applyPatchApproval", "execCommandApproval",
+            } else {"decision": "denied"}
+
+        try:
+            rpc.respond(req_id, decision)
+            log.info(
+                "codex approval: responded id=%s decision=%s",
+                req_id,
+                (decision or {}).get("decision"),
+            )
+        except Exception as exc:
+            log.info(
+                "codex approval: respond failed id=%s (%s)",
+                req_id,
+                type(exc).__name__,
+            )
+
+    def _decline_pending_approvals(self, *, reason: str = "") -> None:
+        """Fail-closed: decline any open Codex approval RPCs (cancel/timeout/exit)."""
+        with self._state_lock:
+            pending = dict(self._pending_approvals)
+            self._pending_approvals.clear()
+        if not pending:
+            return
+        try:
+            rpc = self._session.rpc
         except Exception:
-            pass
+            return
+        for req_id, meta in pending.items():
+            method = str((meta or {}).get("method") or "")
+            if method in {"applyPatchApproval", "execCommandApproval"}:
+                body = {"decision": "denied"}
+            else:
+                body = {"decision": "decline"}
+            try:
+                rpc.respond(req_id, body)
+                log.info(
+                    "codex approval: force-decline id=%s reason=%s",
+                    req_id,
+                    reason or "cleanup",
+                )
+            except Exception:
+                pass
     def _run_turn_locked(
         self,
         thread_id: str,
@@ -565,6 +691,7 @@ class CodexInferenceService:
             deadline = time.time() + max(1.0, float(timeout_s))
             while time.time() < deadline:
                 if self._session.process_state() != "ready":
+                    self._decline_pending_approvals(reason="process_exit")
                     raise CodexInferenceError(
                         "Codex app-server process failed during turn",
                         event_type=CodexInferenceEventType.PROCESS_ERROR,
@@ -576,8 +703,9 @@ class CodexInferenceService:
                     self.cancel_active_turn()
                 except Exception:
                     pass
+                self._decline_pending_approvals(reason="turn_timeout")
                 raise CodexInferenceError(
-                    "Codex turn timed out",
+                    "Codex turn timed out while waiting for approval or a reply",
                     event_type=CodexInferenceEventType.PROTOCOL_ERROR,
                 )
 

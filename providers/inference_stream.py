@@ -100,8 +100,17 @@ def _inference_events_to_openai_sse(events: Iterator) -> Iterator[bytes]:
                 "choices": [{"index": 0, "delta": {"content": evt.text_delta}, "finish_reason": None}],
             }
             yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
+        elif evt.event_type == InferenceEventType.STATUS:
+            note = (evt.raw or {}).get("note") if isinstance(evt.raw, dict) else None
+            note = note or evt.error or "Waiting…"
+            chunk = {
+                "accuretta_notice": note,
+                "accuretta_status": (evt.raw or {}).get("status") if isinstance(evt.raw, dict) else None,
+                "choices": [],
+            }
+            yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
         elif evt.event_type == InferenceEventType.ERROR:
-            err = {"error": {"message": evt.error or "Codex error"}}
+            err = {"error": {"message": evt.error or "Codex error"}, "choices": []}
             yield ("data: " + json.dumps(err, ensure_ascii=False) + "\n\n").encode("utf-8")
         elif evt.event_type == InferenceEventType.COMPLETED:
             chunk = {

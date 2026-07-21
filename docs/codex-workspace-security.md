@@ -10,7 +10,7 @@ sends the workspace tree as prompt text.
 |---|---|
 | `cwd` | Normalized, symlink-resolved Accuretta workspace root (first configured folder, or the path bound to that chat) |
 | `sandbox` | `read-only` when write mode is **Chat only**; otherwise `workspace-write` |
-| `approvalPolicy` | Always `on-request` |
+| `approvalPolicy` | `untrusted` for **Ask before every write** (forces approval RPCs on Codex CLI 0.144.6); otherwise `on-request` |
 
 `danger-full-access` is **never** sent. If a caller requests it, Accuretta clamps
 to `workspace-write`.
@@ -20,7 +20,7 @@ to `workspace-write`.
 | Mode | Native file writes | Shell | Sandbox |
 |---|---|---|---|
 | **Chat only** (`chat_only`) | Always declined | Always declined | `read-only` |
-| **Ask before every write** (`ask`, default) | Accuretta approval UI; outside workspace declined | Accuretta approval UI; cwd outside workspace declined | `workspace-write` |
+| **Ask before every write** (`ask`, default) | Accuretta approval UI (`approvalPolicy: untrusted`); outside workspace declined | Accuretta approval UI | `workspace-write` |
 | **Always allow within workspace** (`workspace_auto`) | Auto-accept paths inside workspace; outside declined | Still requires approval | `workspace-write` |
 
 Shell auto-approve is **not** enabled by any of these modes. OAuth / ChatGPT

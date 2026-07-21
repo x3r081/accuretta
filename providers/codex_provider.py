@@ -462,6 +462,18 @@ class CodexProvider:
                             "correlationId": correlation,
                         },
                     )
+                elif item.type == CodexInferenceEventType.STATUS:
+                    yield InferenceEvent(
+                        event_type=InferenceEventType.STATUS,
+                        error=item.message or "",
+                        raw={
+                            "status": item.status or "status",
+                            "note": item.message or "Waiting…",
+                            "turnId": item.turn_id or turn_id_box.get("id"),
+                            "threadId": item.thread_id or thread_id,
+                            "correlationId": correlation,
+                        },
+                    )
                 elif item.type in {
                     CodexInferenceEventType.PROTOCOL_ERROR,
                     CodexInferenceEventType.PROCESS_ERROR,
