@@ -6973,16 +6973,43 @@
   }
 
   // ---------- settings drawer ----------
+  // Generation token so a slow loadProviders/select response cannot overwrite a
+  // newer user selection (or a later successful save).
+  let _providerSelectGen = 0;
+  // Pending dropdown choice while a save is in flight — populateProviderForm
+  // must not wipe it back to the previous persisted default.
+  let _pendingDefaultProviderId = null;
+
+  /** Persisted Settings default for *new* sessions — never the open session. */
+  function _settingsDefaultProviderId() {
+    return (
+      _pendingDefaultProviderId
+      || state.settings?.provider_id
+      || state.selectedProviderId
+      || "local_llama"
+    );
+  }
+
   async function loadProviders() {
+    const gen = _providerSelectGen;
     try {
       const data = await api("/api/providers");
+      if (gen !== _providerSelectGen) return; // stale
       state.providers = Array.isArray(data.providers) ? data.providers : [];
-      state.selectedProviderId = data.selectedProviderId || state.settings.provider_id || "local_llama";
+      // selectedProviderId is the Settings default for new sessions only.
+      const fromApi = data.selectedProviderId || null;
+      if (!_pendingDefaultProviderId) {
+        state.selectedProviderId = fromApi || state.settings.provider_id || "local_llama";
+        if (fromApi) state.settings.provider_id = fromApi;
+      }
       state.providerWarning = data.warning || null;
     } catch (e) {
       // Provider UI must never block local chat.
+      if (gen !== _providerSelectGen) return;
       state.providers = state.providers || [];
-      state.selectedProviderId = state.settings.provider_id || "local_llama";
+      if (!_pendingDefaultProviderId) {
+        state.selectedProviderId = state.settings.provider_id || "local_llama";
+      }
     }
   }
 
@@ -7035,7 +7062,9 @@
     const sel = $("#set-provider");
     if (!sel) return;
     const list = state.providers || [];
-    const selected = state.selectedProviderId || "local_llama";
+    // Dropdown = Settings default for new sessions. Never the open session's
+    // inference_provider_id (that would make a local session "force" Local).
+    const selected = _settingsDefaultProviderId();
     sel.innerHTML = "";
     if (!list.length) {
       const o = document.createElement("option");
@@ -7172,16 +7201,19 @@
         : "Disconnect is not applicable for Local llama.cpp";
     }
     if (btnSelect) {
-      const canSelect = !!(current && (
+      const saving = btnSelect.dataset.saving === "1";
+      const canSelect = !saving && !!(current && (
         current.providerId === "local_llama"
         || (current.providerId === "openai" && current.credentialStored)
         || (current.providerId === "codex_chatgpt" && current.selectable)
       ));
       btnSelect.disabled = !canSelect;
-      if (isCodex && current && !current.selectable) {
+      if (saving) {
+        btnSelect.title = "Saving provider selection…";
+      } else if (isCodex && current && !current.selectable) {
         btnSelect.title = current.selectionDisabledReason || "Codex is not ready to select";
       } else {
-        btnSelect.title = "Use the selected provider";
+        btnSelect.title = "Use as default for new sessions";
       }
     }
     populateGitHubAuthForm();
@@ -7773,31 +7805,61 @@
 
   async function selectProviderFromUi() {
     const sel = $("#set-provider");
-    if (!sel || !sel.value) return;
+    if (!sel) return;
+    const requested = (_pendingDefaultProviderId || sel.value || "").trim();
+    if (!requested) return;
+
+    const gen = ++_providerSelectGen;
+    _pendingDefaultProviderId = requested;
+    // Keep the dropdown on the user's choice while save is in flight.
+    if (sel.value !== requested) sel.value = requested;
+
+    const btnSelect = $("#btn-provider-select");
+    if (btnSelect) {
+      btnSelect.disabled = true;
+      btnSelect.dataset.saving = "1";
+    }
+
     const body = {};
-    if (sel.value === "openai") {
+    if (requested === "openai") {
       const mid = $("#set-openai-model")?.value;
       if (mid) body.model = mid;
     }
     try {
-      const res = await api(`/api/providers/${encodeURIComponent(sel.value)}/select`, {
+      const res = await api(`/api/providers/${encodeURIComponent(requested)}/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      if (gen !== _providerSelectGen) return; // superseded by a newer selection
       if (res.error) {
         toast(res.message || "Could not select provider", "error");
+        _pendingDefaultProviderId = null;
+        populateProviderForm();
         return;
       }
-      state.settings.provider_id = res.providerId || sel.value;
+      const savedId = res.providerId || requested;
+      state.settings.provider_id = savedId;
       if (body.model) state.settings.openai_model = body.model;
-      state.selectedProviderId = state.settings.provider_id;
+      state.selectedProviderId = savedId;
+      _pendingDefaultProviderId = null;
       await loadProviders();
+      if (gen !== _providerSelectGen) return;
       populateProviderForm();
+      // Session chrome stays on the open session; only the Settings default changed.
       refreshSessionProviderUI();
-      toast("provider updated", "ok", 1800);
+      toast("Default provider updated", "ok", 1800);
     } catch (e) {
-      toast("provider update failed", "error");
+      if (gen !== _providerSelectGen) return;
+      toast((e && e.message) ? `provider update failed: ${e.message}` : "provider update failed", "error");
+      _pendingDefaultProviderId = null;
+      populateProviderForm();
+    } finally {
+      if (gen === _providerSelectGen && btnSelect) {
+        btnSelect.dataset.saving = "";
+        // Re-evaluate disabled/title now that saving is done.
+        populateProviderForm();
+      }
     }
   }
 
@@ -9927,8 +9989,12 @@
       if (!href || href === "#") ev.preventDefault();
     });
     $("#set-provider")?.addEventListener("change", () => {
-      populateProviderForm();
-      // Persist selection immediately so Settings is source of truth for new sessions.
+      // CRITICAL: do not call populateProviderForm() here. Rebuilding the
+      // <select> from the previous state.selectedProviderId was wiping the
+      // user's new Codex choice and then selectProviderFromUi() saved Local.
+      const sel = $("#set-provider");
+      const pending = (sel && sel.value) ? sel.value : null;
+      if (pending) _pendingDefaultProviderId = pending;
       selectProviderFromUi();
     });
     $("#btn-provider-new-session")?.addEventListener("click", () => {
