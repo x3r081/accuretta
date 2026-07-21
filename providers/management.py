@@ -18,6 +18,7 @@ from .errors import (
     RateLimited,
 )
 from .example_cloud import ensure_example_cloud_registered
+from .github_provider import GITHUB_PROVIDER_ID, ensure_github_registered
 from .local_llama import ensure_local_llama_registered
 from .openai_provider import (
     OPENAI_DEFAULT_MODEL,
@@ -48,6 +49,7 @@ def ensure_builtin_providers(registry: Optional[ProviderRegistry] = None) -> Pro
     ensure_local_llama_registered(reg)
     ensure_example_cloud_registered(reg)
     ensure_openai_registered(reg)
+    ensure_github_registered(reg)
     return reg
 
 
@@ -211,6 +213,12 @@ def select_provider(provider_id: str, settings: dict, *, save: Callable[[dict], 
                 "Connect an OpenAI API key before selecting OpenAI",
                 provider_id=provider_id,
             )
+    elif definition.id == GITHUB_PROVIDER_ID:
+        raise ProviderUnavailable(
+            "GitHub connects your account only and cannot be selected for chat. "
+            "Copilot inference is not enabled.",
+            provider_id=provider_id,
+        )
     elif definition.id != DEFAULT_PROVIDER_ID:
         raise ProviderUnavailable(
             "This provider cannot be selected yet",
@@ -402,8 +410,17 @@ def start_device_authorization(provider_id: str, settings: dict) -> dict:
         )
     info = get_auth_store_info()
     manager = get_device_flow_manager()
+    on_success = None
+    store = info.store
+    if provider_id == GITHUB_PROVIDER_ID:
+        from providers.github_provider import store_github_device_result
+
+        def on_success(result):
+            store_github_device_result(info.store, result)
+
+        store = None  # github handler persists after validation
     try:
-        payload = manager.start(config, store=info.store)
+        payload = manager.start(config, store=store, on_success=on_success)
     except DeviceFlowError as exc:
         raise ProviderUnavailable(str(exc), provider_id=provider_id) from None
     except TokenExchangeFailed as exc:

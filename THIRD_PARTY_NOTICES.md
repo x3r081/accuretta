@@ -76,6 +76,11 @@ SOFTWARE.
 
 ## Newly written for Accuretta (not from Hermes)
 
-- `providers/` package interfaces, registry, runtime resolver, `LocalLlamaProvider`
-- `auth/models.py`, `auth/store.py`, `auth/keychain_store.py`
+- `providers/` package interfaces, registry, runtime resolver, `LocalLlamaProvider`,
+  `OpenAIProvider`, `github_provider` (account auth only)
+- `auth/models.py`, `auth/store.py`, `auth/keychain_store.py`, `auth/device_flow.py`,
+  `auth/device_models.py`
 - `tests/fake_oauth_server.py` and Accuretta auth/provider unit tests
+
+GitHub account login and OpenAI API-key support are Accuretta-authored. They do
+not reuse Hermes client IDs or Copilot product flows.

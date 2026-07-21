@@ -14,6 +14,7 @@
     messages: [],
     settings: {},
     providers: [],
+    githubDevice: null,
     selectedProviderId: "local_llama",
     workspace: { folders: [] },
     models: [],
@@ -6756,6 +6757,8 @@
       sel.appendChild(o);
     } else {
       for (const p of list) {
+        // Account-only providers (e.g. GitHub) are managed below — not for chat.
+        if (p.supportsInference === false) continue;
         const o = document.createElement("option");
         o.value = p.providerId;
         o.textContent = `${p.displayName}${_providerSafeLabel(p)}`;
@@ -6829,6 +6832,196 @@
         || (current.providerId === "openai" && current.credentialStored)
       ));
       btnSelect.disabled = !canSelect;
+    }
+    populateGitHubAuthForm();
+  }
+
+  let _githubDevicePollTimer = null;
+
+  function _clearGitHubDeviceUi() {
+    if (_githubDevicePollTimer) {
+      clearTimeout(_githubDevicePollTimer);
+      _githubDevicePollTimer = null;
+    }
+    const row = $("#github-device-row");
+    if (row) row.style.display = "none";
+    const codeEl = $("#github-user-code");
+    if (codeEl) codeEl.textContent = "";
+    const uriEl = $("#github-verify-uri");
+    if (uriEl) uriEl.textContent = "";
+    const openBtn = $("#btn-github-open-verify");
+    if (openBtn) {
+      openBtn.removeAttribute("href");
+      openBtn.setAttribute("aria-disabled", "true");
+    }
+  }
+
+  function populateGitHubAuthForm() {
+    const gh = (state.providers || []).find((p) => p.providerId === "github");
+    const status = $("#github-status-line");
+    const btnConnect = $("#btn-github-connect");
+    const btnDisconnect = $("#btn-github-disconnect");
+    if (!gh) {
+      if (status) status.textContent = "GitHub provider not registered.";
+      if (btnConnect) btnConnect.disabled = true;
+      if (btnDisconnect) btnDisconnect.disabled = true;
+      return;
+    }
+    if (status) {
+      if (!gh.available) {
+        status.textContent = gh.disabledReason || "GitHub login unavailable.";
+      } else if (gh.authenticated || gh.credentialStored) {
+        const label = gh.accountLabel || "GitHub account";
+        status.textContent = `Connected as ${label}. Account login only — Copilot inference is not enabled.`;
+      } else if (state.githubDevice && state.githubDevice.status === "pending") {
+        status.textContent = "Waiting for GitHub authorization…";
+      } else {
+        status.textContent = "Not connected. Connects your GitHub account only — Copilot inference is not enabled.";
+      }
+    }
+    if (btnConnect) {
+      btnConnect.disabled = !gh.available || !!(gh.authenticated || gh.credentialStored) || !!(state.githubDevice && state.githubDevice.status === "pending");
+    }
+    if (btnDisconnect) {
+      btnDisconnect.disabled = !(gh.credentialStored || gh.authenticated);
+    }
+    if (state.githubDevice && state.githubDevice.status === "pending") {
+      _showGitHubDevicePending(state.githubDevice);
+    }
+  }
+
+  function _showGitHubDevicePending(payload) {
+    const row = $("#github-device-row");
+    if (row) row.style.display = "";
+    const codeEl = $("#github-user-code");
+    if (codeEl) codeEl.textContent = payload.userCode || "";
+    const uri = payload.verificationUriComplete || payload.verificationUri || "";
+    const uriEl = $("#github-verify-uri");
+    if (uriEl) uriEl.textContent = payload.verificationUri || uri;
+    const openBtn = $("#btn-github-open-verify");
+    if (openBtn && uri) {
+      openBtn.href = uri;
+      openBtn.removeAttribute("aria-disabled");
+    }
+  }
+
+  async function startGitHubDeviceFromUi() {
+    _clearGitHubDeviceUi();
+    state.githubDevice = null;
+    try {
+      const res = await api("/api/providers/github/device/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.error) {
+        toast(res.message || "Could not start GitHub login", "error");
+        return;
+      }
+      // Keep device UI state in memory only — never localStorage.
+      state.githubDevice = {
+        status: res.status || "pending",
+        userCode: res.userCode,
+        verificationUri: res.verificationUri,
+        verificationUriComplete: res.verificationUriComplete,
+        pollIntervalSeconds: res.pollIntervalSeconds || 5,
+        expiresAt: res.expiresAt,
+      };
+      _showGitHubDevicePending(state.githubDevice);
+      populateGitHubAuthForm();
+      _scheduleGitHubDevicePoll();
+    } catch (e) {
+      toast("GitHub login failed to start", "error");
+    }
+  }
+
+  function _scheduleGitHubDevicePoll() {
+    if (_githubDevicePollTimer) clearTimeout(_githubDevicePollTimer);
+    const interval = Math.max(2, Number(state.githubDevice?.pollIntervalSeconds || 5)) * 1000;
+    _githubDevicePollTimer = setTimeout(_pollGitHubDeviceStatus, interval);
+  }
+
+  async function _pollGitHubDeviceStatus() {
+    _githubDevicePollTimer = null;
+    try {
+      const res = await api("/api/providers/github/device/status");
+      if (!res || res.error) {
+        _scheduleGitHubDevicePoll();
+        return;
+      }
+      const st = res.status;
+      if (st === "pending") {
+        state.githubDevice = {
+          status: "pending",
+          userCode: res.userCode || state.githubDevice?.userCode,
+          verificationUri: res.verificationUri || state.githubDevice?.verificationUri,
+          verificationUriComplete: res.verificationUriComplete || state.githubDevice?.verificationUriComplete,
+          pollIntervalSeconds: res.pollIntervalSeconds || state.githubDevice?.pollIntervalSeconds || 5,
+          expiresAt: res.expiresAt || state.githubDevice?.expiresAt,
+        };
+        _showGitHubDevicePending(state.githubDevice);
+        populateGitHubAuthForm();
+        _scheduleGitHubDevicePoll();
+        return;
+      }
+      // Terminal — clear codes from memory (never persisted to browser storage).
+      state.githubDevice = null;
+      _clearGitHubDeviceUi();
+      await loadProviders();
+      populateProviderForm();
+      if (st === "authorized") toast("GitHub account connected", "ok", 2200);
+      else if (st === "denied") toast("GitHub authorization denied", "warn");
+      else if (st === "expired") toast("GitHub login expired", "warn");
+      else if (st === "cancelled") toast("GitHub login cancelled", "warn");
+      else if (st === "failed") toast(res.error || "GitHub login failed", "error");
+    } catch (e) {
+      _scheduleGitHubDevicePoll();
+    }
+  }
+
+  async function cancelGitHubDeviceFromUi() {
+    try {
+      await api("/api/providers/github/device/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch (e) { /* ignore */ }
+    state.githubDevice = null;
+    _clearGitHubDeviceUi();
+    await loadProviders();
+    populateProviderForm();
+  }
+
+  async function disconnectGitHubFromUi() {
+    try {
+      const res = await api("/api/providers/github/disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.error) {
+        toast(res.message || "Disconnect failed", "error");
+        return;
+      }
+      state.githubDevice = null;
+      _clearGitHubDeviceUi();
+      await loadProviders();
+      populateProviderForm();
+      toast("GitHub disconnected", "ok", 1800);
+    } catch (e) {
+      toast("GitHub disconnect failed", "error");
+    }
+  }
+
+  async function copyGitHubUserCode() {
+    const code = $("#github-user-code")?.textContent || "";
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      toast("code copied", "ok", 1400);
+    } catch (e) {
+      toast("could not copy", "warn");
     }
   }
 
@@ -8925,6 +9118,14 @@
     $("#btn-provider-disconnect")?.addEventListener("click", disconnectProviderFromUi);
     $("#btn-provider-connect")?.addEventListener("click", connectProviderFromUi);
     $("#btn-openai-models")?.addEventListener("click", refreshOpenAIModels);
+    $("#btn-github-connect")?.addEventListener("click", startGitHubDeviceFromUi);
+    $("#btn-github-disconnect")?.addEventListener("click", disconnectGitHubFromUi);
+    $("#btn-github-cancel")?.addEventListener("click", cancelGitHubDeviceFromUi);
+    $("#btn-github-copy-code")?.addEventListener("click", copyGitHubUserCode);
+    $("#btn-github-open-verify")?.addEventListener("click", (ev) => {
+      const href = $("#btn-github-open-verify")?.getAttribute("href");
+      if (!href || href === "#") ev.preventDefault();
+    });
     $("#set-provider")?.addEventListener("change", populateProviderForm);
     $("#btn-cmd-history")?.addEventListener("click", openCmdHistory);
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);

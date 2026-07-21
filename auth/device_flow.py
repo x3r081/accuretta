@@ -30,37 +30,20 @@ from .device_models import (
     safe_device_start_payload,
     safe_device_status_payload,
 )
+from .device_registry import (
+    clear_device_config_factories,
+    register_device_config_factory,
+    resolve_device_config,
+    unregister_device_config_factory,
+)
 
 log = logging.getLogger("accuretta.auth.device_flow")
 
 PostForm = Callable[[str, Dict[str, str]], Dict[str, Any]]
 SleepFn = Callable[[float], bool]  # returns False if cancelled
 
-_DEVICE_CONFIG_FACTORIES: Dict[str, Callable[[], DeviceAuthorizationConfig]] = {}
 _MANAGER: Optional["DeviceFlowManager"] = None
 _MANAGER_LOCK = threading.Lock()
-
-
-def register_device_config_factory(
-    provider_id: str,
-    factory: Callable[[], DeviceAuthorizationConfig],
-) -> None:
-    _DEVICE_CONFIG_FACTORIES[provider_id] = factory
-
-
-def unregister_device_config_factory(provider_id: str) -> None:
-    _DEVICE_CONFIG_FACTORIES.pop(provider_id, None)
-
-
-def clear_device_config_factories() -> None:
-    _DEVICE_CONFIG_FACTORIES.clear()
-
-
-def resolve_device_config(provider_id: str) -> Optional[DeviceAuthorizationConfig]:
-    factory = _DEVICE_CONFIG_FACTORIES.get(provider_id)
-    if factory is None:
-        return None
-    return factory()
 
 
 def get_device_flow_manager() -> "DeviceFlowManager":
@@ -78,6 +61,19 @@ def reset_device_flow_manager() -> None:
         if _MANAGER is not None:
             _MANAGER.shutdown()
         _MANAGER = None
+
+
+# Re-export registry helpers for existing imports.
+__all__ = [
+    "DeviceFlowError",
+    "DeviceFlowManager",
+    "clear_device_config_factories",
+    "get_device_flow_manager",
+    "register_device_config_factory",
+    "reset_device_flow_manager",
+    "resolve_device_config",
+    "unregister_device_config_factory",
+]
 
 
 class DeviceFlowError(Exception):

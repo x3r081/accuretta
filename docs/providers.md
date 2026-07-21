@@ -2,7 +2,8 @@
 
 Accuretta routes inference through a small provider layer. **Local llama.cpp
 remains the default.** This release also includes an **experimental OpenAI API
-key** provider. No other cloud providers are supported.
+key** provider and **experimental GitHub account login** (authentication only —
+not Copilot inference). No other cloud inference providers are supported.
 
 ## Architecture
 
@@ -68,6 +69,57 @@ Cancellation closes the HTTP stream and uses the existing `/api/cancel` path.
 
 Disconnecting OpenAI while it is selected blocks new OpenAI chats (401) until
 you reconnect or select local llama — Accuretta does **not** silently fall back.
+
+## GitHub account authentication (experimental)
+
+- **id:** `github`
+- **auth:** OAuth 2.0 device authorization (`auth_type: oauth_device`)
+- **purpose:** prove Accuretta can sign in a GitHub **account**
+- **does not** enable GitHub Copilot inference, model listing, or chat
+- **supports_inference:** `false`
+
+### Configuration
+
+Set an Accuretta-owned GitHub OAuth App client ID:
+
+```bash
+export ACCURETTA_GITHUB_CLIENT_ID="your-accuretta-oauth-app-client-id"
+```
+
+Create the OAuth App under the Accuretta GitHub organization/account. Enable
+**Device Flow**. No client secret is required for the public device flow Accuretta
+uses. Do **not** reuse client IDs from Hermes, VS Code, GitHub CLI, GitHub Copilot,
+or OpenAI Codex.
+
+If `ACCURETTA_GITHUB_CLIENT_ID` is unset, the GitHub provider remains visible but
+unavailable; local llama and OpenAI keep working and startup does not fail.
+
+### Scopes
+
+| Scope | Why |
+|---|---|
+| `read:user` | Read profile login/id to show a safe account label after connect |
+
+No repository, workflow, org-admin, package, email, or Copilot scopes.
+
+### Flow
+
+1. Settings → GitHub account → Connect GitHub
+2. Bridge starts device authorization and shows `userCode` + verification URL
+3. Bridge polls GitHub’s token endpoint (frontend never talks to GitHub)
+4. On success, Accuretta calls `GET https://api.github.com/user` to validate
+5. Stores access token + minimal metadata (`account_label`, `account_id`, scopes, validation time)
+
+GitHub typically returns a non-expiring token without a refresh token — Accuretta
+does not invent expiry or refresh behavior.
+
+Disconnect deletes the stored GitHub credential, clears metadata, and cancels any
+pending device session. OpenAI / local credentials are untouched.
+
+### Capabilities advertised
+
+`account_authentication`, `device_authorization` only — never `inference`,
+`streaming`, `models`, or Copilot.
 
 ## Demonstration provider
 

@@ -104,3 +104,5 @@ def _register_builtins(registry: ProviderRegistry) -> None:
     ensure_local_llama_registered(registry)
     ensure_example_cloud_registered(registry)
     ensure_openai_registered(registry)
+    # GitHub is registered from providers.management.ensure_builtin_providers
+    # to avoid auth.device_flow ↔ providers import cycles at package import.

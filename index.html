@@ -564,6 +564,24 @@
         <button type="button" class="btn sm" id="btn-provider-disconnect" title="Disconnect" disabled>Disconnect</button>
         <button type="button" class="btn sm" id="btn-openai-models" title="Refresh OpenAI models" style="display:none;">Refresh models</button>
       </div>
+      <div id="github-auth-section" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border, #333);">
+        <label>GitHub account</label>
+        <span class="hint" id="github-auth-hint">Connects your GitHub account only. Copilot inference is not enabled. Experimental.</span>
+        <div id="github-status-line" class="hint" style="margin-top:6px;" role="status" aria-live="polite"></div>
+        <div id="github-device-row" style="display:none;margin-top:10px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <code id="github-user-code" aria-label="GitHub device user code"></code>
+            <button type="button" class="btn sm" id="btn-github-copy-code" title="Copy user code">Copy code</button>
+            <a class="btn sm" id="btn-github-open-verify" href="#" target="_blank" rel="noopener noreferrer" title="Open verification page">Open verification page</a>
+            <button type="button" class="btn sm" id="btn-github-cancel" title="Cancel GitHub device login">Cancel</button>
+          </div>
+          <span class="hint" id="github-verify-uri" style="display:block;margin-top:6px;word-break:break-all;"></span>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+          <button type="button" class="btn sm" id="btn-github-connect" title="Connect GitHub account">Connect GitHub</button>
+          <button type="button" class="btn sm" id="btn-github-disconnect" title="Disconnect GitHub account" disabled>Disconnect</button>
+        </div>
+      </div>
     </div>
 
     <div class="form-group">Model</div>

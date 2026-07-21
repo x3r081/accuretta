@@ -88,12 +88,14 @@ secret POST — prefer HTTPS when exposing Accuretta beyond localhost.
 
 - **Local llama.cpp:** disconnect is not applicable (button hidden/disabled).
 - **OpenAI API:** password input + Connect/Update key; Disconnect removes the key.
+- **GitHub account:** device-flow Connect GitHub (user code + verification URL);
+  Disconnect removes the GitHub credential only. Cannot be selected for chat.
 - **Example cloud (demo):** Connect disabled; Disconnect clears fake credentials if present.
 
 ## Fake-provider tests
 
 ```bash
-python3 -m unittest tests.test_oauth_flow tests.test_auth_store tests.test_providers_api tests.test_openai_provider tests.test_refresh_classification tests.test_device_flow -v
+python3 -m unittest tests.test_oauth_flow tests.test_auth_store tests.test_providers_api tests.test_openai_provider tests.test_refresh_classification tests.test_device_flow tests.test_github_provider -v
 ```
 
 These use in-process fakes and temporary credential files. No test contacts a
