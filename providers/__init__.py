@@ -4,7 +4,6 @@ Newly written for Accuretta. Local llama.cpp remains the default backend;
 cloud providers plug in later behind the same interfaces.
 """
 
-from .local_llama import LocalLlamaProvider, LOCAL_LLAMA_DEFINITION, ensure_local_llama_registered
 from .base import (
     ApiMode,
     AuthType,
@@ -29,7 +28,11 @@ from .errors import (
     TokenExchangeFailed,
     TokenRefreshFailed,
 )
+from .example_cloud import EXAMPLE_CLOUD_DEFINITION, ensure_example_cloud_registered
+from .local_llama import LOCAL_LLAMA_DEFINITION, LocalLlamaProvider, ensure_local_llama_registered
 from .registry import ProviderRegistry, get_default_registry
+from .selection import DEFAULT_PROVIDER_ID, resolve_provider_selection
+from .status import assert_safe_provider_payload, build_safe_provider_status
 
 __all__ = [
     "ApiMode",
@@ -37,6 +40,8 @@ __all__ = [
     "AuthenticationCancelled",
     "AuthenticationExpired",
     "AuthenticationRequired",
+    "DEFAULT_PROVIDER_ID",
+    "EXAMPLE_CLOUD_DEFINITION",
     "InferenceEvent",
     "InferenceEventType",
     "InferenceProvider",
@@ -55,6 +60,10 @@ __all__ = [
     "RuntimeCredentials",
     "TokenExchangeFailed",
     "TokenRefreshFailed",
+    "assert_safe_provider_payload",
+    "build_safe_provider_status",
+    "ensure_example_cloud_registered",
     "ensure_local_llama_registered",
     "get_default_registry",
+    "resolve_provider_selection",
 ]

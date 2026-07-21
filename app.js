@@ -13,6 +13,8 @@
     chatId: null,
     messages: [],
     settings: {},
+    providers: [],
+    selectedProviderId: "local_llama",
     workspace: { folders: [] },
     models: [],
     mode: "auto",          // auto | ide | agent
@@ -2052,6 +2054,7 @@
 
     await Promise.all([
       loadSettings(),
+      loadProviders(),
       loadWorkspace(),
       loadChats(),
       loadModels(),
@@ -6632,6 +6635,13 @@
         renderApprovals();
       } else if (evt.type === "settings:update") {
         loadSettings().then(renderStatus).then(renderModelPill);
+        loadProviders().then(() => {
+          if ($("#settings-drawer")?.classList.contains("open")) populateProviderForm();
+        });
+      } else if (evt.type === "providers:update") {
+        loadProviders().then(() => {
+          if ($("#settings-drawer")?.classList.contains("open")) populateProviderForm();
+        });
       } else if (evt.type === "workspace:update") {
         loadWorkspace().then(renderWorkspace);
       } else if (evt.type === "chat:rename") {
@@ -6709,10 +6719,140 @@
   }
 
   // ---------- settings drawer ----------
+  async function loadProviders() {
+    try {
+      const data = await api("/api/providers");
+      state.providers = Array.isArray(data.providers) ? data.providers : [];
+      state.selectedProviderId = data.selectedProviderId || state.settings.provider_id || "local_llama";
+      state.providerWarning = data.warning || null;
+    } catch (e) {
+      // Provider UI must never block local chat.
+      state.providers = state.providers || [];
+      state.selectedProviderId = state.settings.provider_id || "local_llama";
+    }
+  }
+
+  function _providerSafeLabel(p) {
+    const bits = [];
+    if (p.isDefault) bits.push("default");
+    if (p.experimental) bits.push("experimental");
+    if (!p.available) bits.push("unavailable");
+    else if (p.authType === "none") bits.push("local");
+    else if (p.authenticated) bits.push("signed in");
+    else bits.push("not connected");
+    return bits.length ? ` — ${bits.join(", ")}` : "";
+  }
+
+  function populateProviderForm() {
+    const sel = $("#set-provider");
+    if (!sel) return;
+    const list = state.providers || [];
+    const selected = state.selectedProviderId || "local_llama";
+    sel.innerHTML = "";
+    if (!list.length) {
+      const o = document.createElement("option");
+      o.value = "local_llama";
+      o.textContent = "Local llama.cpp — default";
+      sel.appendChild(o);
+    } else {
+      for (const p of list) {
+        const o = document.createElement("option");
+        o.value = p.providerId;
+        o.textContent = `${p.displayName}${_providerSafeLabel(p)}`;
+        o.disabled = !p.available;
+        if (p.providerId === selected) o.selected = true;
+        sel.appendChild(o);
+      }
+    }
+    const current = list.find((p) => p.providerId === (sel.value || selected)) || list.find((p) => p.providerId === "local_llama");
+    const status = $("#provider-status-line");
+    if (status) {
+      if (!current) {
+        status.textContent = "Using Local llama.cpp.";
+      } else if (!current.available) {
+        status.textContent = current.disabledReason || "This provider is unavailable.";
+      } else if (current.providerId === "local_llama") {
+        status.textContent = "Local llama.cpp — runs on this machine. No cloud account required.";
+      } else {
+        status.textContent = current.authenticated ? "Connected." : "Not connected.";
+      }
+      if (state.providerWarning) {
+        status.textContent = (status.textContent ? status.textContent + " " : "") + state.providerWarning;
+      }
+    }
+    const btnConnect = $("#btn-provider-connect");
+    const btnDisconnect = $("#btn-provider-disconnect");
+    const btnSelect = $("#btn-provider-select");
+    if (btnConnect) {
+      const canConnect = !!(current && current.available && current.authType && current.authType !== "none");
+      btnConnect.disabled = true; // Phase 5: connect not offered for any provider
+      btnConnect.title = canConnect
+        ? "Connect is not available in this release"
+        : "Connect is not applicable";
+    }
+    if (btnDisconnect) {
+      const showDisconnect = !!(current && current.authType && current.authType !== "none");
+      btnDisconnect.disabled = !showDisconnect;
+      btnDisconnect.hidden = !showDisconnect;
+      btnDisconnect.title = showDisconnect
+        ? "Remove stored credentials for this provider"
+        : "Disconnect is not applicable for Local llama.cpp";
+    }
+    if (btnSelect) {
+      btnSelect.disabled = !(current && current.available);
+    }
+  }
+
+  async function selectProviderFromUi() {
+    const sel = $("#set-provider");
+    if (!sel || !sel.value) return;
+    try {
+      const res = await api(`/api/providers/${encodeURIComponent(sel.value)}/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.error) {
+        toast(res.message || "Could not select provider", "error");
+        return;
+      }
+      state.settings.provider_id = res.providerId || sel.value;
+      state.selectedProviderId = state.settings.provider_id;
+      await loadProviders();
+      populateProviderForm();
+      toast("provider updated", "ok", 1800);
+    } catch (e) {
+      toast("provider update failed", "error");
+    }
+  }
+
+  async function disconnectProviderFromUi() {
+    const sel = $("#set-provider");
+    if (!sel || !sel.value) return;
+    if (sel.value === "local_llama") return;
+    try {
+      const res = await api(`/api/providers/${encodeURIComponent(sel.value)}/disconnect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.error) {
+        toast(res.message || "Disconnect failed", "error");
+        return;
+      }
+      await loadProviders();
+      populateProviderForm();
+      toast(res.message || "disconnected", "ok", 1800);
+    } catch (e) {
+      toast("disconnect failed", "error");
+    }
+  }
+
   async function openSettings() {
     $("#drawer-scrim").classList.add("open");
     $("#settings-drawer").classList.add("open");
     await loadModels();
+    await loadProviders();
     populateSettingsForm();
     loadSystemContext();
     loadDetectedVram();
@@ -7189,6 +7329,8 @@
   function populateSettingsForm() {
     const s = state.settings;
     const fill = (id, v) => { const el = $(id); if (el) el.value = v ?? ""; };
+
+    populateProviderForm();
 
     // models folder + dropdown
     const dirInput = $("#set-models-dir");
@@ -8683,6 +8825,9 @@
     $("#btn-settings-m")?.addEventListener("click", openSettings);
     $("#btn-close-settings").addEventListener("click", closeSettings);
     $("#drawer-scrim").addEventListener("click", closeSettings);
+    $("#btn-provider-select")?.addEventListener("click", selectProviderFromUi);
+    $("#btn-provider-disconnect")?.addEventListener("click", disconnectProviderFromUi);
+    $("#set-provider")?.addEventListener("change", populateProviderForm);
     $("#btn-cmd-history")?.addEventListener("click", openCmdHistory);
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);
     $("#cmd-history-scrim")?.addEventListener("click", closeCmdHistory);

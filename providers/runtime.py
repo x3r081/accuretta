@@ -125,29 +125,22 @@ def safe_provider_status(
     expires_at: Optional[str] = None,
     account_label: Optional[str] = None,
     error: Optional[str] = None,
+    available: bool = True,
+    selected: bool = False,
+    is_default: bool = False,
+    disabled_reason: Optional[str] = None,
 ) -> dict:
     """Frontend-safe status payload — never includes tokens."""
-    caps = definition.capabilities
-    return {
-        "providerId": definition.id,
-        "displayName": definition.display_name,
-        "authenticated": bool(authenticated),
-        "expiresAt": expires_at,
-        "accountLabel": account_label,
-        "authType": definition.auth_type.value,
-        "apiMode": definition.api_mode.value,
-        "experimental": definition.experimental,
-        "enabled": definition.enabled,
-        "capabilities": [
-            name
-            for name, enabled in (
-                ("streaming", caps.streaming),
-                ("tools", caps.tools),
-                ("vision", caps.vision),
-                ("cancellation", caps.cancellation),
-                ("model_listing", caps.model_listing),
-            )
-            if enabled
-        ],
-        "error": error,
-    }
+    from .status import build_safe_provider_status
+
+    return build_safe_provider_status(
+        definition,
+        authenticated=authenticated,
+        available=available,
+        selected=selected,
+        is_default=is_default,
+        expires_at=expires_at,
+        account_label=account_label,
+        disabled_reason=disabled_reason,
+        error=error,
+    )

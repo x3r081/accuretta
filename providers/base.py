@@ -55,6 +55,8 @@ class ProviderDefinition:
     supports_model_listing: bool = True
     experimental: bool = False
     enabled: bool = True
+    # Human-readable reason when enabled=False (shown in UI; never secrets).
+    disabled_reason: Optional[str] = None
 
 
 @dataclass

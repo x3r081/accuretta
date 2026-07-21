@@ -590,6 +590,9 @@ DEFAULT_SETTINGS = {
     # Native-binary analysis via Ghidra (in-process through pyghidra).
     "ghidra_path": "",              # Ghidra install root, e.g. C:\Program Files\ghidra_12.0.4_PUBLIC.
                                     # Blank = use $GHIDRA_INSTALL_DIR. Requires JDK 21+ + `pip install pyghidra`.
+    # Inference provider selection. Missing/empty always resolves to local_llama.
+    # Credentials are NEVER stored in settings — only the provider id.
+    "provider_id": "local_llama",
 }
 
 
@@ -16051,6 +16054,73 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- API routes
 
+    def _handle_providers_get(self, p: str):
+        """Safe provider catalog / status / models — never returns credentials."""
+        try:
+            from providers.management import (
+                get_provider_status,
+                list_models_for_provider,
+                list_provider_statuses,
+            )
+            settings = get_settings()
+            if p == "/api/providers":
+                return self._send_json(200, list_provider_statuses(settings))
+            parts = [x for x in p.split("/") if x]
+            # ["api", "providers", "<id>", ...]
+            if len(parts) < 3:
+                return self._send_json(404, {"error": "not found"})
+            provider_id = urllib.parse.unquote(parts[2])
+            if len(parts) == 3:
+                return self._send_json(200, get_provider_status(provider_id, settings))
+            action = parts[3]
+            if len(parts) == 4 and action == "status":
+                return self._send_json(200, get_provider_status(provider_id, settings))
+            if len(parts) == 4 and action == "models":
+                return self._send_json(200, list_models_for_provider(provider_id))
+            return self._send_json(404, {"error": "not found"})
+        except Exception as exc:
+            from providers.management import provider_http_error
+            status, body = provider_http_error(exc)
+            return self._send_json(status, body)
+
+    def _handle_providers_post(self, p: str, body: dict):
+        """Select / disconnect providers. Connect is not offered in Phase 5."""
+        try:
+            from providers.management import (
+                disconnect_provider,
+                select_provider,
+            )
+            parts = [x for x in p.split("/") if x]
+            if len(parts) < 4:
+                return self._send_json(404, {"error": "not found"})
+            provider_id = urllib.parse.unquote(parts[2])
+            action = parts[3]
+            settings = get_settings()
+
+            def _save(updated: dict):
+                save_json(SETTINGS_FILE, updated)
+                broadcast_event({"type": "settings:update"})
+                broadcast_event({"type": "providers:update"})
+
+            if action == "select":
+                result = select_provider(provider_id, settings, save=_save)
+                return self._send_json(200, result)
+            if action == "disconnect":
+                result = disconnect_provider(provider_id, settings)
+                broadcast_event({"type": "providers:update"})
+                return self._send_json(200, result)
+            if action == "connect":
+                return self._send_json(409, {
+                    "error": "provider_unavailable",
+                    "message": "Connect is not available in this release",
+                    "providerId": provider_id,
+                })
+            return self._send_json(404, {"error": "not found"})
+        except Exception as exc:
+            from providers.management import provider_http_error
+            status, err = provider_http_error(exc)
+            return self._send_json(status, err)
+
     def _handle_api_get(self, p: str, parsed):
         if p == "/api/health":
             life = _llama.lifecycle_snapshot()
@@ -16112,6 +16182,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, recommended_settings(name))
         if p == "/api/settings":
             return self._send_json(200, get_settings())
+        if p == "/api/providers" or p.startswith("/api/providers/"):
+            return self._handle_providers_get(p)
         if p == "/api/savings":
             # Lifetime token totals for the "saved vs cloud" card. Server-side so
             # it survives restarts and follows the machine, not the browser.
@@ -16511,6 +16583,8 @@ class Handler(BaseHTTPRequestHandler):
             save_json(SETTINGS_FILE, cur)
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
+        if p == "/api/providers" or p.startswith("/api/providers/"):
+            return self._handle_providers_post(p, body)
         if p == "/api/workspace":
             folders = body.get("folders") or []
             folders = [normalize_path(f) for f in folders if isinstance(f, str) and f.strip()]
@@ -17109,6 +17183,17 @@ class Handler(BaseHTTPRequestHandler):
         regenerate = bool(body.get("regenerate"))
         if not user_text and not images and not regenerate:
             return self._send_json(400, {"error": "empty message"})
+
+        # Provider gate (Phase 5): resolve selected provider before any llama work.
+        # Only LocalLlamaProvider is inference-capable in this release. Chat
+        # orchestration still uses run_chat_turn (compatibility adapter) so the
+        # existing SSE contract, tools, and cancellation stay unchanged.
+        try:
+            from providers.management import provider_http_error, resolve_chat_provider
+            resolve_chat_provider(get_settings())
+        except Exception as exc:
+            status, err_body = provider_http_error(exc)
+            return self._send_json(status, err_body)
 
         # Two paths for incoming images:
         #   (a) The loaded model has its own vision tower (we booted with

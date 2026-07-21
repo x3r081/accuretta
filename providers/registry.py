@@ -97,6 +97,8 @@ def reset_default_registry() -> None:
 def _register_builtins(registry: ProviderRegistry) -> None:
     # Import locally to attach definition + factory without circular imports
     # at module load of registry.py.
+    from .example_cloud import ensure_example_cloud_registered
     from .local_llama import ensure_local_llama_registered
 
     ensure_local_llama_registered(registry)
+    ensure_example_cloud_registered(registry)

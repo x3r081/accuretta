@@ -542,6 +542,19 @@
     <button class="iconbtn" id="btn-close-settings"><i class="ph ph-x"></i></button>
   </div>
   <div class="drawer-body" id="settings-body">
+    <div class="form-group">Provider</div>
+    <div class="form-row" id="provider-section">
+      <label for="set-provider">Inference provider</label>
+      <select id="set-provider" aria-describedby="set-provider-hint"></select>
+      <span class="hint" id="set-provider-hint">Local llama.cpp is the default. Cloud providers are experimental and may be unavailable.</span>
+      <div id="provider-status-line" class="hint" style="margin-top:6px;" role="status" aria-live="polite"></div>
+      <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+        <button type="button" class="btn sm" id="btn-provider-select" title="Use the selected provider">Use provider</button>
+        <button type="button" class="btn sm" id="btn-provider-connect" title="Connect" disabled>Connect</button>
+        <button type="button" class="btn sm" id="btn-provider-disconnect" title="Disconnect" disabled>Disconnect</button>
+      </div>
+    </div>
+
     <div class="form-group">Model</div>
     <div class="form-row">
       <label>Models folder</label>
