@@ -86,6 +86,22 @@ class ProviderUnavailable(ProviderError):
 class RateLimited(ProviderError):
     code = "rate_limited"
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_id: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ):
+        super().__init__(message, provider_id=provider_id)
+        self.retry_after = retry_after
+
+    def to_safe_dict(self) -> dict:
+        out = super().to_safe_dict()
+        if self.retry_after is not None:
+            out["retryAfterSeconds"] = self.retry_after
+        return out
+
 
 class InvalidProviderResponse(ProviderError):
     code = "invalid_provider_response"

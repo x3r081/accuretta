@@ -112,17 +112,23 @@ def open_provider_chat_stream(
                 provider_id=OPENAI_PROVIDER_ID,
             )
         provider = OpenAIProvider()
-        resp = provider.open_chat_stream(payload, api_key=api_key)
+        resp = provider.open_chat_stream(payload, api_key=api_key, cancel_ev=cancel_ev)
 
         def _iter_openai():
-            # Re-frame parsed objects is unnecessary — read raw SSE bytes.
-            while True:
-                if cancel_ev is not None and cancel_ev.is_set():
-                    return
-                chunk = resp.read(1024)
-                if not chunk:
-                    return
-                yield chunk
+            try:
+                while True:
+                    if cancel_ev is not None and cancel_ev.is_set():
+                        return
+                    try:
+                        chunk = resp.read(1024)
+                    except Exception:
+                        return
+                    if not chunk:
+                        return
+                    yield chunk
+            finally:
+                # Caller also closes; belt-and-suspenders for early cancel.
+                pass
 
         return resp, _iter_openai()
 

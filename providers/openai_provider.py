@@ -7,16 +7,15 @@ client registrations.
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
-import re
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from auth.models import StoredCredential
-from auth.redact import redact_sensitive_text
 from auth.store import AuthStore
 
 from .base import (
@@ -36,6 +35,7 @@ from .errors import (
     RateLimited,
 )
 from .registry import ProviderRegistry, get_default_registry
+from .retry import parse_retry_after, with_retries
 
 log = logging.getLogger("accuretta.providers.openai")
 
@@ -65,7 +65,6 @@ OPENAI_DEFINITION = ProviderDefinition(
     disabled_reason=None,
 )
 
-# Conservative allowlist / prefixes for chat-oriented models.
 _CHAT_MODEL_PREFIXES = (
     "gpt-4",
     "gpt-3.5",
@@ -86,7 +85,6 @@ def ensure_openai_registered(registry: Optional[ProviderRegistry] = None) -> Non
 
 
 def validate_api_key_format(api_key: str) -> Optional[str]:
-    """Return an error message if the key looks unusable, else None."""
     if not isinstance(api_key, str):
         return "API key is required"
     key = api_key.strip()
@@ -96,8 +94,6 @@ def validate_api_key_format(api_key: str) -> Optional[str]:
         return "API key must not contain whitespace"
     if len(key) < 20:
         return "API key looks too short"
-    # Official keys commonly start with sk-; accept other prefixes cautiously
-    # but reject obvious placeholders.
     lowered = key.lower()
     if lowered in {"sk-...", "your-api-key", "changeme", "xxx"}:
         return "API key looks like a placeholder"
@@ -131,7 +127,6 @@ def is_chat_model_id(model_id: str) -> bool:
     mid = (model_id or "").strip().lower()
     if not mid:
         return False
-    # Exclude obvious non-chat endpoints.
     if any(x in mid for x in ("embedding", "whisper", "tts", "dall-e", "davinci-moderation", "transcribe")):
         return False
     return mid.startswith(_CHAT_MODEL_PREFIXES)
@@ -140,8 +135,34 @@ def is_chat_model_id(model_id: str) -> bool:
 def model_capabilities(model_id: str) -> Dict[str, bool]:
     mid = (model_id or "").lower()
     vision = any(x in mid for x in ("gpt-4o", "gpt-4.1", "gpt-5", "vision"))
-    tools = not mid.startswith("o1-mini")  # conservative
+    tools = not mid.startswith("o1-mini")
     return {"streaming": True, "tools": tools, "vision": vision}
+
+
+def normalize_usage(usage: Any) -> Optional[dict]:
+    """Safe usage fields only — no cost, no raw dump."""
+    if not isinstance(usage, dict):
+        return None
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+    completion = usage.get("completion_tokens", usage.get("output_tokens"))
+    total = usage.get("total_tokens")
+    out: dict = {}
+    for key, val in (
+        ("prompt_tokens", prompt),
+        ("completion_tokens", completion),
+        ("total_tokens", total),
+    ):
+        if val is None:
+            continue
+        try:
+            out[key] = int(val)
+        except (TypeError, ValueError):
+            continue
+    if not out:
+        return None
+    if "total_tokens" not in out and "prompt_tokens" in out and "completion_tokens" in out:
+        out["total_tokens"] = out["prompt_tokens"] + out["completion_tokens"]
+    return out
 
 
 class OpenAIProvider:
@@ -152,9 +173,11 @@ class OpenAIProvider:
         *,
         base_url: str = OPENAI_DEFAULT_BASE,
         transport: Any = None,
+        max_attempts: int = 3,
     ):
         self.base_url = (base_url or OPENAI_DEFAULT_BASE).rstrip("/")
-        self._transport = transport  # optional injectable for tests
+        self._transport = transport
+        self.max_attempts = max(1, int(max_attempts))
 
     @property
     def definition(self) -> ProviderDefinition:
@@ -173,7 +196,35 @@ class OpenAIProvider:
             "Accept": "application/json",
         }
 
-    def _request_json(
+    def _map_http_error(self, status: int, raw: str, *, headers: Optional[dict] = None):
+        _ = raw  # never put body into the exception message
+        retry_after = None
+        if headers:
+            retry_after = parse_retry_after(
+                headers.get("Retry-After") or headers.get("retry-after")
+            )
+        if status in (401, 403):
+            return AuthenticationRequired(
+                "OpenAI rejected the API key or access is forbidden",
+                provider_id=OPENAI_PROVIDER_ID,
+            )
+        if status == 429:
+            return RateLimited(
+                "OpenAI rate limit exceeded; try again later",
+                provider_id=OPENAI_PROVIDER_ID,
+                retry_after=retry_after,
+            )
+        if status in (500, 502, 503, 504) or 500 <= status <= 599:
+            return ProviderUnavailable(
+                "OpenAI is temporarily unavailable",
+                provider_id=OPENAI_PROVIDER_ID,
+            )
+        return ProviderUnavailable(
+            f"OpenAI request failed (HTTP {status})",
+            provider_id=OPENAI_PROVIDER_ID,
+        )
+
+    def _request_json_once(
         self,
         method: str,
         path: str,
@@ -184,11 +235,11 @@ class OpenAIProvider:
         accept: str = "application/json",
     ) -> Tuple[int, Any]:
         url = f"{self.base_url}{path}"
-        data = None if body is None else json.dumps(body).encode("utf-8")
         headers = self._headers(api_key)
         headers["Accept"] = accept
         if self._transport is not None:
             return self._transport(method, url, headers=headers, body=body, timeout=timeout)
+        data = None if body is None else json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -200,8 +251,10 @@ class OpenAIProvider:
                 raw = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 pass
-            raise self._map_http_error(exc.code, raw) from None
+            hdrs = dict(getattr(exc, "headers", {}) or {})
+            raise self._map_http_error(exc.code, raw, headers=hdrs) from None
         except Exception as exc:
+            # Never include exception args that might echo request bodies.
             raise ProviderUnavailable(
                 f"OpenAI request failed ({type(exc).__name__})",
                 provider_id=OPENAI_PROVIDER_ID,
@@ -216,32 +269,29 @@ class OpenAIProvider:
                 provider_id=OPENAI_PROVIDER_ID,
             ) from exc
 
-    def _map_http_error(self, status: int, raw: str):
-        # Never put raw body into the exception message.
-        _ = raw
-        if status in (401, 403):
-            return AuthenticationRequired(
-                "OpenAI rejected the API key or access is forbidden",
-                provider_id=OPENAI_PROVIDER_ID,
-            )
-        if status == 429:
-            return RateLimited(
-                "OpenAI rate limit exceeded; try again later",
-                provider_id=OPENAI_PROVIDER_ID,
-            )
-        if 500 <= status <= 599:
-            return ProviderUnavailable(
-                "OpenAI is temporarily unavailable",
-                provider_id=OPENAI_PROVIDER_ID,
-            )
-        return ProviderUnavailable(
-            f"OpenAI request failed (HTTP {status})",
-            provider_id=OPENAI_PROVIDER_ID,
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        api_key: str,
+        body: Optional[dict] = None,
+        timeout: float = 30.0,
+        accept: str = "application/json",
+        cancel_ev=None,
+    ) -> Tuple[int, Any]:
+        return with_retries(
+            lambda: self._request_json_once(
+                method, path, api_key=api_key, body=body, timeout=timeout, accept=accept
+            ),
+            max_attempts=self.max_attempts,
+            cancel_ev=cancel_ev,
         )
 
-    def validate_credential(self, api_key: str) -> dict:
-        """Lightweight validation via GET /models. Documented behavior."""
-        status, payload = self._request_json("GET", "/models", api_key=api_key, timeout=20.0)
+    def validate_credential(self, api_key: str, *, cancel_ev=None) -> dict:
+        status, payload = self._request_json(
+            "GET", "/models", api_key=api_key, timeout=20.0, cancel_ev=cancel_ev
+        )
         if status != 200:
             raise ProviderUnavailable(
                 "OpenAI validation failed",
@@ -254,7 +304,7 @@ class OpenAIProvider:
             )
         return {"ok": True, "validated": True}
 
-    def list_models(self, *, api_key: str, use_cache: bool = True) -> Sequence[dict]:
+    def list_models(self, *, api_key: str, use_cache: bool = True, cancel_ev=None) -> Sequence[dict]:
         cache_key = "default"
         now = time.time()
         if use_cache and cache_key in _MODEL_CACHE:
@@ -262,7 +312,9 @@ class OpenAIProvider:
             if now - ts < _MODEL_CACHE_TTL_S:
                 return list(rows)
 
-        _status, payload = self._request_json("GET", "/models", api_key=api_key, timeout=30.0)
+        _status, payload = self._request_json(
+            "GET", "/models", api_key=api_key, timeout=30.0, cancel_ev=cancel_ev
+        )
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list):
             raise InvalidProviderResponse(
@@ -284,6 +336,7 @@ class OpenAIProvider:
                 "capabilities": caps,
             })
         out.sort(key=lambda r: r["id"])
+        # Cache only safe model metadata — never credentials.
         _MODEL_CACHE[cache_key] = (now, list(out))
         return out
 
@@ -291,13 +344,14 @@ class OpenAIProvider:
         _MODEL_CACHE.clear()
 
     def cancel(self, cancellation_id: str) -> bool:
-        # Cancellation is owned by bridge cancel_chat + closing the HTTP body.
         return False
 
     def stream_response(
         self,
         request: InferenceRequest,
         credentials: Optional[RuntimeCredentials] = None,
+        *,
+        cancel_ev=None,
     ) -> Iterator[InferenceEvent]:
         api_key = (credentials.access_token if credentials else None) or ""
         if not api_key:
@@ -306,9 +360,9 @@ class OpenAIProvider:
                 provider_id=OPENAI_PROVIDER_ID,
             )
         payload = self._build_chat_payload(request)
-        resp = self.open_chat_stream(payload, api_key=api_key)
+        resp = self.open_chat_stream(payload, api_key=api_key, cancel_ev=cancel_ev)
         try:
-            for obj in self.iter_openai_sse_objects(resp):
+            for obj in self.iter_openai_sse_objects(resp, cancel_ev=cancel_ev):
                 yield from self._events_from_chunk(obj)
         finally:
             try:
@@ -334,14 +388,34 @@ class OpenAIProvider:
             payload["tool_choice"] = "auto"
         return payload
 
-    def open_chat_stream(self, payload: dict, *, api_key: str, timeout: float = 120.0):
-        """Open a streaming chat.completions response (caller must close)."""
+    def open_chat_stream(
+        self,
+        payload: dict,
+        *,
+        api_key: str,
+        timeout: float = 120.0,
+        cancel_ev=None,
+    ):
+        """Open a streaming chat.completions response (caller must close).
+
+        Retries only apply before the response object is returned — never after
+        partial streamed output has begun.
+        """
+
+        def _open_once():
+            return self._open_chat_stream_once(payload, api_key=api_key, timeout=timeout)
+
+        return with_retries(
+            _open_once,
+            max_attempts=self.max_attempts,
+            cancel_ev=cancel_ev,
+        )
+
+    def _open_chat_stream_once(self, payload: dict, *, api_key: str, timeout: float = 120.0):
         url = f"{self.base_url}/chat/completions"
         body = dict(payload)
         body["stream"] = True
-        # Request usage in stream when supported; ignore if rejected upstream.
         body.setdefault("stream_options", {"include_usage": True})
-        data = json.dumps(body).encode("utf-8")
         headers = self._headers(api_key)
         headers["Accept"] = "text/event-stream"
         if self._transport is not None:
@@ -351,6 +425,7 @@ class OpenAIProvider:
             if status >= 400:
                 raise self._map_http_error(status, "")
             return resp
+        data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
             return urllib.request.urlopen(req, timeout=timeout)
@@ -360,7 +435,12 @@ class OpenAIProvider:
                 raw = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 pass
-            raise self._map_http_error(exc.code, raw) from None
+            hdrs = dict(getattr(exc, "headers", {}) or {})
+            try:
+                exc.close()
+            except Exception:
+                pass
+            raise self._map_http_error(exc.code, raw, headers=hdrs) from None
         except Exception as exc:
             raise ProviderUnavailable(
                 f"OpenAI stream failed ({type(exc).__name__})",
@@ -368,33 +448,89 @@ class OpenAIProvider:
             ) from None
 
     def iter_openai_sse_objects(self, resp, *, cancel_ev=None) -> Iterator[dict]:
-        """Yield parsed JSON objects from an OpenAI SSE body."""
-        buf = b""
+        """Yield parsed JSON objects from an OpenAI SSE body.
+
+        Hardened for blank lines, multi-line ``data:`` fields, split UTF-8,
+        malformed JSON (skipped), and early cancellation / connection close.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        text_buf = ""
+        data_lines: List[str] = []
+
+        def _flush_event() -> Optional[dict]:
+            nonlocal data_lines
+            if not data_lines:
+                return None
+            payload = "\n".join(data_lines).strip()
+            data_lines = []
+            if not payload:
+                return None
+            if payload == "[DONE]":
+                return {"__done__": True}
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                return None
+            return obj if isinstance(obj, dict) else None
+
         while True:
             if cancel_ev is not None and cancel_ev.is_set():
                 return
-            chunk = resp.read(1024)
+            try:
+                chunk = resp.read(1024)
+            except Exception:
+                # Premature close — stop without leaking details.
+                return
             if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line or not line.startswith(b"data:"):
-                    continue
-                data = line[5:].strip()
-                if data == b"[DONE]":
+                # Final flush
+                event = _flush_event()
+                if event and not event.get("__done__"):
+                    yield event
+                return
+            text_buf += decoder.decode(chunk)
+            while True:
+                if cancel_ev is not None and cancel_ev.is_set():
                     return
-                try:
-                    obj = json.loads(data.decode("utf-8"))
-                except Exception:
+                nl = text_buf.find("\n")
+                if nl < 0:
+                    break
+                line, text_buf = text_buf[:nl], text_buf[nl + 1:]
+                if line.endswith("\r"):
+                    line = line[:-1]
+                if line == "":
+                    event = _flush_event()
+                    if event is None:
+                        continue
+                    if event.get("__done__"):
+                        return
+                    yield event
                     continue
-                if isinstance(obj, dict):
-                    yield obj
+                if line.startswith(":"):
+                    # SSE comment
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+                    # OpenAI usually sends one JSON object per data line.
+                    # Flush early when the accumulated payload is complete JSON
+                    # or [DONE]; otherwise wait for a blank line (multi-line data).
+                    payload = "\n".join(data_lines).strip()
+                    if payload == "[DONE]":
+                        data_lines = []
+                        return
+                    try:
+                        obj = json.loads(payload)
+                    except Exception:
+                        continue
+                    data_lines = []
+                    if isinstance(obj, dict):
+                        yield obj
+                    continue
+                # Ignore other SSE fields (event:, id:, retry:)
+        # unreachable
 
     def _events_from_chunk(self, obj: dict) -> Iterator[InferenceEvent]:
-        usage = obj.get("usage")
-        if isinstance(usage, dict):
+        usage = normalize_usage(obj.get("usage"))
+        if usage:
             yield InferenceEvent(event_type=InferenceEventType.USAGE, usage=usage, raw=None)
         choices = obj.get("choices") or []
         if not choices:
@@ -410,6 +546,8 @@ class OpenAIProvider:
             )
         tool_calls = delta.get("tool_calls")
         if tool_calls:
+            # Pass through multi-index tool-call fragments for the agent loop
+            # to assemble; never attach raw upstream object.
             yield InferenceEvent(
                 event_type=InferenceEventType.TOOL_CALL_DELTA,
                 tool_call_delta={"tool_calls": tool_calls},
@@ -432,13 +570,10 @@ def connect_openai_api_key(store: AuthStore, api_key: str, *, provider: Optional
         prov.validate_credential(api_key.strip())
         validated = True
     except RateLimited:
-        # Store key but mark unvalidated — do not delete on transient failure.
-        validated = False
         cred = api_key_credential(api_key, validated=False, validated_at=None)
         store.save(OPENAI_PROVIDER_ID, cred)
         raise
-    except ProviderUnavailable as exc:
-        # Network blip during validation: store as unvalidated so the user can retry.
+    except ProviderUnavailable:
         cred = api_key_credential(api_key, validated=False, validated_at=None)
         store.save(OPENAI_PROVIDER_ID, cred)
         raise ProviderUnavailable(
@@ -446,7 +581,6 @@ def connect_openai_api_key(store: AuthStore, api_key: str, *, provider: Optional
             provider_id=OPENAI_PROVIDER_ID,
         ) from None
     except AuthenticationRequired:
-        # Invalid key — do not store.
         raise
 
     cred = api_key_credential(
@@ -466,9 +600,6 @@ def openai_api_key_from_store(store: AuthStore) -> Optional[str]:
     cred = store.load(OPENAI_PROVIDER_ID)
     if cred is None:
         return None
-    if (cred.metadata or {}).get("credential_type") not in (None, "api_key"):
-        # Still accept legacy rows that stored the key in access_token.
-        pass
     key = cred.access_token
     if not key:
         return None
