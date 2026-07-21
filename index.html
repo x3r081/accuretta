@@ -76,7 +76,7 @@
       <div class="workspace" id="workspace">
         <div id="ws-list"></div>
         <div class="ws-add hidden" id="ws-add">
-          <input id="ws-input" placeholder="C:\path\to\folder" autocomplete="off">
+          <input id="ws-input" data-copy="workspace.path_placeholder" data-copy-attr="placeholder" placeholder="/path/to/folder" autocomplete="off">
           <button class="btn sm" id="ws-browse-btn" title="Browse for folder"><i class="ph ph-folder-open"></i></button>
           <button class="btn accent sm" id="ws-add-btn">Add</button>
         </div>
@@ -164,7 +164,7 @@
       </div>
       <div class="actions">
         <button class="iconbtn" id="btn-session-desktop" title="Desktop automation for this chat only" hidden><i class="ph ph-desktop"></i></button>
-        <button class="iconbtn" id="btn-cmd-history" title="PowerShell command history"><i class="ph ph-terminal-window"></i></button>
+        <button class="iconbtn" id="btn-cmd-history" data-copy="shell.history_title" data-copy-attr="title" title="Shell command history"><i class="ph ph-terminal-window"></i></button>
         <button class="iconbtn" id="btn-palette" title="Switch session (⌘K / Ctrl+K)"><i class="ph ph-magnifying-glass"></i></button>
         <button class="iconbtn" id="btn-theme" title="Theme"><i class="ph ph-moon"></i></button>
         <button class="iconbtn" id="btn-toggle-preview" title="Toggle preview"><i class="ph ph-browser"></i></button>
@@ -208,7 +208,7 @@
             <button class="chip" id="mode-agent" data-mode="agent"><i class="ph ph-terminal-window"></i>Agent</button>
             <button class="chip on" id="mode-auto" data-mode="auto"><i class="ph ph-lightning"></i>Auto</button>
             <button class="chip" id="btn-attach-image" title="Attach image — the vision model reads it and hands a description to the main model"><i class="ph ph-image"></i>Image</button>
-            <button class="chip" id="btn-trust-writes" title="Trust writes — auto-approve saving and editing files in your workspace. Registry edits, Windows system folders, and PowerShell still require approval."><i class="ph ph-pencil-simple-line"></i>Trust writes</button>
+            <button class="chip" id="btn-trust-writes" data-copy="trust.title" data-copy-attr="title" title="Trust writes — auto-approve saving and editing files in your workspace. System-protected paths and shell commands still require approval."><i class="ph ph-pencil-simple-line"></i>Trust writes</button>
             <input type="file" id="file-image" accept="image/*" multiple hidden>
             <div class="toolbar-overflow-wrap">
               <button class="toolbar-overflow" id="btn-toolbar-overflow" title="Build options"><i class="ph ph-sliders-horizontal"></i></button>
@@ -216,8 +216,10 @@
                 <div class="overflow-section-label">Build</div>
                 <button class="chip" id="toggle-tailwind" title="Inject the Tailwind Play CDN into generated HTML and ask the model to use Tailwind classes"><i class="ph ph-wind"></i>Tailwind CDN</button>
                 <button class="chip" id="toggle-multifile" title="Have the model emit a small folder structure (index.html, style.css, script.js, assets/) — preview inlines it, Export Project zips the files separately"><i class="ph ph-folder-simple"></i>Multi-file</button>
+                <div data-feature="network_snapshot" hidden>
                 <div class="overflow-section-label">Network</div>
                 <button class="chip" id="quick-netscan-mothership" title="Inserts a prompt asking the model to scan THIS machine's active TCP/UDP connections and recent DNS, then flag anything weird"><i class="ph ph-radio"></i>Netscan inference device</button>
+                </div>
                 <div class="overflow-section-label">Red team</div>
                 <button class="chip" id="quick-recon-target" title="Authorized external recon on a target domain. Gated by an authorization prompt, then runs stealth port scan, TLS audit, HTTP fingerprint, passive subdomain enum and DNS recon, then summarizes."><i class="ph ph-crosshair"></i>Recon target (authorized)</button>
                 <button class="chip" id="quick-gain-access" title="Authorized autonomous pentest. Gated by an authorization prompt, then the model chains recon, exposure checks, weakness identification and access attempts (default creds, exposed services), captures proof, and reports. Only on systems you own or are authorized to test."><i class="ph ph-lock-key-open"></i>Find a way in (authorized)</button>
@@ -447,15 +449,17 @@
     <p>a local-first LLM wrapper. it runs entirely on your machine — no cloud API, no telemetry, no account. the model lives in <code>llama.cpp</code>, the bridge is a small python server, the UI is served on <code>localhost:8787</code> and is reachable from any device on your LAN at <code>http://&lt;your-ip&gt;:8787</code>.</p>
 
     <div class="faq-q">what are the modes?</div>
-    <p><b>IDE</b> — model replies with one HTML document and the right pane renders it live, saving every version. good for building landing pages, mocks, dashboards.<br>
-    <b>Agent</b> — model calls tools to list files, read, write, run powershell. every write/run asks for your approval first.<br>
+    <p data-copy="faq.modes" data-copy-attr="html"><b>IDE</b> — model replies with one HTML document and the right pane renders it live, saving every version. good for building landing pages, mocks, dashboards.<br>
+    <b>Agent</b> — model calls tools to list files, read, write, and run shell commands. every write/run asks for your approval first.<br>
     <b>Auto</b> — bridge picks IDE vs. Agent based on what you asked.</p>
 
     <div class="faq-q">how do tools work with a gemma model?</div>
     <p>gemma emits a python-style function call — <code>name(arg=value)</code> inside a <code>```tool_code```</code> fence — instead of the JSON tool_call that <code>llama.cpp</code>'s native parser understands. so accuretta runs gemma in <b>text-tools</b> mode: the tools are still listed in the prompt, but accuretta parses the <code>tool_code</code> call out of the reply and executes it itself, rather than handing the tool schema to llama-server (which would silently no-op and let the model narrate a fake <i>"saved to…"</i>). tools work, just via a different path. models that emit standard JSON tool calls — <b>Qwen</b>, <b>GLM</b>, <b>Llama</b>, <b>GPT-OSS</b> — still use the faster native path.</p>
 
+    <div class="faq-block" data-feature="network_snapshot" hidden>
     <div class="faq-q">what is netscan inference device?</div>
-    <p>a one-click prompt under the <svg class="faq-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="8" cy="6" r="2" fill="currentColor"/><circle cx="16" cy="12" r="2" fill="currentColor"/><circle cx="10" cy="18" r="2" fill="currentColor"/></svg> button that asks the model to scan <i>this</i> machine's active TCP/UDP connections, listening ports, and recent DNS cache, then flag anything weird (unknown processes phoning home, suspicious remote IPs, etc.). a chart card renders inline showing connection counts, top processes, and top remote endpoints — favicons fetched from DuckDuckGo. all data is gathered locally via PowerShell — nothing leaves your machine.</p>
+    <p data-copy="faq.network" data-copy-attr="html">a one-click prompt that asks the model to scan <i>this</i> machine's active TCP/UDP connections, listening ports, and recent DNS cache, then flag anything weird. all data is gathered locally — nothing leaves your machine.</p>
+    </div>
 
     <div class="faq-q">what are the authorized recon / pentest buttons?</div>
     <p>under <b>Build options → Red team</b> there are two gated one-click actions. <b>Recon target</b> runs passive + active reconnaissance on a domain (DNS, passive subdomains via cert-transparency, TLS/cert audit, HTTP fingerprint, stealthy port scan) and writes a clean report. <b>Find a way in</b> is an autonomous pentest: the model chains recon, then exposure checks (readable <code>.git</code>/<code>.env</code>, directory listing, Spring actuator), subdomain-takeover detection, unauthenticated-service checks (Redis/Elasticsearch/Docker/Memcached), CVE correlation, injection probes, and default-credential spraying — and for anything it can confirm it captures a proof artifact under <code>data/recon_evidence/</code> with a sha256, then reports what's broken and what it reached. both fire an <b>authorization gate first</b> (you must confirm you have explicit permission) with a disclaimer that you alone are responsible for use. the port scan is deliberately quiet — capped concurrency, randomized order, jitter — not an nmap blast. <i>use only against systems you own or are contracted to test.</i></p>
@@ -542,7 +546,7 @@
     <div class="form-row">
       <label>Models folder</label>
       <div style="display:flex;gap:6px;">
-        <input type="text" id="set-models-dir" placeholder="C:\Users\you\MODELS" style="flex:1;" />
+        <input type="text" id="set-models-dir" data-copy="models_dir.placeholder" data-copy-attr="placeholder" placeholder="~/models" style="flex:1;" />
         <button class="btn sm" id="btn-browse-models-dir" title="Pick folder"><i class="ph ph-folder-open"></i></button>
         <button class="btn sm" id="btn-rescan-models-dir" title="Re-scan folder"><i class="ph ph-arrow-clockwise"></i></button>
       </div>
@@ -573,9 +577,9 @@
     </div>
 
     <div class="form-row">
-      <label>Context window · num_ctx <i class="ph ph-info" title="How many tokens the model can 'remember' at once. Each token ≈ 0.75 words. Larger = longer conversations but more VRAM usage."></i></label>
+      <label>Context window · num_ctx <i class="ph ph-info" data-copy="ctx.tooltip" data-copy-attr="title" title="How many tokens the model can remember at once. Larger = longer conversations but more memory usage."></i></label>
       <input type="number" id="set-ctx" min="512" step="256">
-      <span class="hint" id="ctx-hint">tokens the model sees. Bigger = more VRAM, slower.</span>
+      <span class="hint" id="ctx-hint" data-copy="ctx.hint">tokens the model sees. Bigger = more memory, slower.</span>
     </div>
     <div class="form-row">
       <label>GPU layers · num_gpu <i class="ph ph-info" title="How many model layers run on GPU vs CPU. -1 or 99 = all GPU (fastest). 0 = all CPU."></i></label>
@@ -583,7 +587,7 @@
       <span class="hint" id="gpu-hint">-1 or 99 = all layers on GPU.</span>
     </div>
     <div class="form-row">
-      <label>Batch size · num_batch <i class="ph ph-info" title="How many tokens processed in parallel. Larger = faster prompt processing but more VRAM."></i></label>
+      <label>Batch size · num_batch <i class="ph ph-info" data-copy="batch.tooltip" data-copy-attr="title" title="How many tokens processed in parallel. Larger = faster prompt processing but more memory."></i></label>
       <input type="number" id="set-batch" min="32" step="32">
       <span class="hint" id="batch-hint">parallel token processing.</span>
     </div>
@@ -598,32 +602,32 @@
       <span class="hint">-1 = unlimited.</span>
     </div>
     <div class="form-row">
-      <label>KV cache quant · kv_cache_type <i class="ph ph-info" title="q4_0 saves ~50% VRAM vs q8_0 with tiny quality loss. f16 is best quality but uses full VRAM. Changing this restarts llama-server."></i></label>
+      <label>KV cache quant · kv_cache_type <i class="ph ph-info" data-copy="kv.tooltip" data-copy-attr="title" title="q4_0 saves memory vs q8_0 with tiny quality loss. Changing this restarts llama-server."></i></label>
       <select id="set-kv">
-        <option value="q4_0">q4_0 · smallest VRAM</option>
+        <option value="q4_0" data-copy="kv.opt_q4">q4_0 · smallest memory</option>
         <option value="q8_0">q8_0 · balanced</option>
         <option value="f16">f16 · best quality</option>
       </select>
-      <span class="hint">lower = more context window fits in VRAM. saving reloads the model.</span>
+      <span class="hint" data-copy="kv.hint">lower = more context window fits in memory. saving reloads the model.</span>
     </div>
 
-    <div class="form-group">Auto-tune <span class="hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;">· pick your VRAM, get sane defaults</span></div>
+    <div class="form-group">Auto-tune <span class="hint" id="autotune-group-hint" style="font-size:10px;font-weight:normal;text-transform:none;letter-spacing:0;" data-copy="memory_budget.autotune_group">· pick your memory budget</span></div>
     <div class="form-row">
-      <label>VRAM budget <i class="ph ph-info" title="How much GPU memory to plan around. Auto-detected via nvidia-smi when possible. The auto-tuner uses ~85% of this for weights and KV cache and leaves the rest as headroom."></i></label>
+      <label>Memory budget <i class="ph ph-info" data-copy="memory_budget.tooltip" data-copy-attr="title" title="How much GPU or system memory to plan around. The auto-tuner leaves headroom for the KV cache."></i></label>
       <select id="set-vram-tier">
         <option value="0">Manual · don't touch the advanced fields below</option>
-        <option value="6">6 GB · low end laptops, GTX 1660</option>
-        <option value="8">8 GB · RTX 3050 / 3060 8GB / 4060</option>
-        <option value="12">12 GB · RTX 3060 12GB / 4070 / 4070 Ti</option>
-        <option value="16">16 GB · RTX 4060 Ti 16GB / 4070 Ti Super / 5060 Ti</option>
-        <option value="20">20 GB · RTX 4000 Ada / 7900 XT</option>
-        <option value="24">24 GB · RTX 3090 / 4090 / 7900 XTX</option>
-        <option value="32">32 GB · RTX 5090 / W7900</option>
-        <option value="48">48 GB · A6000 / 6000 Ada</option>
-        <option value="64">64 GB · dual GPU rig</option>
+        <option value="6">6 GB · low end / tight unified</option>
+        <option value="8">8 GB · RTX 3050 / small unified usable</option>
+        <option value="12">12 GB · RTX 3060 12GB / mid unified</option>
+        <option value="16">16 GB · RTX 4060 Ti / Apple 24 GB UMA usable</option>
+        <option value="20">20 GB · RTX 4000 Ada / larger UMA</option>
+        <option value="24">24 GB · RTX 3090 / 4090 / 32 GB UMA class</option>
+        <option value="32">32 GB · RTX 5090 / 48 GB UMA class</option>
+        <option value="48">48 GB · A6000 / high-memory Mac</option>
+        <option value="64">64 GB · dual GPU / 96 GB UMA class</option>
         <option value="80">80+ GB · A100 / H100</option>
       </select>
-      <span class="hint" id="vram-detected-hint">detecting GPU...</span>
+      <span class="hint" id="vram-detected-hint" data-copy="memory_budget.detecting">detecting memory…</span>
     </div>
     <div class="form-row">
       <button type="button" class="btn sm" id="btn-autotune"><i class="ph ph-magic-wand"></i>Suggest values for current model</button>
@@ -769,13 +773,14 @@
       <div class="sw" id="sw-red-team-enabled"></div>
     </div>
 
+    <div id="settings-sandbox-section" data-feature="sandbox_wsl" hidden>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
       <span>Sandbox</span>
       <span class="grow" style="flex:1;"></span>
       <span class="sandbox-chip" id="sandbox-chip" data-state="unknown">checking…</span>
     </div>
     <div class="form-row">
-      <span class="hint">an isolated Ubuntu guest (<code>accuretta-sbx</code>, via WSL2) for running offensive tools and unpacking untrusted files off your host — the workspace is visible inside at <code>/mnt/…</code>. optional: in a web red-team the exploits run on the target, not here, so this matters mainly when you pull loot back to analyze locally. first-time set-up with full progress lives in the <b>Setup Wizard</b>.</span>
+      <span class="hint" data-copy="sandbox.section_hint" data-copy-attr="html"></span>
     </div>
     <div class="form-row inline" id="sandbox-actions" style="gap:8px;flex-wrap:wrap;">
       <button class="btn sm" id="btn-sandbox-setup" type="button"><i class="ph ph-cube"></i>Set up / repair</button>
@@ -791,6 +796,7 @@
         <div class="desc" id="sandbox-card-desc"></div>
         <pre id="sandbox-card-log" class="sandbox-log" style="display:none;"></pre>
       </div>
+    </div>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;">
@@ -825,9 +831,9 @@
       <div class="sw" id="sw-desktop-enabled"></div>
     </div>
     <div class="form-row">
-      <label>App allowlist — one per line (exe name or absolute path)</label>
-      <textarea id="set-desktop-allowlist" rows="5" placeholder="notepad&#10;chrome&#10;C:\Program Files\Electronic Arts\EA Desktop\EA Desktop\EADesktop.exe" style="font-family:ui-monospace,Consolas,monospace;font-size:12px;"></textarea>
-      <span class="hint">matches any exe/path that contains a line from this list (case-insensitive). leave empty to block all launches. restart not required.</span>
+      <label id="desktop-allowlist-label" data-copy="desktop.allowlist.label">App allowlist — one per line (app name or absolute path)</label>
+      <textarea id="set-desktop-allowlist" rows="5" data-copy="desktop.allowlist.placeholder" data-copy-attr="placeholder" placeholder="Terminal&#10;firefox&#10;/usr/bin/firefox" style="font-family:ui-monospace,Consolas,monospace;font-size:12px;"></textarea>
+      <span class="hint" data-copy="desktop.allowlist.hint">matches any app/path that contains a line from this list (case-insensitive). leave empty to block all launches. restart not required.</span>
     </div>
     <div class="form-row inline">
       <label>Max actions per minute</label>
@@ -888,23 +894,23 @@
   <div class="setup-card">
     <div class="setup-header">
       <h2>Quick Setup</h2>
-      <p class="setup-sub">Select your llama-server and model to get started.</p>
+      <p class="setup-sub" data-copy="setup.subtitle">Select your llama-server and model to get started.</p>
       
       <div class="setup-scanner-card" id="setup-scanner-card">
         <div class="header">
           <i class="ph ph-spinner-gap pulse-icon spin" id="setup-scanner-icon" style="font-size: 20px; display: inline-block;"></i>
-          <div class="title" id="setup-scanner-title">Scanning System Specs &amp; Files…</div>
+          <div class="title" id="setup-scanner-title" data-copy="setup.scanning_title">Scanning System Specs &amp; Files…</div>
         </div>
-        <div class="desc" id="setup-scanner-desc">
-          Checking GPU hardware and searching for local llama-server binaries to minimize setup friction.
+        <div class="desc" id="setup-scanner-desc" data-copy="setup.scanning_desc">
+          Checking hardware and searching for a local llama-server to minimize setup friction.
         </div>
       </div>
     </div>
     <div class="setup-body">
       <div class="setup-step" id="step-llama">
-        <label>llama-server.exe</label>
+        <label data-copy="llama_bin.label">llama-server executable</label>
         <select id="setup-llama-path"><option value="">— scanning… —</option></select>
-        <span class="hint">Auto-detected from common locations, or set manually in Settings later.</span>
+        <span class="hint" id="setup-llama-hint" data-copy="setup.llama_hint">Auto-detected from PATH and common locations — or set llama_bin in settings.</span>
       </div>
       <div class="setup-step" id="step-model">
         <label>Chat model (.gguf)</label>
@@ -912,18 +918,18 @@
         <span class="hint">Pick a GGUF model from your models directory.</span>
       </div>
       <div class="setup-step" id="step-models-dir">
-        <label>Models directory</label>
-        <input type="text" id="setup-models-dir" placeholder="e.g. D:\\MODELS" />
-        <span class="hint">Where your .gguf files live. Leave blank to use the default.</span>
+        <label data-copy="setup.models_dir.label">Models directory</label>
+        <input type="text" id="setup-models-dir" data-copy="setup.models_dir.placeholder" data-copy-attr="placeholder" placeholder="e.g. ~/models" />
+        <span class="hint" data-copy="setup.models_dir.hint">Where your .gguf files live. Leave blank to use the default.</span>
       </div>
-      <div class="setup-step" id="step-sandbox">
+      <div class="setup-step" id="step-sandbox" data-feature="sandbox_wsl" hidden>
         <label>Sandbox <span class="hint" style="font-weight:normal;">— optional, isolated Linux guest</span></label>
         <div class="setup-scanner-card" id="sbx-wiz-card">
           <div class="header">
             <i class="ph ph-spinner-gap pulse-icon spin" id="sbx-wiz-icon" style="font-size:18px;display:inline-block;"></i>
-            <div class="title" id="sbx-wiz-title">Checking for WSL…</div>
+            <div class="title" id="sbx-wiz-title" data-copy="sandbox.wiz_checking">Checking sandbox…</div>
           </div>
-          <div class="desc" id="sbx-wiz-desc">Runs offensive tools and unpacks untrusted files in an isolated Ubuntu guest (via WSL2) so nothing touches your host. Your workspace is visible inside it.</div>
+          <div class="desc" id="sbx-wiz-desc" data-copy="sandbox.wiz_desc">Optional isolated Linux guest for offensive tools and unpacking untrusted files.</div>
         </div>
       </div>
     </div>
@@ -935,7 +941,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="/app.js?v=202607172400"></script>
+<script src="/app.js?v=202607210900"></script>
 <script>
   // Setup wizard — auto-detect llama-server and models on load.
   (function () {
@@ -955,21 +961,66 @@
     var scannerTitle = document.getElementById('setup-scanner-title');
     var scannerDesc = document.getElementById('setup-scanner-desc');
 
-    var sysinfo = { gpu_name: "Generic CPU", recommended_build: "CPU" };
+    var sysinfo = { gpu_name: "Generic CPU", recommended_build: "CPU", features: {}, copy: {} };
     var downloadInterval = null;
 
-    // 1. Fetch system info
+    function escHtml(s) {
+      return String(s == null ? "" : s).replace(/[&<>"']/g, function(c) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
+      });
+    }
+
+    function copyT(key, fallback) {
+      var c = sysinfo && sysinfo.copy;
+      if (c && c[key]) return c[key];
+      if (window.__accurettaT) return window.__accurettaT(key, fallback || "");
+      return fallback || "";
+    }
+
+    function hardwareSummaryHtml(info) {
+      if (!info) return "";
+      if (info.is_apple_silicon && info.summary_lines && info.summary_lines.length) {
+        return '<ul style="margin:8px 0 0 18px;padding:0;line-height:1.55;">' +
+          info.summary_lines.map(function(line) {
+            return "<li>" + escHtml(line) + "</li>";
+          }).join("") + "</ul>";
+      }
+      var bits = [];
+      if (info.gpu_name) bits.push("<strong>Hardware:</strong> " + escHtml(info.gpu_name));
+      if (info.recommended_build) bits.push("<strong>Build:</strong> " + escHtml(info.recommended_build));
+      return bits.length ? "<div style=\"margin-top:8px;\">" + bits.join(" · ") + "</div>" : "";
+    }
+
+    // 1. Fetch system info (platform + copy + features from backend only).
+    // Fall back to /api/ui-capabilities so Windows feature gates still apply
+    // when hardware probing fails.
+    function applySysinfo(info) {
+      sysinfo = info || sysinfo;
+      if (window.__accurettaApplyCapabilities) {
+        window.__accurettaApplyCapabilities(sysinfo);
+      }
+      if (sysinfo.features && sysinfo.features.sandbox_wsl) {
+        initSandboxWizard();
+      }
+      runDetection();
+    }
     fetch('/api/setup/sysinfo')
       .then(function(r) { return r.json(); })
       .then(function(info) {
-        sysinfo = info;
-        runDetection();
+        if (info && (info.features || info.copy)) {
+          applySysinfo(info);
+          return;
+        }
+        return fetch('/api/ui-capabilities').then(function(r) { return r.json(); }).then(applySysinfo);
       })
       .catch(function() {
-        runDetection();
+        fetch('/api/ui-capabilities')
+          .then(function(r) { return r.json(); })
+          .then(applySysinfo)
+          .catch(function() { runDetection(); });
       });
 
-    // --- Optional WSL sandbox card (independent of Save & Start) -------------
+    // --- Optional WSL sandbox card (Windows only; gated by features.sandbox_wsl) ---
     var sbxPoll = null;
     function sbxEl(id) { return document.getElementById(id); }
     function escSbx(s) { return String(s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
@@ -981,7 +1032,7 @@
         if (SBX_BUSY.indexOf(p.status) >= 0) { renderSbxProgress(p); if (!sbxPoll) sbxPoll = setInterval(pollSbx, 700); }
         else renderSbx(st);
       }).catch(function(){
-        var t = sbxEl('sbx-wiz-title'); if (t) t.textContent = 'Sandbox status unavailable';
+        var titleEl = sbxEl('sbx-wiz-title'); if (titleEl) titleEl.textContent = 'Sandbox status unavailable';
         var ic = sbxEl('sbx-wiz-icon'); if (ic) { ic.className = 'ph ph-warning'; }
       });
     }
@@ -999,8 +1050,11 @@
         desc.innerHTML = 'Isolated guest <code>' + escSbx(st.sandbox_distro) + '</code> is provisioned. Manage it later in Settings &rarr; Sandbox.';
       } else if (st.state === 'no_wsl') {
         icon.className = 'ph ph-warning pulse-icon';
-        title.textContent = 'WSL not installed (one-time)';
-        desc.innerHTML = 'The sandbox needs WSL2. In an <strong>elevated PowerShell</strong> run <code>wsl --install</code>, reboot once, then reopen this wizard — everything after is automatic. This step is optional; you can start using accuretta without it.';
+        title.textContent = copyT('sandbox.no_wsl_title', 'WSL not installed (one-time)');
+        desc.innerHTML = copyT(
+          'sandbox.no_wsl_body',
+          'The sandbox needs WSL2. In an <strong>elevated PowerShell</strong> run <code>wsl --install</code>, reboot once, then reopen this wizard.'
+        );
       } else {
         icon.className = 'ph ph-cube';
         title.textContent = (st.state === 'present_unprovisioned')
@@ -1044,8 +1098,6 @@
       }).catch(function(){});
     }
 
-    initSandboxWizard();
-
     // 2. Fetch and run scanner detection
     function runDetection() {
       fetch('/api/setup/detect')
@@ -1058,6 +1110,8 @@
             overlay.style.display = 'none';
             return;
           }
+
+          var llamaName = copyT('llama_bin.basename', 'llama-server');
 
           // Populate llama-server paths dropdown
           llamaSel.innerHTML = '';
@@ -1073,24 +1127,42 @@
             scannerCard.className = 'setup-scanner-card success';
             scannerIcon.className = 'ph ph-check-circle success-icon';
             scannerIcon.classList.remove('spin');
-            scannerTitle.textContent = 'System Ready: llama-server detected';
-            scannerDesc.innerHTML = 'We\'ve automatically detected a working <code>llama-server.exe</code> on your computer.<br><strong>Build Mode:</strong> ' + sysinfo.gpu_name;
+            scannerTitle.textContent = copyT('setup.ready_title', 'System Ready: llama-server detected');
+            var resolvedPath = (data.llama_resolution && data.llama_resolution.path) || (data.llama_paths[0] && data.llama_paths[0].path) || '';
+            var resolvedVer = (data.llama_resolution && data.llama_resolution.version) ? ('<br><strong>Version:</strong> ' + escHtml(data.llama_resolution.version)) : '';
+            scannerDesc.innerHTML = 'We\'ve automatically detected a working <code>' + escHtml(llamaName) + '</code> executable'
+              + (resolvedPath ? (' at <code>' + escHtml(resolvedPath) + '</code>') : '')
+              + '.'
+              + hardwareSummaryHtml(sysinfo)
+              + resolvedVer;
           } else {
-            // No llama-server detected - show one-click installer card
+            // No llama-server detected
             llamaSel.innerHTML = '<option value="">No local llama-server configured</option>';
             
             scannerCard.className = 'setup-scanner-card';
             scannerIcon.className = 'ph ph-warning pulse-icon';
             scannerIcon.classList.remove('spin');
-            scannerTitle.textContent = 'Action Required: Missing llama-server';
+            scannerTitle.textContent = copyT('setup.missing_title', 'Action Required: Missing llama-server');
             
-            scannerDesc.innerHTML = 'We couldn\'t locate a local <code>llama-server.exe</code>. To run models locally, you need Llama.cpp.<br>' +
-              '<div style="margin-top: 8px;"><strong>Detected Hardware:</strong> <span class="setup-wizard-badge success">' + sysinfo.gpu_name + '</span></div>' +
-              '<button class="btn-installer-download" id="btn-setup-download" style="margin-top: 12px;">' +
-                '<i class="ph ph-download-simple"></i> Install Recommended ' + sysinfo.recommended_build + ' Build (1-Click)' +
-              '</button>';
+            var missHint = (data.llama_resolution && data.llama_resolution.hint) || '';
+            var installBlock = '';
+            var feats = sysinfo.features || {};
+            if (feats.llama_one_click_windows) {
+              installBlock =
+                '<button class="btn-installer-download" id="btn-setup-download" style="margin-top: 12px;">' +
+                  '<i class="ph ph-download-simple"></i> Install Recommended ' + escHtml(sysinfo.recommended_build || 'CPU') + ' Build (1-Click)' +
+                '</button>';
+            } else {
+              installBlock =
+                '<div style="margin-top:12px;">' +
+                copyT('setup.missing_install', 'Install llama.cpp and ensure llama-server is on your PATH, or set llama_bin.') +
+                '</div>';
+            }
+            scannerDesc.innerHTML = copyT('setup.missing_body_prefix', 'We couldn\'t locate a local llama-server executable. ')
+              + missHint + hardwareSummaryHtml(sysinfo) + installBlock;
 
-            document.getElementById('btn-setup-download').addEventListener('click', startDownload);
+            var dlBtn = document.getElementById('btn-setup-download');
+            if (dlBtn) dlBtn.addEventListener('click', startDownload);
           }
 
           // Populate models dropdown
@@ -1116,33 +1188,49 @@
 
     // 3. One-Click Downloader Trigger
     function startDownload() {
+      // Windows-only zip installer (gated by features.llama_one_click_windows).
+      if (!(sysinfo.features || {}).llama_one_click_windows) {
+        scannerCard.className = 'setup-scanner-card';
+        scannerIcon.className = 'ph ph-warning-circle';
+        scannerTitle.textContent = copyT('setup.missing_title', 'Action Required: Missing llama-server');
+        scannerDesc.innerHTML = copyT(
+          'setup.missing_install',
+          'Install llama.cpp and ensure llama-server is on your PATH, or set llama_bin.'
+        );
+        return;
+      }
       fetch('/api/setup/download-llama', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ build_type: sysinfo.recommended_build })
       })
-      .then(function(r) { return r.json(); })
+      .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, body: j }; }); })
       .then(function(res) {
-        if (res.success) {
-          // Switch UI state to downloading
-          scannerCard.className = 'setup-scanner-card downloading';
-          scannerIcon.className = 'ph ph-spinner-gap pulse-icon spin';
-          scannerTitle.textContent = 'Installing llama-server…';
-          scannerDesc.innerHTML = 'Fetching official pre-compiled package for <code>' + sysinfo.gpu_name + '</code>. Please wait.' +
-            '<div class="setup-download-container" id="download-progress-container">' +
-              '<div class="setup-download-bar">' +
-                '<div class="setup-download-fill" id="download-progress-fill" style="width: 0%;"></div>' +
-              '</div>' +
-              '<div class="setup-download-meta">' +
-                '<span id="download-progress-percent">0%</span>' +
-                '<span id="download-progress-speed">0 KB/s</span>' +
-              '</div>' +
-            '</div>';
-
-          // Begin polling status
-          if (downloadInterval) clearInterval(downloadInterval);
-          downloadInterval = setInterval(pollDownloadStatus, 400);
+        if (!res.ok || !res.body || !res.body.success) {
+          scannerCard.className = 'setup-scanner-card';
+          scannerIcon.className = 'ph ph-warning-circle';
+          scannerTitle.textContent = 'Installation unavailable';
+          scannerDesc.innerHTML = escHtml((res.body && res.body.error) || 'Download refused on this platform.');
+          return;
         }
+        // Switch UI state to downloading
+        scannerCard.className = 'setup-scanner-card downloading';
+        scannerIcon.className = 'ph ph-spinner-gap pulse-icon spin';
+        scannerTitle.textContent = 'Installing llama-server…';
+        scannerDesc.innerHTML = 'Fetching official pre-compiled package for <code>' + escHtml(sysinfo.gpu_name) + '</code>. Please wait.' +
+          '<div class="setup-download-container" id="download-progress-container">' +
+            '<div class="setup-download-bar">' +
+              '<div class="setup-download-fill" id="download-progress-fill" style="width: 0%;"></div>' +
+            '</div>' +
+            '<div class="setup-download-meta">' +
+              '<span id="download-progress-percent">0%</span>' +
+              '<span id="download-progress-speed">0 KB/s</span>' +
+            '</div>' +
+          '</div>';
+
+        // Begin polling status
+        if (downloadInterval) clearInterval(downloadInterval);
+        downloadInterval = setInterval(pollDownloadStatus, 400);
       });
     }
 
@@ -1174,7 +1262,7 @@
             scannerIcon.className = 'ph ph-check-circle success-icon';
             scannerIcon.classList.remove('spin');
             scannerTitle.textContent = 'Installation Complete!';
-            scannerDesc.innerHTML = 'The recommended <code>llama-server.exe</code> has been successfully configured locally inside <code>./bin/llama/</code>.<br>Click <strong>Save &amp; Start</strong> to launch!';
+            scannerDesc.innerHTML = 'The recommended <code>llama-server</code> executable has been configured inside <code>./bin/llama/</code>.<br>Click <strong>Save &amp; Start</strong> to launch!';
             
             // Refresh selections to load the brand new binary
             runDetection();
@@ -1183,11 +1271,17 @@
             scannerCard.className = 'setup-scanner-card';
             scannerIcon.className = 'ph ph-warning-circle';
             scannerTitle.textContent = 'Installation Failed';
-            scannerDesc.innerHTML = 'An error occurred during installation: <code style="color: var(--danger);">' + status.error_msg + '</code><br>' +
-              '<button class="btn-installer-download" id="btn-setup-download" style="margin-top: 12px;">' +
-                '<i class="ph ph-arrow-counter-clockwise"></i> Try Again' +
-              '</button>';
-            document.getElementById('btn-setup-download').addEventListener('click', startDownload);
+            var retryHtml = '';
+            if ((sysinfo.features || {}).llama_one_click_windows) {
+              retryHtml =
+                '<button class="btn-installer-download" id="btn-setup-download" style="margin-top: 12px;">' +
+                  '<i class="ph ph-arrow-counter-clockwise"></i> Try Again' +
+                '</button>';
+            }
+            scannerDesc.innerHTML = 'An error occurred during installation: <code style="color: var(--danger);">' +
+              escHtml(status.error_msg || 'unknown error') + '</code><br>' + retryHtml;
+            var retryBtn = document.getElementById('btn-setup-download');
+            if (retryBtn) retryBtn.addEventListener('click', startDownload);
           }
         });
     }
@@ -1247,6 +1341,16 @@
         if (suggested.spec_strategy) settings.spec_strategy = String(suggested.spec_strategy);
         if (suggested.no_warmup != null) settings.no_warmup = !!suggested.no_warmup;
         if (suggested.enable_metrics != null) settings.enable_metrics = !!suggested.enable_metrics;
+        if (suggested.n_parallel != null) settings.n_parallel = Number(suggested.n_parallel);
+        // Apple Silicon first-run defaults when auto-tune returned nothing useful
+        if (sysinfo && sysinfo.is_apple_silicon) {
+          if (settings.num_ctx == null && sysinfo.recommended_num_ctx)
+            settings.num_ctx = Number(sysinfo.recommended_num_ctx);
+          if (settings.num_gpu == null && sysinfo.recommended_num_gpu != null)
+            settings.num_gpu = Number(sysinfo.recommended_num_gpu);
+          if (settings.n_parallel == null)
+            settings.n_parallel = Number(sysinfo.recommended_n_parallel || 1);
+        }
 
         // Persist the combined settings via the API
         return fetch('/api/settings', {
