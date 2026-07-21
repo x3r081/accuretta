@@ -9316,54 +9316,76 @@
     // Remove vision badge when not in local selectable mode.
     let badge = pill.querySelector(".model-pill-vision");
 
+    function _setLockedIndicator({ mode, label, title, unavailable }) {
+      nameEl.textContent = label;
+      pill.title = title;
+      pill.classList.add("is-provider-locked", "model-pill-indicator");
+      pill.classList.toggle("is-unavailable", !!unavailable);
+      pill.setAttribute("aria-disabled", "true");
+      pill.removeAttribute("aria-haspopup");
+      pill.removeAttribute("aria-expanded");
+      pill.setAttribute("aria-label", label);
+      pill.dataset.mode = mode;
+      if (caret) {
+        caret.hidden = true;
+        caret.setAttribute("aria-hidden", "true");
+      }
+      if (badge) badge.remove();
+    }
+
     if (!sessionPid) {
       // Avoid flashing the local Qwen name before chat metadata loads.
-      nameEl.textContent = "";
-      pill.title = "Loading session…";
-      pill.classList.add("is-provider-locked");
-      pill.setAttribute("aria-disabled", "true");
-      pill.dataset.mode = "loading";
-      if (caret) caret.hidden = true;
-      if (badge) badge.remove();
+      _setLockedIndicator({
+        mode: "loading",
+        label: "…",
+        title: "Loading session…",
+        unavailable: false,
+      });
       return;
     }
 
     if (sessionPid === "codex_chatgpt") {
       const verified = _sessionVerifiedModelLabel();
+      // Never invent GPT-4 / etc. Only append a protocol-verified model_label.
       const base = _sessionInferenceProviderLabel() || "Codex via ChatGPT";
-      nameEl.textContent = verified ? `${base} · ${shortenModelName(verified)}` : base;
+      const label = (verified && verified !== "Codex")
+        ? `${base} · ${shortenModelName(verified)}`
+        : base;
       const unavail = _codexSessionUnavailableReason();
-      pill.title = unavail
-        ? `This session uses Codex via ChatGPT — ${unavail}`
-        : "This session uses Codex via ChatGPT. Start a new session to use a local GGUF model.";
-      pill.classList.add("is-provider-locked");
-      pill.classList.toggle("is-unavailable", !!unavail);
-      pill.setAttribute("aria-disabled", "true");
-      pill.dataset.mode = "codex";
-      if (caret) caret.hidden = true;
-      if (badge) badge.remove();
+      _setLockedIndicator({
+        mode: "codex",
+        label,
+        title: unavail
+          ? `This session is bound to Codex. ${unavail}`
+          : "This session is bound to Codex. Start a new Local llama.cpp session to choose a local model.",
+        unavailable: !!unavail,
+      });
       return;
     }
 
     if (sessionPid === "openai") {
       const om = state.settings.openai_model || _sessionVerifiedModelLabel() || "";
       const base = _sessionInferenceProviderLabel() || "OpenAI API";
-      nameEl.textContent = om ? `${base} · ${shortenModelName(om)}` : base;
-      pill.title = "This session uses OpenAI API. Local GGUF selection does not apply.";
-      pill.classList.add("is-provider-locked");
-      pill.classList.remove("is-unavailable");
-      pill.setAttribute("aria-disabled", "true");
-      pill.dataset.mode = "openai";
-      if (caret) caret.hidden = true;
-      if (badge) badge.remove();
+      const label = om ? `${base} · ${shortenModelName(om)}` : base;
+      _setLockedIndicator({
+        mode: "openai",
+        label,
+        title: "This session is bound to OpenAI API. Start a new Local llama.cpp session to choose a local model.",
+        unavailable: false,
+      });
       return;
     }
 
-    // Local session — interactive GGUF model selector.
-    pill.classList.remove("is-provider-locked", "is-unavailable");
+    // Local session — interactive GGUF model selector (independent of Settings default).
+    pill.classList.remove("is-provider-locked", "is-unavailable", "model-pill-indicator");
     pill.removeAttribute("aria-disabled");
+    pill.setAttribute("aria-haspopup", "listbox");
+    pill.setAttribute("aria-expanded", menu?.classList.contains("open") ? "true" : "false");
     pill.dataset.mode = "local";
-    if (caret) caret.hidden = false;
+    if (caret) {
+      caret.hidden = false;
+      caret.removeAttribute("aria-hidden");
+    }
 
     const loadedPath = state.loadedModel || state.settings.model_path || state.settings.model || "";
     if (loadedPath) {
@@ -9371,12 +9393,15 @@
       const shortName = shortenModelName(fullName);
       nameEl.textContent = shortName;
       pill.title = `${fullName} — click to change model`;
+      pill.setAttribute("aria-label", `Local model ${shortName}. Click to change.`);
     } else if (state.models && state.models.length) {
       nameEl.textContent = "select model";
       pill.title = "Click to pick a model";
+      pill.setAttribute("aria-label", "Select a local model");
     } else {
       nameEl.textContent = "no models";
       pill.title = state.modelsError || "Pick a models folder in Settings";
+      pill.setAttribute("aria-label", "No local models available");
     }
     // Vision badge — small "eye" chip glued to the pill when the loaded model
     // has its own vision tower (mmproj). Hover tells the user images are
@@ -9572,13 +9597,25 @@
       menu.style.top = `${Math.round(top)}px`;
       menu.style.left = `${Math.round(left)}px`;
     }
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      // Codex / OpenAI sessions: pill is an indicator only — local GGUF
-      // selection must not imply it controls this session.
-      if (pill.classList.contains("is-provider-locked") || pill.dataset.mode !== "local") {
-        menu.classList.remove("open");
-        btn.classList.remove("open");
+    function closeMenu() {
+      menu.classList.remove("open");
+      btn.classList.remove("open");
+      if (btn.dataset.mode === "local") btn.setAttribute("aria-expanded", "false");
+    }
+    function openMenu() {
+      renderModelMenu();
+      menu.classList.add("open");
+      btn.classList.add("open");
+      btn.setAttribute("aria-expanded", "true");
+      positionMenu();
+      requestAnimationFrame(positionMenu);
+    }
+    function toggleMenuFromUser() {
+      // Codex / OpenAI / loading: indicator only — never open the local list.
+      // Use `btn` (the pill element). A prior typo referenced undefined `pill`
+      // and threw on every click, making the local Qwen selector appear dead.
+      if (btn.classList.contains("is-provider-locked") || btn.dataset.mode !== "local") {
+        closeMenu();
         const sessionPid = _sessionInferenceProviderId();
         if (sessionPid === "codex_chatgpt") {
           const unavail = _codexSessionUnavailableReason();
@@ -9586,33 +9623,42 @@
             toast(unavail, "warn", 4200, "codex-session-unavail");
             openSettings();
           } else {
-            toast("This session uses Codex. Start a new session to change the local model.", "info", 3200, "codex-pill-locked");
+            toast(
+              "This session is bound to Codex. Start a new Local llama.cpp session to choose a local model.",
+              "info",
+              4200,
+              "codex-pill-locked"
+            );
           }
         }
         return;
       }
-      const willOpen = !menu.classList.contains("open");
-      if (willOpen) {
-        renderModelMenu();
-        menu.classList.add("open");
-        btn.classList.add("open");
-        positionMenu();
-        requestAnimationFrame(positionMenu);
-      } else {
-        menu.classList.remove("open");
-        btn.classList.remove("open");
+      if (menu.classList.contains("open")) closeMenu();
+      else openMenu();
+    }
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleMenuFromUser();
+    });
+    btn.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      // Only activate the local selector via keyboard; locked indicators ignore.
+      if (btn.dataset.mode !== "local" || btn.getAttribute("aria-disabled") === "true") {
+        e.preventDefault();
+        return;
       }
+      e.preventDefault();
+      toggleMenuFromUser();
     });
     document.addEventListener("click", (e) => {
       if (!menu.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
-        menu.classList.remove("open");
-        btn.classList.remove("open");
+        closeMenu();
       }
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && menu.classList.contains("open")) {
-        menu.classList.remove("open");
-        btn.classList.remove("open");
+        closeMenu();
+        btn.focus();
       }
     });
     window.addEventListener("resize", () => { if (menu.classList.contains("open")) positionMenu(); });

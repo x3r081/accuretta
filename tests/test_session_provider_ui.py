@@ -34,12 +34,12 @@ class SessionProviderUiContractTest(unittest.TestCase):
         self.assertIn("click to change model", self.js)
 
     def test_codex_session_shows_provider_indicator_not_gguf_selector(self):
-        self.assertIn('dataset.mode = "codex"', self.js)
+        self.assertIn('mode: "codex"', self.js)
         self.assertIn("is-provider-locked", self.js)
-        self.assertIn("This session uses Codex via ChatGPT", self.js)
-        self.assertIn("Start a new session to use a local GGUF model", self.js)
+        self.assertIn("This session is bound to Codex", self.js)
+        self.assertIn("Start a new Local llama.cpp session to choose a local model", self.js)
         # Locked pill must not open the local model menu.
-        self.assertIn('pill.dataset.mode !== "local"', self.js)
+        self.assertIn('btn.dataset.mode !== "local"', self.js)
 
     def test_assistant_label_from_response_metadata(self):
         self.assertIn("function assistantResponseLabel", self.js)
@@ -77,7 +77,7 @@ class SessionProviderUiContractTest(unittest.TestCase):
         )
         self.assertIsNotNone(pill)
         self.assertNotRegex(pill.group(0), r"qwen|select model", re.I)
-        self.assertIn('dataset.mode = "loading"', self.js)
+        self.assertIn('mode: "loading"', self.js)
         self.assertIn("Avoid flashing the local Qwen name", self.js)
 
     def test_legacy_missing_metadata_is_local(self):
@@ -95,7 +95,7 @@ class SessionProviderUiContractTest(unittest.TestCase):
         self.assertIn('id="provider-session-unavailable"', self.html)
         self.assertIn("Existing Codex sessions stay labelled Codex", self.js)
         # Indicator still uses Codex label even when unavailable.
-        self.assertIn('pill.classList.toggle("is-unavailable"', self.js)
+        self.assertIn('classList.toggle("is-unavailable"', self.js)
 
     def test_no_false_gpt4_claim(self):
         label_fn = self.js.split("function assistantResponseLabel", 1)[1].split(
@@ -104,15 +104,13 @@ class SessionProviderUiContractTest(unittest.TestCase):
         self.assertIn("Never invent cloud model names", label_fn)
         self.assertNotRegex(label_fn, r'["\']GPT-4|["\']gpt-4', re.I)
         # Codex pill indicator uses provider display name, not a guessed model.
-        self.assertIn('dataset.mode = "codex"', self.js)
-        self.assertIn(
-            'nameEl.textContent = verified ? `${base} · ${shortenModelName(verified)}` : base;',
-            self.js,
-        )
+        self.assertIn('mode: "codex"', self.js)
+        self.assertIn("Never invent GPT-4", self.js)
         self.assertIn(
             'const base = _sessionInferenceProviderLabel() || "Codex via ChatGPT";',
             self.js,
         )
+        self.assertIn("model-pill-indicator", self.js)
 
 
 class SessionProviderUiIntegrationTest(unittest.TestCase):
