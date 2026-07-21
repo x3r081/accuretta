@@ -25,8 +25,25 @@ unnecessary profile data.
 ## OAuth primitives (generic)
 
 `auth/` includes PKCE, loopback callback (127.0.0.1 / ::1), config-driven code
-exchange, refresh-with-skew, and redaction helpers. These are for future
-providers and tests (`tests/fake_oauth_server.py`).
+exchange, refresh-with-skew, **RFC 8628 device authorization**
+(`auth/device_flow.py`, `auth/device_models.py`), and redaction helpers. These are
+for future providers and tests (`tests/fake_oauth_server.py`).
+
+### Device authorization (backend-only)
+
+Safe HTTP surface (never returns `device_code` or tokens):
+
+| Method | Path |
+|---|---|
+| POST | `/api/providers/{id}/device/start` |
+| GET | `/api/providers/{id}/device/status` |
+| POST | `/api/providers/{id}/device/cancel` |
+
+Start responses may include `userCode`, `verificationUri`,
+`verificationUriComplete`, `expiresAt`, and `pollIntervalSeconds`. The bridge
+polls the token endpoint in the background — `app.js` must not poll upstream
+providers directly. Only one active device flow is kept per provider; a new
+start cancels the prior poller. Shutdown cancels in-flight pollers.
 
 Security rules:
 
@@ -37,7 +54,8 @@ Security rules:
   - *Permanent* (`invalid_grant`, revoked token, `invalid_client`, bare HTTP 401) → delete credentials and require reconnect
   - *Transient* (timeout, DNS, connection errors, HTTP 429 / 5xx, malformed temporary body) → **retain** credentials; do not use an already-expired access token; allow retry
   - *Configuration* (missing token URL / client ID) → retain credentials; report `ProviderNotConfigured`
-- Logout / disconnect calls `AuthStore.delete(provider_id)`
+- Logout / disconnect calls `AuthStore.delete(provider_id)` and cancels any pending device session
+- `device_code` is never logged and never sent to the frontend
 
 ## Frontend security boundary
 
@@ -75,7 +93,7 @@ secret POST — prefer HTTPS when exposing Accuretta beyond localhost.
 ## Fake-provider tests
 
 ```bash
-python3 -m unittest tests.test_oauth_flow tests.test_auth_store tests.test_providers_api tests.test_openai_provider tests.test_refresh_classification -v
+python3 -m unittest tests.test_oauth_flow tests.test_auth_store tests.test_providers_api tests.test_openai_provider tests.test_refresh_classification tests.test_device_flow -v
 ```
 
 These use in-process fakes and temporary credential files. No test contacts a

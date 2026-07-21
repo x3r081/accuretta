@@ -18,6 +18,7 @@ _SECRET_KEYS = frozenset({
     "authorization",
     "client_secret",
     "code_verifier",
+    "device_code",
     "password",
     "api_key",
 })

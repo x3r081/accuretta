@@ -293,6 +293,12 @@ def disconnect_provider(provider_id: str, settings: dict) -> dict:
         deleted = bool(info.store.delete(provider_id))
     except Exception:
         deleted = False
+    # Cancel any in-flight device authorization for this provider.
+    try:
+        from auth.device_flow import get_device_flow_manager
+        get_device_flow_manager().cancel(provider_id)
+    except Exception:
+        pass
     return {
         "ok": True,
         "providerId": provider_id,
@@ -356,6 +362,97 @@ def list_models_for_provider(provider_id: str, settings: Optional[dict] = None) 
         "models": safe_models,
         "selectedModel": selected_model,
     }
+    assert_safe_provider_payload(payload)
+    return payload
+
+
+def start_device_authorization(provider_id: str, settings: dict) -> dict:
+    """Start RFC 8628 device flow for a registered provider. Safe response only."""
+    ensure_builtin_providers()
+    from auth.device_flow import (
+        DeviceFlowError,
+        get_device_flow_manager,
+        resolve_device_config,
+    )
+    from auth.oauth_client import TokenExchangeFailed
+
+    reg = get_default_registry()
+    try:
+        definition = reg.get_definition(provider_id)
+    except ProviderNotConfigured as exc:
+        raise ProviderNotConfigured(
+            f"Unknown provider: {provider_id}",
+            provider_id=provider_id,
+        ) from exc
+    if definition.auth_type != AuthType.OAUTH_DEVICE:
+        raise ProviderUnavailable(
+            "Device authorization is not available for this provider",
+            provider_id=provider_id,
+        )
+    if not definition.enabled:
+        raise ProviderUnavailable(
+            definition.disabled_reason or "Provider is not available",
+            provider_id=provider_id,
+        )
+    config = resolve_device_config(provider_id)
+    if config is None:
+        raise ProviderUnavailable(
+            definition.disabled_reason or "Device authorization is not configured",
+            provider_id=provider_id,
+        )
+    info = get_auth_store_info()
+    manager = get_device_flow_manager()
+    try:
+        payload = manager.start(config, store=info.store)
+    except DeviceFlowError as exc:
+        raise ProviderUnavailable(str(exc), provider_id=provider_id) from None
+    except TokenExchangeFailed as exc:
+        raise ProviderUnavailable(
+            sanitize_provider_error_message(str(exc)),
+            provider_id=provider_id,
+        ) from None
+    assert_safe_provider_payload(payload)
+    if "deviceCode" in payload or "device_code" in payload:
+        raise ValueError("device_code leaked into start payload")
+    return payload
+
+
+def device_authorization_status(provider_id: str, settings: dict) -> dict:
+    ensure_builtin_providers()
+    from auth.device_flow import get_device_flow_manager, resolve_device_config
+
+    reg = get_default_registry()
+    try:
+        reg.get_definition(provider_id)
+    except ProviderNotConfigured as exc:
+        raise ProviderNotConfigured(
+            f"Unknown provider: {provider_id}",
+            provider_id=provider_id,
+        ) from exc
+    _ = resolve_device_config(provider_id)
+    _ = settings
+    payload = get_device_flow_manager().status(provider_id)
+    if payload.get("status") == "authorized":
+        payload = dict(payload)
+        payload["providerStatus"] = get_provider_status(provider_id, settings)
+    assert_safe_provider_payload(payload)
+    return payload
+
+
+def cancel_device_authorization(provider_id: str, settings: dict) -> dict:
+    ensure_builtin_providers()
+    from auth.device_flow import get_device_flow_manager
+
+    reg = get_default_registry()
+    try:
+        reg.get_definition(provider_id)
+    except ProviderNotConfigured as exc:
+        raise ProviderNotConfigured(
+            f"Unknown provider: {provider_id}",
+            provider_id=provider_id,
+        ) from exc
+    _ = settings
+    payload = get_device_flow_manager().cancel(provider_id)
     assert_safe_provider_payload(payload)
     return payload
 

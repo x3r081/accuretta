@@ -22,6 +22,8 @@ FORBIDDEN_KEYS = frozenset({
     "code_verifier",
     "authorization",
     "authorization_code",
+    "device_code",
+    "devicecode",
     "raw_credential",
     "raw_response",
     "raw_provider_response",
@@ -92,9 +94,13 @@ def build_safe_provider_status(
                 ("vision", caps.vision),
                 ("cancellation", caps.cancellation),
                 ("model_listing", caps.model_listing),
+                ("account_authentication", caps.account_authentication),
+                ("device_authorization", caps.device_authorization),
+                ("inference", caps.inference),
             )
             if on
         ],
+        "supportsInference": bool(getattr(definition, "supports_inference", True)),
         "disabledReason": reason,
         "error": error,
     }

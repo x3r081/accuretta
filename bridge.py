@@ -16113,6 +16113,7 @@ class Handler(BaseHTTPRequestHandler):
         """Safe provider catalog / status / models — never returns credentials."""
         try:
             from providers.management import (
+                device_authorization_status,
                 get_provider_status,
                 list_models_for_provider,
                 list_provider_statuses,
@@ -16132,6 +16133,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, get_provider_status(provider_id, settings))
             if len(parts) == 4 and action == "models":
                 return self._send_json(200, list_models_for_provider(provider_id, settings))
+            if len(parts) == 5 and action == "device" and parts[4] == "status":
+                return self._send_json(200, device_authorization_status(provider_id, settings))
             return self._send_json(404, {"error": "not found"})
         except Exception as exc:
             from providers.management import provider_http_error
@@ -16139,12 +16142,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(status, body)
 
     def _handle_providers_post(self, p: str, body: dict):
-        """Select / disconnect / connect providers."""
+        """Select / disconnect / connect / device-auth providers."""
         try:
             from providers.management import (
+                cancel_device_authorization,
                 connect_provider,
                 disconnect_provider,
                 select_provider,
+                start_device_authorization,
             )
             parts = [x for x in p.split("/") if x]
             if len(parts) < 4:
@@ -16180,6 +16185,15 @@ class Handler(BaseHTTPRequestHandler):
                 result = connect_provider(provider_id, body or {}, settings)
                 broadcast_event({"type": "providers:update"})
                 return self._send_json(200, result)
+            if action == "device" and len(parts) >= 5:
+                sub = parts[4]
+                if sub == "start":
+                    result = start_device_authorization(provider_id, settings)
+                    return self._send_json(200, result)
+                if sub == "cancel":
+                    result = cancel_device_authorization(provider_id, settings)
+                    broadcast_event({"type": "providers:update"})
+                    return self._send_json(200, result)
             return self._send_json(404, {"error": "not found"})
         except Exception as exc:
             from providers.management import provider_http_error

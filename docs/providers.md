@@ -84,6 +84,17 @@ See earlier Phase 5 routes. OpenAI-specific:
 | GET | `/api/providers/openai/models` | Requires stored key |
 | POST | `/api/providers/openai/select` | Requires stored key; optional `{ "model": "..." }` |
 
+Generic device authorization (RFC 8628) when a provider registers a device
+config factory:
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/api/providers/{id}/device/start` | Returns user code + verification URLs only |
+| GET | `/api/providers/{id}/device/status` | `idle` / `pending` / `authorized` / … |
+| POST | `/api/providers/{id}/device/cancel` | Cancels in-flight poller |
+
+Never returns `deviceCode`, tokens, or client secrets.
+
 ## Frontend boundary
 
 `app.js` may only see safe status. API key input is password-style, cleared after

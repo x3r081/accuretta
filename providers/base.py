@@ -42,6 +42,9 @@ class ProviderCapabilities:
     vision: bool = False
     cancellation: bool = True
     model_listing: bool = True
+    account_authentication: bool = False
+    device_authorization: bool = False
+    inference: bool = True
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,7 @@ class ProviderDefinition:
     capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities)
     default_base_url: Optional[str] = None
     supports_model_listing: bool = True
+    supports_inference: bool = True
     experimental: bool = False
     enabled: bool = True
     # Human-readable reason when enabled=False (shown in UI; never secrets).
