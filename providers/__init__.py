@@ -4,6 +4,7 @@ Newly written for Accuretta. Local llama.cpp remains the default backend;
 cloud providers plug in later behind the same interfaces.
 """
 
+from .local_llama import LocalLlamaProvider, LOCAL_LLAMA_DEFINITION, ensure_local_llama_registered
 from .base import (
     ApiMode,
     AuthType,
@@ -41,6 +42,8 @@ __all__ = [
     "InferenceProvider",
     "InferenceRequest",
     "InvalidProviderResponse",
+    "LOCAL_LLAMA_DEFINITION",
+    "LocalLlamaProvider",
     "OAuthStateMismatch",
     "ProviderCapabilities",
     "ProviderDefinition",
@@ -52,5 +55,6 @@ __all__ = [
     "RuntimeCredentials",
     "TokenExchangeFailed",
     "TokenRefreshFailed",
+    "ensure_local_llama_registered",
     "get_default_registry",
 ]

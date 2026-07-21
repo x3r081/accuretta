@@ -95,26 +95,8 @@ def reset_default_registry() -> None:
 
 
 def _register_builtins(registry: ProviderRegistry) -> None:
-    # Local llama definition only; factory is attached in local_llama module
-    # to avoid circular imports at package load time.
-    from .base import ApiMode, AuthType, ProviderCapabilities, ProviderDefinition
+    # Import locally to attach definition + factory without circular imports
+    # at module load of registry.py.
+    from .local_llama import ensure_local_llama_registered
 
-    registry.register(
-        ProviderDefinition(
-            id="local_llama",
-            display_name="Local llama.cpp",
-            api_mode=ApiMode.LOCAL_LLAMA,
-            auth_type=AuthType.NONE,
-            capabilities=ProviderCapabilities(
-                streaming=True,
-                tools=True,
-                vision=True,
-                cancellation=True,
-                model_listing=True,
-            ),
-            default_base_url="http://127.0.0.1:8080",
-            supports_model_listing=True,
-            experimental=False,
-            enabled=True,
-        )
-    )
+    ensure_local_llama_registered(registry)
