@@ -19,6 +19,7 @@ from .errors import (
 )
 from .example_cloud import ensure_example_cloud_registered
 from .github_provider import GITHUB_PROVIDER_ID, ensure_github_registered
+from .codex_provider import CODEX_PROVIDER_ID, ensure_codex_registered
 from .local_llama import ensure_local_llama_registered
 from .openai_provider import (
     OPENAI_DEFAULT_MODEL,
@@ -50,6 +51,7 @@ def ensure_builtin_providers(registry: Optional[ProviderRegistry] = None) -> Pro
     ensure_example_cloud_registered(reg)
     ensure_openai_registered(reg)
     ensure_github_registered(reg)
+    ensure_codex_registered(reg)
     return reg
 
 
@@ -157,15 +159,20 @@ def list_provider_statuses(settings: dict) -> dict:
     reg = ensure_builtin_providers()
     info = get_auth_store_info()
     selection = resolve_provider_selection(settings)
-    providers = [
-        provider_status_for(
-            d,
-            settings=settings,
-            store=info.store,
-            selected_id=selection.provider_id,
-        )
-        for d in reg.list_definitions(include_disabled=True)
-    ]
+    providers = []
+    for d in reg.list_definitions(include_disabled=True):
+        if d.id == CODEX_PROVIDER_ID:
+            from providers.codex_provider import get_codex_provider_status
+            providers.append(get_codex_provider_status(live=False))
+        else:
+            providers.append(
+                provider_status_for(
+                    d,
+                    settings=settings,
+                    store=info.store,
+                    selected_id=selection.provider_id,
+                )
+            )
     payload = {
         "providers": providers,
         "selectedProviderId": selection.provider_id,
@@ -206,6 +213,7 @@ def build_provider_diagnostics(
     local = by_id.get(DEFAULT_PROVIDER_ID) or {}
     openai = by_id.get(OPENAI_PROVIDER_ID) or {}
     github = by_id.get(GITHUB_PROVIDER_ID) or {}
+    codex = by_id.get(CODEX_PROVIDER_ID) or {}
     out = {
         "localProviderAvailable": bool(local.get("available", True)),
         "openaiAvailable": bool(openai.get("available")),
@@ -214,6 +222,9 @@ def build_provider_diagnostics(
         "githubConfigured": bool(github.get("available")),
         "githubAvailable": bool(github.get("available")),
         "githubDisabledReason": github.get("disabledReason"),
+        "codexInstalled": bool(codex.get("installed") if "installed" in codex else codex.get("available")),
+        "codexAvailable": bool(codex.get("available")),
+        "codexDisabledReason": codex.get("disabledReason"),
         "authBackend": info.backend,
         "secureCloudAuthAvailable": bool(info.secure_cloud_auth_available),
         "selectedProviderId": resolve_provider_selection(settings).provider_id,
@@ -223,13 +234,18 @@ def build_provider_diagnostics(
 
 
 def shutdown_provider_background() -> None:
-    """Cancel device-flow pollers and drop the manager singleton.
+    """Cancel device-flow pollers and stop Codex app-server.
 
     Safe to call multiple times. Must run before ``os._exit`` (which skips atexit).
     """
     try:
         from auth.device_flow import reset_device_flow_manager
         reset_device_flow_manager()
+    except Exception:
+        pass
+    try:
+        from codex.session import shutdown_codex
+        shutdown_codex()
     except Exception:
         pass
 
@@ -243,6 +259,10 @@ def get_provider_status(provider_id: str, settings: dict) -> dict:
             f"Unknown provider: {provider_id}",
             provider_id=provider_id,
         ) from exc
+    if provider_id == CODEX_PROVIDER_ID:
+        from providers.codex_provider import get_codex_provider_status
+        # Live status starts app-server lazily when Codex is installed.
+        return get_codex_provider_status(live=True)
     info = get_auth_store_info()
     return provider_status_for(definition, settings=settings, store=info.store)
 
@@ -274,6 +294,12 @@ def select_provider(provider_id: str, settings: dict, *, save: Callable[[dict], 
             "Copilot inference is not enabled.",
             provider_id=provider_id,
         )
+    elif definition.id == CODEX_PROVIDER_ID:
+        raise ProviderUnavailable(
+            "ChatGPT / Codex authentication is available, but Codex inference "
+            "is not enabled in this milestone.",
+            provider_id=provider_id,
+        )
     elif definition.id != DEFAULT_PROVIDER_ID:
         raise ProviderUnavailable(
             "This provider cannot be selected yet",
@@ -292,6 +318,15 @@ def select_provider(provider_id: str, settings: dict, *, save: Callable[[dict], 
 
 def connect_provider(provider_id: str, body: dict, settings: dict) -> dict:
     ensure_builtin_providers()
+    if provider_id == CODEX_PROVIDER_ID:
+        from providers.codex_provider import codex_connect_browser
+        method = (body or {}).get("method") if isinstance(body, dict) else None
+        if method and str(method).lower() not in {"browser", "chatgpt"}:
+            raise ProviderUnavailable(
+                "Unsupported Codex connect method",
+                provider_id=provider_id,
+            )
+        return codex_connect_browser()
     if provider_id != OPENAI_PROVIDER_ID:
         raise ProviderUnavailable(
             "Connect is not available for this provider",
@@ -349,6 +384,10 @@ def disconnect_provider(provider_id: str, settings: dict) -> dict:
             "message": "Disconnect is not applicable for Local llama.cpp",
             "status": get_provider_status(provider_id, settings),
         }
+
+    if provider_id == CODEX_PROVIDER_ID:
+        from providers.codex_provider import codex_logout
+        return codex_logout()
 
     info = get_auth_store_info()
     deleted = False

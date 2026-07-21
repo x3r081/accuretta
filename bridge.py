@@ -16135,6 +16135,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, list_models_for_provider(provider_id, settings))
             if len(parts) == 5 and action == "device" and parts[4] == "status":
                 return self._send_json(200, device_authorization_status(provider_id, settings))
+            if provider_id == "codex_chatgpt" and len(parts) >= 4:
+                from providers.codex_provider import codex_login_status
+                if action == "login" and len(parts) == 5 and parts[4] == "status":
+                    return self._send_json(200, codex_login_status())
             return self._send_json(404, {"error": "not found"})
         except Exception as exc:
             from providers.management import provider_http_error
@@ -16142,7 +16146,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(status, body)
 
     def _handle_providers_post(self, p: str, body: dict):
-        """Select / disconnect / connect / device-auth providers."""
+        """Select / disconnect / connect / device-auth / Codex login providers."""
         try:
             from providers.management import (
                 cancel_device_authorization,
@@ -16167,6 +16171,34 @@ class Handler(BaseHTTPRequestHandler):
                 save_json(SETTINGS_FILE, cur)
                 broadcast_event({"type": "settings:update"})
                 broadcast_event({"type": "providers:update"})
+
+            if provider_id == "codex_chatgpt":
+                from providers.codex_provider import (
+                    codex_cancel_login,
+                    codex_connect_browser,
+                    codex_logout,
+                    codex_retry_process,
+                    codex_start_device,
+                )
+                if action == "connect":
+                    result = codex_connect_browser()
+                    broadcast_event({"type": "providers:update"})
+                    return self._send_json(200, result)
+                if action == "disconnect":
+                    result = codex_logout()
+                    broadcast_event({"type": "providers:update"})
+                    return self._send_json(200, result)
+                if action == "device" and len(parts) >= 5 and parts[4] == "start":
+                    result = codex_start_device()
+                    return self._send_json(200, result)
+                if action == "login" and len(parts) >= 5 and parts[4] == "cancel":
+                    result = codex_cancel_login(body or {})
+                    broadcast_event({"type": "providers:update"})
+                    return self._send_json(200, result)
+                if action == "process" and len(parts) >= 5 and parts[4] == "retry":
+                    result = codex_retry_process()
+                    broadcast_event({"type": "providers:update"})
+                    return self._send_json(200, result)
 
             if action == "select":
                 # Optional model selection for OpenAI in the same call.
