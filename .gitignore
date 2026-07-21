@@ -8,6 +8,13 @@
 data/
 !data/.gitkeep
 
+# OAuth / cloud credential stores (file fallback). Never commit.
+**/credentials.json
+**/credentials.json.lock
+**/credentials.json.corrupt
+**/auth.json
+.accuretta/
+
 # python
 __pycache__/
 *.py[cod]

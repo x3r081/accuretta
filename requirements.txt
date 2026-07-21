@@ -12,6 +12,11 @@
 pillow>=10.0.0            # Image manipulation and fallback OCR / screenshots
 
 # ------------------------------------------------------------------------------
+# Secure credential storage (Optional — cloud provider auth)
+# ------------------------------------------------------------------------------
+keyring>=25.0.0           # macOS Keychain / platform credential store for OAuth tokens
+
+# ------------------------------------------------------------------------------
 # Desktop Automation (Optional)
 # ------------------------------------------------------------------------------
 pyautogui>=0.9.54         # Lets the agent take screenshots and drive the mouse/keyboard
