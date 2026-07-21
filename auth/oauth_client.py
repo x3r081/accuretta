@@ -74,7 +74,12 @@ def build_authorize_url(
     return f"{config.authorize_url}?{urllib.parse.urlencode(params)}"
 
 
-def _post_form(url: str, data: Dict[str, str], *, timeout: float = 30.0) -> Dict[str, Any]:
+def _post_form(
+    url: str,
+    data: Dict[str, str],
+    *,
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
     body = urllib.parse.urlencode(data).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -93,14 +98,27 @@ def _post_form(url: str, data: Dict[str, str], *, timeout: float = 30.0) -> Dict
         try:
             detail = exc.read().decode("utf-8", errors="replace")
         except Exception:
-            detail = str(exc)
+            detail = ""
+        oauth_error = None
+        try:
+            parsed = json.loads(detail) if detail else {}
+            if isinstance(parsed, dict):
+                oauth_error = parsed.get("error")
+                if isinstance(oauth_error, str):
+                    oauth_error = oauth_error.strip().lower()
+                else:
+                    oauth_error = None
+        except Exception:
+            parsed = {}
+        # Do not include response bodies in the exception message.
         raise TokenExchangeFailed(
-            redact_sensitive_text(f"token endpoint HTTP {exc.code}: {detail[:200]}")
-        ) from None
+            redact_sensitive_text(f"token endpoint HTTP {exc.code}"),
+            provider_id=None,
+        ) from _TokenEndpointHTTPError(exc.code, oauth_error, parsed if isinstance(parsed, dict) else {})
     except Exception as exc:
         raise TokenExchangeFailed(
             redact_sensitive_text(f"token endpoint request failed: {type(exc).__name__}")
-        ) from None
+        ) from exc
 
     try:
         payload = json.loads(raw) if raw else {}
@@ -109,6 +127,21 @@ def _post_form(url: str, data: Dict[str, str], *, timeout: float = 30.0) -> Dict
     if not isinstance(payload, dict):
         raise TokenExchangeFailed("token endpoint returned invalid JSON")
     return payload
+
+
+class _TokenEndpointHTTPError(Exception):
+    """Internal carrier for HTTP status / oauth error code (no secrets)."""
+
+    def __init__(self, status_code: int, oauth_error: Optional[str], payload: Dict[str, Any]):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = int(status_code)
+        self.oauth_error = oauth_error
+        # Keep only the error code fields — never tokens.
+        self.safe_payload = {
+            k: payload.get(k)
+            for k in ("error", "error_description")
+            if k in payload and k == "error"
+        }
 
 
 def parse_token_response(payload: Mapping[str, Any]) -> TokenResponse:
@@ -167,6 +200,25 @@ def refresh_access_token(
     refresh_token: str,
     timeout: float = 30.0,
 ) -> TokenResponse:
+    from .refresh_errors import (
+        RefreshFailureKind,
+        classify_refresh_http_failure,
+        refresh_failure,
+    )
+
+    if not (config.token_url or "").strip() or not (config.client_id or "").strip():
+        raise refresh_failure(
+            "OAuth token endpoint or client_id is not configured",
+            provider_id=config.provider_id,
+            kind=RefreshFailureKind.CONFIGURATION,
+        )
+    if not refresh_token:
+        raise refresh_failure(
+            "No refresh token available",
+            provider_id=config.provider_id,
+            kind=RefreshFailureKind.PERMANENT,
+        )
+
     data = {
         "grant_type": "refresh_token",
         "client_id": config.client_id,
@@ -177,16 +229,44 @@ def refresh_access_token(
     try:
         payload = _post_form(config.token_url, data, timeout=timeout)
     except TokenExchangeFailed as exc:
-        raise TokenRefreshFailed(str(exc), provider_id=config.provider_id) from None
-    if payload.get("error"):
-        raise TokenRefreshFailed(
-            redact_sensitive_text(str(payload.get("error_description") or payload.get("error"))),
+        cause = exc.__cause__
+        status_code = getattr(cause, "status_code", None) if cause is not None else None
+        oauth_error = getattr(cause, "oauth_error", None) if cause is not None else None
+        kind = classify_refresh_http_failure(
+            status_code=status_code,
+            oauth_error=oauth_error,
+            transport_exc=cause if not isinstance(cause, _TokenEndpointHTTPError) else None,
+        )
+        # URLError / timeout wrapped as TokenExchangeFailed without HTTP carrier
+        if cause is not None and not isinstance(cause, _TokenEndpointHTTPError):
+            kind = classify_refresh_http_failure(transport_exc=cause)
+        raise refresh_failure(
+            "Token refresh failed",
             provider_id=config.provider_id,
+            kind=kind,
+            oauth_error=oauth_error,
+            status_code=status_code,
+        ) from None
+
+    if payload.get("error"):
+        oauth_error = str(payload.get("error") or "").strip().lower()
+        kind = classify_refresh_http_failure(oauth_error=oauth_error, status_code=400)
+        raise refresh_failure(
+            "Token refresh rejected",
+            provider_id=config.provider_id,
+            kind=kind,
+            oauth_error=oauth_error,
+            status_code=400,
         )
     try:
         return parse_token_response(payload)
-    except TokenExchangeFailed as exc:
-        raise TokenRefreshFailed(str(exc), provider_id=config.provider_id) from None
+    except TokenExchangeFailed:
+        # Malformed success body — transient; do not wipe credentials.
+        raise refresh_failure(
+            "Token refresh returned an invalid response",
+            provider_id=config.provider_id,
+            kind=RefreshFailureKind.TRANSIENT,
+        ) from None
 
 
 @dataclass

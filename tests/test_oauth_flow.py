@@ -195,8 +195,22 @@ class OAuthFlowTest(unittest.TestCase):
                 expires_at=time.time() - 10,
             ),
         )
-        with self.assertRaises(TokenRefreshFailed):
-            ensure_fresh_credential(self.store, self.config, skew_seconds=120)
+        # Permanent rejection (invalid_grant) must clear credentials.
+        from providers.errors import AuthenticationRequired, TokenRefreshFailed
+
+        def permanent(config, **kwargs):
+            raise TokenRefreshFailed(
+                "rejected",
+                provider_id="fake_oauth",
+                kind="permanent",
+                retryable=False,
+                oauth_error="invalid_grant",
+            )
+
+        with self.assertRaises(AuthenticationRequired):
+            ensure_fresh_credential(
+                self.store, self.config, skew_seconds=120, refresher=permanent
+            )
         self.assertIsNone(self.store.load("fake_oauth"))
 
     def test_expiry_skew(self):
@@ -215,6 +229,8 @@ class OAuthFlowTest(unittest.TestCase):
         self.assertEqual(self.store.list_authenticated_providers(), [])
 
     def test_ensure_fresh_without_refresh_raises_expired(self):
+        from providers.errors import AuthenticationRequired
+
         self.store.save(
             "fake_oauth",
             StoredCredential(
@@ -224,7 +240,7 @@ class OAuthFlowTest(unittest.TestCase):
                 expires_at=time.time() - 1,
             ),
         )
-        with self.assertRaises(AuthenticationExpired):
+        with self.assertRaises(AuthenticationRequired):
             ensure_fresh_credential(self.store, self.config)
         self.assertIsNone(self.store.load("fake_oauth"))
 

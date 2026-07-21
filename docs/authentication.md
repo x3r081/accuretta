@@ -33,7 +33,10 @@ Security rules:
 - Browser auth-code flows use PKCE + state (`hmac.compare_digest`)
 - Loopback only on localhost
 - Short callback timeout
-- Failed refresh deletes credentials — no silent stale continuation
+- **Refresh failure classification** (`auth/refresh_errors.py`):
+  - *Permanent* (`invalid_grant`, revoked token, `invalid_client`, bare HTTP 401) → delete credentials and require reconnect
+  - *Transient* (timeout, DNS, connection errors, HTTP 429 / 5xx, malformed temporary body) → **retain** credentials; do not use an already-expired access token; allow retry
+  - *Configuration* (missing token URL / client ID) → retain credentials; report `ProviderNotConfigured`
 - Logout / disconnect calls `AuthStore.delete(provider_id)`
 
 ## Frontend security boundary

@@ -51,7 +51,32 @@ class TokenExchangeFailed(ProviderError):
 
 
 class TokenRefreshFailed(ProviderError):
+    """Refresh failed. Inspect ``kind`` / ``retryable`` before deleting credentials."""
+
     code = "token_refresh_failed"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_id: Optional[str] = None,
+        kind: str = "transient",
+        retryable: bool = True,
+        oauth_error: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message, provider_id=provider_id)
+        # permanent | transient | configuration
+        self.kind = kind
+        self.retryable = bool(retryable)
+        self.oauth_error = oauth_error
+        self.status_code = status_code
+
+    def to_safe_dict(self) -> dict:
+        out = super().to_safe_dict()
+        out["kind"] = self.kind
+        out["retryable"] = self.retryable
+        return out
 
 
 class ProviderUnavailable(ProviderError):

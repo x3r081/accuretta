@@ -4,7 +4,8 @@ Adapted from Nous Research Hermes Agent (MIT) expiry helpers
 (``_is_expiring``, ``_coerce_ttl_seconds``, ``_parse_iso_timestamp``)
 and refresh persistence patterns. See THIRD_PARTY_NOTICES.md.
 
-Failed refresh must not silently continue with stale credentials.
+Failed refresh must not silently continue with stale access tokens.
+Only permanent credential rejection deletes stored credentials.
 """
 
 from __future__ import annotations
@@ -13,10 +14,20 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from providers.errors import AuthenticationExpired, TokenRefreshFailed
+from providers.errors import (
+    AuthenticationExpired,
+    AuthenticationRequired,
+    ProviderNotConfigured,
+    TokenRefreshFailed,
+)
 
 from .models import StoredCredential
 from .oauth_client import OAuthProviderConfig, TokenResponse, refresh_access_token
+from .refresh_errors import (
+    RefreshFailureKind,
+    refresh_failure,
+    should_delete_credentials,
+)
 from .store import AuthStore
 
 DEFAULT_REFRESH_SKEW_SECONDS = 120
@@ -119,36 +130,88 @@ def ensure_fresh_credential(
     now: Optional[float] = None,
     refresher: Optional[Callable[..., TokenResponse]] = None,
 ) -> StoredCredential:
-    """Load credential and refresh if within skew. Raises on refresh failure."""
+    """Load credential and refresh if within skew.
+
+    - Permanent refresh rejection → delete credentials, raise AuthenticationRequired
+    - Transient failure → retain credentials, raise retryable TokenRefreshFailed
+      (never continue with an already-expired access token)
+    - Configuration failure → retain credentials, raise ProviderNotConfigured
+    """
     n = time.time() if now is None else float(now)
-    cred = store.load(config.provider_id)
+
+    if not (config.token_url or "").strip() or not (config.client_id or "").strip():
+        # Keep any stored credential; this is a developer/config problem.
+        raise ProviderNotConfigured(
+            "OAuth provider is missing token_url or client_id",
+            provider_id=config.provider_id,
+        )
+
+    try:
+        cred = store.load(config.provider_id)
+    except ValueError:
+        # Malformed local credential — remove unusable data.
+        try:
+            store.delete(config.provider_id)
+        except Exception:
+            pass
+        raise AuthenticationRequired(
+            f"Stored credentials for {config.provider_id} are invalid",
+            provider_id=config.provider_id,
+        ) from None
+
     if cred is None:
         raise AuthenticationExpired(
             f"No credentials for {config.provider_id}",
             provider_id=config.provider_id,
         )
+    if not cred.access_token:
+        store.delete(config.provider_id)
+        raise AuthenticationRequired(
+            f"Stored credentials for {config.provider_id} are incomplete",
+            provider_id=config.provider_id,
+        )
+
     if not is_expiring(cred.expires_at, skew_seconds=skew_seconds, now=n):
         return cred
+
     if not cred.refresh_token:
-        # Do not continue with a stale access token.
+        # Access token expired/within skew and no RT — credential unusable.
         store.delete(config.provider_id)
-        raise AuthenticationExpired(
+        raise AuthenticationRequired(
             f"Credentials for {config.provider_id} expired and no refresh token is available",
             provider_id=config.provider_id,
         )
+
     refresh_fn = refresher or refresh_access_token
     try:
         token = refresh_fn(config, refresh_token=cred.refresh_token)
-    except TokenRefreshFailed:
-        store.delete(config.provider_id)
+    except ProviderNotConfigured:
         raise
-    except Exception as exc:
-        store.delete(config.provider_id)
-        raise TokenRefreshFailed(
+    except TokenRefreshFailed as exc:
+        if should_delete_credentials(exc):
+            store.delete(config.provider_id)
+            raise AuthenticationRequired(
+                f"Credentials for {config.provider_id} were rejected; reconnect required",
+                provider_id=config.provider_id,
+            ) from None
+        # Transient / configuration-classified TokenRefreshFailed: retain store.
+        # Do not return the expired access token for inference.
+        raise
+    except Exception:
+        # Unknown failure — treat as transient; retain credentials.
+        raise refresh_failure(
             f"Refresh failed for {config.provider_id}",
             provider_id=config.provider_id,
-        ) from exc
+            kind=RefreshFailureKind.TRANSIENT,
+        ) from None
 
     fresh = apply_token_response(config.provider_id, token, previous=cred, now=n)
+    if not fresh.access_token:
+        # Do not overwrite store with incomplete data.
+        raise refresh_failure(
+            "Refresh returned an incomplete token response",
+            provider_id=config.provider_id,
+            kind=RefreshFailureKind.TRANSIENT,
+        )
     store.save(config.provider_id, fresh)
     return fresh
