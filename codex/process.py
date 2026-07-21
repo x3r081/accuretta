@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -45,6 +46,8 @@ class CodexAppServerProcess:
         self._lock = threading.RLock()
         self._on_notification: Optional[Callable[[str, object], None]] = None
         self._exit_code: Optional[int] = None
+        # PID of the owned child only — never used to signal unrelated Codex CLIs.
+        self._owned_pid: Optional[int] = None
 
     @property
     def ready(self) -> bool:
@@ -87,6 +90,7 @@ class CodexAppServerProcess:
                 raise CodexProcessError(
                     f"Codex app-server failed to start ({type(exc).__name__})"
                 ) from None
+            self._owned_pid = self._proc.pid
 
             def _write_line(line: str) -> None:
                 proc = self._proc
@@ -191,7 +195,9 @@ class CodexAppServerProcess:
             self._ready = False
             proc = self._proc
             rpc = self._rpc
+            owned_pid = self._owned_pid
             self._rpc = None
+            self._owned_pid = None
             if rpc is not None:
                 try:
                     rpc.close()
@@ -206,11 +212,31 @@ class CodexAppServerProcess:
                     except Exception:
                         pass
                 if proc.poll() is None:
-                    proc.terminate()
+                    # Prefer signaling the owned process group (Unix + start_new_session)
+                    # so grandchildren exit. Never broadcast-kill by process name —
+                    # only this owned PID / process group.
+                    signaled = False
+                    if os.name != "nt" and owned_pid:
+                        try:
+                            os.killpg(owned_pid, signal.SIGTERM)
+                            signaled = True
+                        except (ProcessLookupError, PermissionError, OSError):
+                            signaled = False
+                    if not signaled:
+                        proc.terminate()
                     try:
                         proc.wait(timeout=grace_s)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        if os.name != "nt" and owned_pid:
+                            try:
+                                os.killpg(owned_pid, signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError, OSError):
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                        else:
+                            proc.kill()
                         try:
                             proc.wait(timeout=1.0)
                         except Exception:

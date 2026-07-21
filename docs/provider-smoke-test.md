@@ -8,8 +8,9 @@ This release supports:
 - **Local llama.cpp** — default inference
 - **OpenAI API key** — experimental cloud inference
 - **GitHub account login** — experimental, account only (not Copilot, not chat)
-
-ChatGPT / Codex authentication is **not** implemented in this milestone.
+- **Codex via ChatGPT** — experimental Codex-managed auth; optional gated
+  inference (`ACCURETTA_CODEX_INFERENCE_ENABLED`) — see
+  [codex-inference-checklist.md](codex-inference-checklist.md)
 
 ## Prerequisites
 

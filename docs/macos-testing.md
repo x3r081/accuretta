@@ -71,8 +71,21 @@ python3 -m unittest discover -s tests -v
 | NET-LOCAL | llama `--host 127.0.0.1` | Not reachable from LAN IP on 8080 | Manual AS |
 | NET-LAN | Bridge `0.0.0.0:8787` | Phone/LAN browser reaches UI | Manual AS + smoke |
 | NET-TAILSCALE | Tailscale IP:8787 | Remote device reaches UI; llama stays local | Manual AS |
+| NET-HEALTH-ID | Unrelated process on 8787 | Launcher does **not** attach; requires `/api/health` `app=accuretta` | Unit (`test_launcher_readiness`) + Manual |
+| NET-CODEX-SHUT | Quit Accuretta after Codex status/chat | Owned `codex app-server` exits; unrelated Codex CLIs untouched | Manual AS |
 
 \*Today stream idle may hang a long time (`timeout=None`); record actual behavior until timeouts land.
+
+### Codex CLI (optional / experimental)
+
+| ID | Scenario | Expect | Layer |
+|----|----------|--------|-------|
+| CX-DISC | Homebrew `codex` present | Status shows installed/version; or set `ACCURETTA_CODEX_BIN` | Manual AS |
+| CX-PATH-GUI | Frozen/Dock launch | Homebrew bins on PATH or explicit `ACCURETTA_CODEX_BIN` | Manual packaged |
+| CX-FLAG-OFF | No inference env | Auth UI works; Codex not selectable for chat | Manual AS |
+| CX-FLAG-ON | `ACCURETTA_CODEX_INFERENCE_ENABLED=1` + signed in | Codex selectable; labeled replies; no local fallback | Manual AS |
+
+See [codex-inference-checklist.md](codex-inference-checklist.md).
 
 ### Setup / persistence
 

@@ -99,7 +99,23 @@ A few failures are common enough to name:
 - **llama-server crashes instantly on NVIDIA.** You're missing the CUDA runtime DLLs. Download the `cudart-llama-bin-win-cuda-*.zip` that matches your build and extract it into the same folder as `llama-server.exe`. Match the CUDA version to your driver: run `nvidia-smi` and read the CUDA Version in the top right. A CUDA 13 build needs a 13.x driver.
 - **`error loading model: missing tensor 'blk.NN.ssm_conv1d.weight'`.** Your llama.cpp is too old for that model, usually a new MTP or hybrid GGUF. Use a non-MTP version of the same model, or update your binary.
 - **llama-server exits the moment speculative decoding turns on.** Set Settings → Speculative decoding to `off` (or `ngram-mod`) and reload. `draft-mtp` only works on models that ship MTP heads and a recent build.
-- **Port 8787 already in use.** Something else is on it. `start.bat` clears it for you; in manual mode set `ACCURETTA_PORT` to another number.
+- **Port 8787 already in use.** Something else is on it. `start.bat` clears it for you; in manual mode set `ACCURETTA_PORT` to another number. The desktop launcher only attaches when `GET /api/health` returns Accuretta’s marker (`"app": "accuretta"`) — an unrelated TCP listener is not treated as Accuretta.
+
+### Optional: Codex via ChatGPT (experimental)
+
+Accuretta can use the official **Codex CLI** for ChatGPT sign-in and, when you
+explicitly enable it, Codex chat inference. Tokens stay in Codex — Accuretta
+never stores them. Local llama.cpp remains the default and never silently takes
+over a failed Codex turn.
+
+```bash
+ACCURETTA_CODEX_INFERENCE_ENABLED=1 ACCURETTA_BROWSER=none python3 bridge.py
+```
+
+Prerequisites, security model, workspace rules, and a short operator checklist:
+[docs/providers.md](docs/providers.md),
+[docs/codex-inference-checklist.md](docs/codex-inference-checklist.md).
+**Tested Codex CLI:** `0.144.6`.
 
 ---
 

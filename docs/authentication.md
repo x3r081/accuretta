@@ -3,9 +3,10 @@
 Accuretta keeps cloud credentials off the frontend. Local llama.cpp needs no
 account. This milestone supports an **experimental OpenAI API-key** provider,
 optional **experimental GitHub account login** (device flow, identity only —
-not Copilot inference), and **experimental ChatGPT / Codex account login**
-through the official Codex app-server (authentication only — Accuretta does not
-store Codex tokens).
+not Copilot inference), and **experimental ChatGPT / Codex** through the
+official Codex app-server. Accuretta does **not** store Codex tokens. Codex
+**inference** is separate from authentication and is off unless
+`ACCURETTA_CODEX_INFERENCE_ENABLED=1` (see [providers.md](providers.md)).
 
 ## Storage backends
 
@@ -101,16 +102,25 @@ secret POST — prefer HTTPS when exposing Accuretta beyond localhost.
 
 ## ChatGPT / Codex (Codex-managed)
 
-Accuretta communicates only with `codex app-server` JSON-RPC. Codex owns OAuth
-registration, callbacks, device authorization, access/refresh tokens, persistence,
-refresh, and logout. Accuretta:
+Accuretta communicates only with `codex app-server` JSON-RPC over **stdio**.
+Codex owns OAuth registration, browser/device callbacks, access/refresh tokens,
+persistence, refresh, and logout. Accuretta does **not** host a custom OAuth
+callback for ChatGPT. Accuretta:
 
 - never reads or writes Codex credential files
 - never copies Codex tokens into AuthStore or settings
+- never logs `access_token`, `refresh_token`, or `Authorization` values
 - never reuses Hermes / VS Code / GitHub CLI / other third-party OAuth client IDs
 - never calls undocumented private OpenAI endpoints for this flow
 
-See [codex-chatgpt-auth-smoke-test.md](codex-chatgpt-auth-smoke-test.md) and
+**Authentication** (sign-in status) works without the inference flag.
+**Inference** requires `ACCURETTA_CODEX_INFERENCE_ENABLED=1` plus a ready CLI
+session; select **Codex via ChatGPT** explicitly in Settings. Disconnect or
+expired sign-in makes Codex unselectable and returns actionable errors — Accuretta
+does not silently switch to local llama.
+
+See [codex-chatgpt-auth-smoke-test.md](codex-chatgpt-auth-smoke-test.md),
+[codex-inference-checklist.md](codex-inference-checklist.md), and
 [providers.md](providers.md).
 
 ## Fake-provider tests
@@ -133,4 +143,6 @@ it does not vendor the Codex source tree.
 ## Related
 
 - [providers.md](providers.md)
+- [codex-inference-checklist.md](codex-inference-checklist.md)
 - [codex-chatgpt-auth-smoke-test.md](codex-chatgpt-auth-smoke-test.md)
+- [codex-workspace-security.md](codex-workspace-security.md)

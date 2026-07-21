@@ -43,29 +43,35 @@ os.environ.setdefault("ACCURETTA_BROWSER", "none")
 # When frozen, run from the extracted bundle dir so bridge finds its assets.
 if getattr(sys, "frozen", False):
     os.chdir(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+    # GUI apps launched from Finder/Dock often lack Homebrew PATH. Extend PATH
+    # so Codex CLI discovery can find /opt/homebrew/bin and /usr/local/bin.
+    _extra = ["/opt/homebrew/bin", "/usr/local/bin"]
+    _path = os.environ.get("PATH", "")
+    for _p in _extra:
+        if _p and _p not in _path.split(os.pathsep) and os.path.isdir(_p):
+            _path = _p + os.pathsep + _path
+    os.environ["PATH"] = _path
 
 import webview  # pip install pywebview
 import bridge   # the existing server; module-level init runs on import
+from launcher_readiness import (
+    port_accepts_tcp,
+    probe_accuretta,
+    wait_for_accuretta,
+)
 
 PORT = int(os.environ.get("ACCURETTA_PORT", "8787"))
 
 
 def _wait_ready(host: str = "127.0.0.1", port: int = PORT, timeout: float = 40.0) -> bool:
-    """Block until the bridge is accepting connections (or give up)."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                return True
-        except OSError:
-            time.sleep(0.25)
-    return False
+    """Block until Accuretta's /api/health marker responds (not bare TCP)."""
+    return wait_for_accuretta(host, port, timeout=timeout)
 
 
 def _run_bridge() -> None:
     # bridge.main() creates the HTTP server and blocks in serve_forever(). It runs
     # in a daemon thread so it dies with the app; the bridge's own atexit handlers
-    # clean up llama-server on shutdown.
+    # clean up llama-server and the owned Codex app-server on shutdown.
     try:
         bridge.main()
     except Exception as exc:  # keep the window usable even if the bridge stumbles
@@ -79,11 +85,7 @@ _lock_sock = None
 
 
 def _port_in_use(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            return True
-    except OSError:
-        return False
+    return port_accepts_tcp("127.0.0.1", port, timeout=0.5)
 
 
 def _acquire_single_instance(lock_port: int = 8799) -> bool:
@@ -375,17 +377,21 @@ _FAILED_HTML = ("<body style='font-family:system-ui,sans-serif;background:#12151
                 "<h2>Accuretta could not start its engine</h2>"
                 f"<p>The local bridge did not come up on port {PORT}. Check the logs, then relaunch.</p></body>")
 
+_PORT_BUSY_HTML = ("<body style='font-family:system-ui,sans-serif;background:#12151c;color:#e6e6e6;padding:2rem'>"
+                   "<h2>Port is already in use</h2>"
+                   f"<p>Something other than Accuretta is listening on port {PORT}. "
+                   "Stop that process, or set <code>ACCURETTA_PORT</code> to a free port, then relaunch.</p></body>")
+
 
 def _watch_bridge(win) -> None:
-    """Close the window (exit the app) once the bridge stops responding, e.g.
-    right after the in-app Shutdown button stops it."""
+    """Close the window (exit the app) once Accuretta health stops responding,
+    e.g. right after the in-app Shutdown button stops the bridge."""
     time.sleep(3)
     misses = 0
     while True:
-        try:
-            with socket.create_connection(("127.0.0.1", PORT), timeout=1):
-                misses = 0
-        except OSError:
+        if probe_accuretta("127.0.0.1", PORT, timeout=1.0):
+            misses = 0
+        else:
             misses += 1
             if misses >= 2:
                 try:
@@ -459,8 +465,16 @@ def main() -> int:
                                 text_select=True)
 
     def _boot() -> None:
-        if not _port_in_use(PORT):
-            threading.Thread(target=_run_bridge, daemon=True).start()
+        # Attach only when Accuretta itself is healthy — never because a random
+        # TCP listener occupies the port.
+        if probe_accuretta("127.0.0.1", PORT, timeout=1.0):
+            win.load_url(f"http://127.0.0.1:{PORT}")
+            threading.Thread(target=_watch_bridge, args=(win,), daemon=True).start()
+            return
+        if _port_in_use(PORT):
+            win.load_html(_PORT_BUSY_HTML)
+            return
+        threading.Thread(target=_run_bridge, daemon=True).start()
         if _wait_ready():
             win.load_url(f"http://127.0.0.1:{PORT}")
             threading.Thread(target=_watch_bridge, args=(win,), daemon=True).start()

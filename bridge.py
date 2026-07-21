@@ -16367,6 +16367,7 @@ class Handler(BaseHTTPRequestHandler):
             life = _llama.lifecycle_snapshot()
             return self._send_json(200, {
                 "ok": True,
+                "app": "accuretta",
                 "llama": LLAMA,
                 "vision_llama": VISION_LLAMA,
                 "llama_up": llama_ping(timeout=1.0),
