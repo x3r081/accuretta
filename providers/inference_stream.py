@@ -12,7 +12,7 @@ import json
 from typing import Any, Iterator, Optional, Tuple
 
 from .codex_provider import CODEX_PROVIDER_ID, CodexProvider, cancel_codex_for_chat
-from .codex_readiness import assess_codex_inference_readiness, readiness_to_provider_error
+from .codex_readiness import assess_codex_inference_readiness
 from .errors import AuthenticationRequired, ProviderUnavailable
 from .openai_provider import OPENAI_PROVIDER_ID, OpenAIProvider, openai_api_key_from_store
 from .selection import DEFAULT_PROVIDER_ID
@@ -123,6 +123,8 @@ def open_provider_chat_stream(
     auth_store=None,
     bridge_module=None,
     chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    correlation_id: Optional[str] = None,
 ) -> Tuple[Any, Iterator[bytes]]:
     """Open a streaming completion for exactly one provider.
 
@@ -178,18 +180,37 @@ def open_provider_chat_stream(
         return resp, _iter_openai()
 
     if provider_id == CODEX_PROVIDER_ID:
+        from .codex_errors import user_message_for_readiness_status
+        from .codex_provider import bind_codex_thread
+
         readiness = assess_codex_inference_readiness(live=True)
         if not readiness.get("ready"):
-            raise readiness_to_provider_error(readiness, provider_id=CODEX_PROVIDER_ID)
+            from .errors import AuthenticationRequired, ProviderUnavailable
+            detail = user_message_for_readiness_status(readiness.get("status"))
+            status = readiness.get("status")
+            if status == "not_signed_in":
+                raise AuthenticationRequired(detail, provider_id=CODEX_PROVIDER_ID)
+            raise ProviderUnavailable(detail, provider_id=CODEX_PROVIDER_ID)
 
         from .base import InferenceRequest
+
+        if chat_id and thread_id:
+            bind_codex_thread(chat_id, thread_id)
+
+        extra = {"chat_id": chat_id} if chat_id else {}
+        if thread_id:
+            extra["thread_id"] = thread_id
+        if correlation_id:
+            extra["correlation_id"] = correlation_id
+        elif chat_id:
+            extra["correlation_id"] = chat_id
 
         provider = CodexProvider()
         request = InferenceRequest(
             model=str(payload.get("model") or ""),
             messages=list(payload.get("messages") or []),
             cancellation_id=chat_id or "",
-            extra={"chat_id": chat_id} if chat_id else {},
+            extra=extra,
         )
         handle = _CodexStreamHandle(chat_id=chat_id)
 

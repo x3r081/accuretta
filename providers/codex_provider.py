@@ -34,8 +34,12 @@ from .base import (
     ProviderDefinition,
     RuntimeCredentials,
 )
+from .codex_errors import (
+    MSG_THREAD_INVALID,
+    is_invalid_thread_message,
+    user_message_for_codex_error,
+)
 from .codex_readiness import (
-    CodexInferenceStatus,
     assess_codex_inference_readiness,
     readiness_to_provider_error,
 )
@@ -47,13 +51,67 @@ from .registry import ProviderRegistry, get_default_registry
 from .status import assert_safe_provider_payload
 
 CODEX_PROVIDER_ID = "codex_chatgpt"
-
-# chat_id -> codex thread id (in-memory only; not credentials)
+CODEX_DISPLAY_NAME = "Codex via ChatGPT"
+LOCAL_DISPLAY_NAME = "Local llama.cpp"
 _THREAD_BY_CHAT: dict[str, str] = {}
 _THREAD_LOCK = threading.Lock()
 # cancellation_id / chat_id -> active inference service for cancel routing
 _ACTIVE_TURN: dict[str, CodexInferenceService] = {}
 _ACTIVE_LOCK = threading.Lock()
+# Last completed turn metadata per chat (safe fields only) for persistence.
+_LAST_TURN_META: dict[str, dict] = {}
+_META_LOCK = threading.Lock()
+
+
+def bind_codex_thread(chat_id: str, thread_id: str) -> None:
+    """Remember Accuretta chat → Codex thread mapping (non-secret id only)."""
+    if not chat_id or not thread_id:
+        return
+    tid = str(thread_id).strip()
+    if not tid or len(tid) > 200:
+        return
+    with _THREAD_LOCK:
+        _THREAD_BY_CHAT[str(chat_id)] = tid
+
+
+def get_bound_codex_thread(chat_id: str) -> Optional[str]:
+    if not chat_id:
+        return None
+    with _THREAD_LOCK:
+        return _THREAD_BY_CHAT.get(str(chat_id))
+
+
+def clear_codex_thread_for_chat(chat_id: str) -> None:
+    if not chat_id:
+        return
+    with _THREAD_LOCK:
+        _THREAD_BY_CHAT.pop(str(chat_id), None)
+    with _META_LOCK:
+        _LAST_TURN_META.pop(str(chat_id), None)
+
+
+def pop_codex_turn_meta(chat_id: str) -> Optional[dict]:
+    if not chat_id:
+        return None
+    with _META_LOCK:
+        return _LAST_TURN_META.pop(str(chat_id), None)
+
+
+def peek_codex_turn_meta(chat_id: str) -> Optional[dict]:
+    if not chat_id:
+        return None
+    with _META_LOCK:
+        meta = _LAST_TURN_META.get(str(chat_id))
+        return dict(meta) if isinstance(meta, dict) else None
+
+
+def _store_turn_meta(chat_id: str, meta: dict) -> None:
+    if not chat_id:
+        return
+    public = {k: v for k, v in meta.items() if not str(k).startswith("_")}
+    assert_safe_provider_payload(public)
+    with _META_LOCK:
+        _LAST_TURN_META[str(chat_id)] = dict(meta)
 
 
 def build_codex_definition() -> ProviderDefinition:
@@ -135,7 +193,7 @@ def safe_codex_response_metadata(
     """Safe provider metadata for responses / tests (never tokens)."""
     out = {
         "providerId": CODEX_PROVIDER_ID,
-        "providerDisplayName": "Codex via ChatGPT",
+        "providerDisplayName": CODEX_DISPLAY_NAME,
     }
     if isinstance(model_label, str) and model_label.strip():
         out["modelLabel"] = model_label.strip()[:120]
@@ -213,7 +271,8 @@ class CodexProvider:
         readiness = assess_codex_inference_readiness(live=True)
         if not readiness.get("ready"):
             err = readiness_to_provider_error(readiness, provider_id=CODEX_PROVIDER_ID)
-            yield InferenceEvent(event_type=InferenceEventType.ERROR, error=err.message)
+            msg = user_message_for_codex_error(err)
+            yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
             raise err
 
         text = _last_user_text(request.messages)
@@ -229,65 +288,120 @@ class CodexProvider:
         chat_key = request.cancellation_id or (request.extra or {}).get("chat_id") or ""
         chat_key = str(chat_key) if chat_key else ""
         model = (request.model or "").strip() or None
+        correlation = str((request.extra or {}).get("correlation_id") or chat_key or "")
         svc = self._svc()
 
         if chat_key:
             with _ACTIVE_LOCK:
+                if chat_key in _ACTIVE_TURN:
+                    busy = ProviderUnavailable(
+                        "A Codex turn is already in progress",
+                        provider_id=CODEX_PROVIDER_ID,
+                    )
+                    msg = user_message_for_codex_error(busy)
+                    yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+                    raise busy
                 _ACTIVE_TURN[chat_key] = svc
 
         try:
-            with _THREAD_LOCK:
-                thread_id = _THREAD_BY_CHAT.get(chat_key) if chat_key else None
+            thread_id = None
+            if chat_key:
+                thread_id = get_bound_codex_thread(chat_key)
+            extra_tid = (request.extra or {}).get("thread_id") or (request.extra or {}).get(
+                "codex_thread_id"
+            )
+            if not thread_id and isinstance(extra_tid, str) and extra_tid.strip():
+                thread_id = extra_tid.strip()
+                if chat_key:
+                    bind_codex_thread(chat_key, thread_id)
+
+            created_fresh = False
             if not thread_id:
                 try:
                     thread_id = svc.create_thread(model=model)
+                    created_fresh = True
                 except CodexInferenceError as exc:
-                    yield InferenceEvent(
-                        event_type=InferenceEventType.ERROR,
-                        error=exc.message,
-                    )
-                    raise self._map_inference_error(exc) from None
+                    msg = user_message_for_codex_error(exc)
+                    yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+                    raise self._map_inference_error(exc, message=msg) from None
                 if chat_key:
-                    with _THREAD_LOCK:
-                        _THREAD_BY_CHAT[chat_key] = thread_id
+                    bind_codex_thread(chat_key, thread_id)
 
-            # Stream by wrapping run_turn's on_event into InferenceEvents via a queue.
             import queue
 
-            q: queue.Queue = queue.Queue()
+            def _run_once(active_thread: str):
+                q: queue.Queue = queue.Queue()
+                result_box: dict = {}
+                error_box: dict = {}
 
-            def on_event(evt):
-                q.put(evt)
+                def on_event(evt):
+                    q.put(evt)
 
-            result_box: dict = {}
-            error_box: dict = {}
+                def _worker():
+                    try:
+                        result_box["r"] = svc.run_turn(
+                            active_thread, text, on_event=on_event, timeout_s=300.0
+                        )
+                    except Exception as exc:
+                        error_box["e"] = exc
+                    finally:
+                        q.put(None)
 
-            def _worker():
-                try:
-                    result_box["r"] = svc.run_turn(
-                        thread_id, text, on_event=on_event, timeout_s=300.0
-                    )
-                except Exception as exc:
-                    error_box["e"] = exc
-                finally:
-                    q.put(None)
+                t = threading.Thread(target=_worker, name="codex-turn", daemon=True)
+                t.start()
+                events: list = []
+                while True:
+                    item = q.get()
+                    if item is None:
+                        break
+                    events.append(item)
+                t.join(timeout=1.0)
+                return events, result_box.get("r"), error_box.get("e")
 
-            t = threading.Thread(target=_worker, name="codex-turn", daemon=True)
-            t.start()
-            while True:
-                item = q.get()
-                if item is None:
-                    break
-                if item.type == CodexInferenceEventType.TEXT_DELTA and item.text_delta:
-                    yield InferenceEvent(
-                        event_type=InferenceEventType.TEXT_DELTA,
-                        text_delta=item.text_delta,
-                    )
-                elif item.type == CodexInferenceEventType.STARTED:
+            events, result, err = _run_once(thread_id)
+
+            # Invalid / missing remote thread → clear mapping, create once, retry.
+            if err is not None and isinstance(err, CodexInferenceError):
+                if is_invalid_thread_message(err.message) and chat_key:
+                    clear_codex_thread_for_chat(chat_key)
+                    try:
+                        thread_id = svc.create_thread(model=model)
+                        created_fresh = True
+                        bind_codex_thread(chat_key, thread_id)
+                        events, result, err = _run_once(thread_id)
+                    except CodexInferenceError as exc2:
+                        msg = user_message_for_codex_error(exc2)
+                        yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+                        raise self._map_inference_error(exc2, message=msg) from None
+                    if err is not None:
+                        # Recovery failed — surface thread-invalid guidance.
+                        msg = MSG_THREAD_INVALID
+                        if isinstance(err, CodexInferenceError):
+                            msg = user_message_for_codex_error(err)
+                        yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+                        if isinstance(err, CodexInferenceError):
+                            raise self._map_inference_error(err, message=msg) from None
+                        raise err
+
+            turn_id = None
+            for item in events:
+                if item.type == CodexInferenceEventType.STARTED:
+                    turn_id = item.turn_id
                     yield InferenceEvent(
                         event_type=InferenceEventType.TEXT_DELTA,
                         text_delta="",
-                        raw={"status": "started", "turnId": item.turn_id},
+                        raw={
+                            "status": "started",
+                            "turnId": item.turn_id,
+                            "threadId": thread_id,
+                            "correlationId": correlation,
+                        },
+                    )
+                elif item.type == CodexInferenceEventType.TEXT_DELTA and item.text_delta:
+                    yield InferenceEvent(
+                        event_type=InferenceEventType.TEXT_DELTA,
+                        text_delta=item.text_delta,
+                        raw={"turnId": item.turn_id or turn_id, "correlationId": correlation},
                     )
                 elif item.type in {
                     CodexInferenceEventType.PROTOCOL_ERROR,
@@ -295,44 +409,59 @@ class CodexProvider:
                     CodexInferenceEventType.AUTHENTICATION_REQUIRED,
                     CodexInferenceEventType.UNAVAILABLE,
                 }:
-                    yield InferenceEvent(
-                        event_type=InferenceEventType.ERROR,
-                        error=item.message or item.type.value,
+                    msg = user_message_for_codex_error(
+                        CodexInferenceError(
+                            item.message or item.type.value,
+                            event_type=item.type,
+                        )
                     )
-            t.join(timeout=1.0)
-            if "e" in error_box:
-                exc = error_box["e"]
-                if isinstance(exc, CodexInferenceError):
-                    yield InferenceEvent(
-                        event_type=InferenceEventType.ERROR,
-                        error=exc.message,
-                    )
-                    raise self._map_inference_error(exc) from None
-                raise
-            result = result_box.get("r")
+                    yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+
+            if err is not None:
+                if isinstance(err, CodexInferenceError):
+                    msg = user_message_for_codex_error(err)
+                    yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+                    raise self._map_inference_error(err, message=msg) from None
+                raise err
+
             if result is None:
-                yield InferenceEvent(
-                    event_type=InferenceEventType.ERROR,
-                    error="Codex turn produced no result",
-                )
-                raise ProviderUnavailable(
-                    "Codex turn produced no result",
-                    provider_id=CODEX_PROVIDER_ID,
-                )
+                msg = "Codex turn produced no result"
+                yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+                raise ProviderUnavailable(msg, provider_id=CODEX_PROVIDER_ID)
+
+            meta = {
+                "providerId": CODEX_PROVIDER_ID,
+                "providerDisplayName": CODEX_DISPLAY_NAME,
+                "threadId": thread_id,
+                "turnId": result.turn_id or turn_id,
+                "correlationId": correlation,
+                "createdThread": created_fresh,
+            }
+            if model:
+                meta["modelLabel"] = str(model)[:120]
+            if chat_key:
+                _store_turn_meta(chat_key, meta)
+
             if result.status == "cancelled":
                 yield InferenceEvent(
                     event_type=InferenceEventType.COMPLETED,
                     completion_reason="cancelled",
+                    raw=meta,
                 )
                 return
             if not result.ok:
-                msg = result.error_message or "Codex turn failed"
+                msg = user_message_for_codex_error(
+                    CodexInferenceError(
+                        result.error_message or "Codex turn failed",
+                        event_type=CodexInferenceEventType.PROTOCOL_ERROR,
+                    )
+                )
                 yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
                 raise ProviderUnavailable(msg, provider_id=CODEX_PROVIDER_ID)
             yield InferenceEvent(
                 event_type=InferenceEventType.COMPLETED,
                 completion_reason="stop",
-                raw=safe_codex_response_metadata(model_label=model, thread_id=None),
+                raw=meta,
             )
         finally:
             if chat_key:
@@ -340,10 +469,11 @@ class CodexProvider:
                     _ACTIVE_TURN.pop(chat_key, None)
 
     @staticmethod
-    def _map_inference_error(exc: CodexInferenceError):
+    def _map_inference_error(exc: CodexInferenceError, *, message: Optional[str] = None):
+        msg = message or user_message_for_codex_error(exc)
         if exc.event_type == CodexInferenceEventType.AUTHENTICATION_REQUIRED:
-            return AuthenticationRequired(exc.message, provider_id=CODEX_PROVIDER_ID)
-        return ProviderUnavailable(exc.message, provider_id=CODEX_PROVIDER_ID)
+            return AuthenticationRequired(msg, provider_id=CODEX_PROVIDER_ID)
+        return ProviderUnavailable(msg, provider_id=CODEX_PROVIDER_ID)
 
 
 def cancel_codex_for_chat(chat_id: str) -> bool:
@@ -355,11 +485,6 @@ def cancel_codex_for_chat(chat_id: str) -> bool:
     if svc is None:
         return False
     return bool(svc.cancel_active_turn())
-
-
-def clear_codex_thread_for_chat(chat_id: str) -> None:
-    with _THREAD_LOCK:
-        _THREAD_BY_CHAT.pop(chat_id, None)
 
 
 # ---- account auth HTTP helpers (unchanged surface) ------------------------

@@ -13758,7 +13758,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         emit({"type": "error", "error": msg, "code": getattr(exc, "code", "provider_error")})
         return None
 
-    from providers.codex_provider import CODEX_PROVIDER_ID
+    from providers.codex_provider import CODEX_DISPLAY_NAME, CODEX_PROVIDER_ID, LOCAL_DISPLAY_NAME
 
     # Codex owns its model selection; Accuretta tools are not used on Codex turns.
     if provider_id == CODEX_PROVIDER_ID:
@@ -13771,9 +13771,46 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         model = (settings.get("codex_model") or settings.get("model") or "codex").strip()
     else:
         model = settings.get("model") or ""
-    if not model:
+    if not model and provider_id != CODEX_PROVIDER_ID:
         emit({"type": "error", "error": "no model selected. Pick one in Settings."})
         return None
+    if not model:
+        model = "codex"
+
+    # Label the turn for the UI (text, not color alone).
+    if provider_id == CODEX_PROVIDER_ID:
+        emit({
+            "type": "provider",
+            "providerId": CODEX_PROVIDER_ID,
+            "providerDisplayName": CODEX_DISPLAY_NAME,
+        })
+    elif provider_id == DEFAULT_PROVIDER_ID:
+        emit({
+            "type": "provider",
+            "providerId": DEFAULT_PROVIDER_ID,
+            "providerDisplayName": LOCAL_DISPLAY_NAME,
+        })
+    elif provider_id == OPENAI_PROVIDER_ID:
+        emit({
+            "type": "provider",
+            "providerId": OPENAI_PROVIDER_ID,
+            "providerDisplayName": "OpenAI API",
+        })
+
+    # Restore persisted Codex thread binding for this Accuretta conversation.
+    codex_thread_id = None
+    if provider_id == CODEX_PROVIDER_ID:
+        try:
+            from providers.codex_provider import bind_codex_thread
+            _crec = (get_chats().get("chats") or {}).get(chat_id) or {}
+            raw_tid = _crec.get("codex_thread_id")
+            if isinstance(raw_tid, str) and raw_tid.strip():
+                codex_thread_id = raw_tid.strip()
+                bind_codex_thread(chat_id, codex_thread_id)
+        except Exception:
+            codex_thread_id = None
+
+    turn_correlation = f"{chat_id}:{uuid.uuid4().hex[:10]}"
 
     _chat_emitters[chat_id] = emit
     cancel_ev = _register_cancel(chat_id)
@@ -13900,7 +13937,22 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 "stream": True,
                 **(llama_options(settings) if provider_id == DEFAULT_PROVIDER_ID else {}),
             }
-            if provider_id != DEFAULT_PROVIDER_ID:
+            if provider_id == CODEX_PROVIDER_ID:
+                # Codex thread already holds remote history — submit only the
+                # new user turn (never replay assistant messages as user turns).
+                _user_text = ""
+                for _m in reversed(trimmed or []):
+                    if isinstance(_m, dict) and _m.get("role") == "user":
+                        _c = _m.get("content")
+                        if isinstance(_c, str) and _c.strip():
+                            _user_text = _c.strip()
+                            break
+                payload = {
+                    "model": model or "codex",
+                    "messages": [{"role": "user", "content": _user_text}],
+                    "stream": True,
+                }
+            elif provider_id != DEFAULT_PROVIDER_ID:
                 # Cloud: attach shared sampling fields without llama-only keys.
                 opts = llama_options(settings)
                 for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
@@ -13979,6 +14031,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         auth_store=get_auth_store_info().store,
                         bridge_module=sys.modules[__name__],
                         chat_id=chat_id,
+                        thread_id=codex_thread_id if provider_id == CODEX_PROVIDER_ID else None,
+                        correlation_id=turn_correlation if provider_id == CODEX_PROVIDER_ID else None,
                     )
                     break
                 except Exception as e:
@@ -14002,19 +14056,27 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                                         "Settings, or turn off some tools for this turn."),
                               "code": "generation_failed"})
                     elif isinstance(e, (AuthenticationRequired, RateLimited, ProviderError)):
+                        from providers.codex_errors import user_message_for_codex_error
+                        err_msg = getattr(e, "message", None) or str(e)
+                        if provider_id == CODEX_PROVIDER_ID:
+                            err_msg = user_message_for_codex_error(e)
                         emit({
                             "type": "error",
-                            "error": getattr(e, "message", None) or str(e),
+                            "error": err_msg,
                             "code": getattr(e, "code", "provider_error"),
                         })
                     else:
+                        from providers.codex_errors import user_message_for_codex_error
                         life = _llama.lifecycle_snapshot() if provider_id == DEFAULT_PROVIDER_ID else {}
+                        err_msg = (
+                            f"inference request failed"
+                            + (f" (state={life.get('state')})" if life else "")
+                            + f": {type(e).__name__}"
+                        )
+                        if provider_id == CODEX_PROVIDER_ID:
+                            err_msg = user_message_for_codex_error(e)
                         emit({"type": "error",
-                              "error": (
-                                  f"inference request failed"
-                                  + (f" (state={life.get('state')})" if life else "")
-                                  + f": {type(e).__name__}"
-                              ),
+                              "error": err_msg,
                               "code": "generation_failed",
                               "lifecycle": life or None})
                     if provider_id == DEFAULT_PROVIDER_ID:
@@ -14199,8 +14261,11 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 if provider_id == DEFAULT_PROVIDER_ID:
                     _llama.end_generation(failed=True, reason=type(e).__name__)
                 from providers.errors import ProviderError
+                from providers.codex_errors import user_message_for_codex_error
                 code = getattr(e, "code", "generation_failed") if isinstance(e, ProviderError) else "generation_failed"
                 msg = getattr(e, "message", None) if isinstance(e, ProviderError) else f"{type(e).__name__}"
+                if provider_id == CODEX_PROVIDER_ID:
+                    msg = user_message_for_codex_error(e)
                 emit({"type": "error", "error": msg or "generation failed", "code": code})
                 partial = {"role": "assistant", "content": "".join(content_buf)}
                 partial["_appended_intermediate"] = list(conversation[_start_len:])
@@ -14372,6 +14437,26 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 if turn_prompt_total:
                     turn_stats["prompt_eval_count"] = turn_prompt_total
                 assistant_msg["_stats"] = turn_stats
+                # Provider label for UI / persistence (never secrets).
+                if provider_id == CODEX_PROVIDER_ID:
+                    from providers.codex_provider import (
+                        CODEX_DISPLAY_NAME,
+                        get_bound_codex_thread,
+                        pop_codex_turn_meta,
+                    )
+                    meta = pop_codex_turn_meta(chat_id) or {}
+                    assistant_msg["provider_id"] = CODEX_PROVIDER_ID
+                    assistant_msg["provider_label"] = CODEX_DISPLAY_NAME
+                    tid = meta.get("threadId") or get_bound_codex_thread(chat_id)
+                    if tid:
+                        assistant_msg["_codex_thread_id"] = tid
+                elif provider_id == DEFAULT_PROVIDER_ID:
+                    from providers.codex_provider import LOCAL_DISPLAY_NAME
+                    assistant_msg["provider_id"] = DEFAULT_PROVIDER_ID
+                    assistant_msg["provider_label"] = LOCAL_DISPLAY_NAME
+                elif provider_id == OPENAI_PROVIDER_ID:
+                    assistant_msg["provider_id"] = OPENAI_PROVIDER_ID
+                    assistant_msg["provider_label"] = "OpenAI API"
                 # Lifetime savings: add this turn's tokens to the durable counters
                 # (summed per-round, as a cloud API would bill) and push the new
                 # totals to the widget. Fall back to a char estimate when the
@@ -16103,6 +16188,11 @@ class Handler(BaseHTTPRequestHandler):
                     chats["order"] = [x for x in chats["order"] if x != cid]
                     save_json(CHATS_FILE, chats)
                     shutil.rmtree(VERSIONS_DIR / cid, ignore_errors=True)
+                    try:
+                        from providers.codex_provider import clear_codex_thread_for_chat
+                        clear_codex_thread_for_chat(cid)
+                    except Exception:
+                        pass
                     return self._send_json(200, {"ok": True})
                 return self._send_json(404, {"error": "not found"})
             if p == "/api/cmd-history":
@@ -17631,6 +17721,15 @@ class Handler(BaseHTTPRequestHandler):
                     msg["tokens"] = stats["eval_count"]
                 if stats.get("prompt_eval_count") is not None:
                     msg["prompt_tokens"] = stats["prompt_eval_count"]
+                # Safe provider label only — never tokens / auth payloads.
+                if final.get("provider_id"):
+                    msg["provider_id"] = final["provider_id"]
+                if final.get("provider_label"):
+                    msg["provider_label"] = final["provider_label"]
+                # Persist Codex thread id on the chat (non-secret resume key).
+                tid = final.pop("_codex_thread_id", None)
+                if isinstance(tid, str) and tid.strip():
+                    chat["codex_thread_id"] = tid.strip()
                 chat["messages"].append(msg)
                 chat["updated"] = now_t
                 # Retention cap: keep the chat under CHAT_HISTORY_MAX messages.

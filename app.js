@@ -2977,13 +2977,16 @@
     }
 
     const tokTip = m.tokens ? ` title="${m.tokens.toLocaleString()} tokens"` : "";
+    const agentLabel = m.role === "user"
+      ? "you"
+      : (m.provider_label || m.providerLabel || _providerLabelForId(m.provider_id) || state.settings.model || "agent");
     row.innerHTML = `
       ${avatar}
       <div class="bubble-col">
         ${thoughtChip}
         <div class="bubble ${m.role === "user" ? "user" : "agent"}">${renderMarkdown(visible)}</div>
         ${cascadeChips}
-        <div class="bubble-meta"${tokTip}>${m.role === "user" ? "you" : (state.settings.model || "agent")} · ${relTime(m.t)}</div>
+        <div class="bubble-meta"${tokTip}>${agentLabel} · ${relTime(m.t)}</div>
       </div>`;
     
     // (Cascade click listeners are now handled via event delegation on #chat-inner)
@@ -3214,7 +3217,7 @@
         </div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta streaming">${esc(state.settings.model)} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
+        <div class="bubble-meta streaming">${esc(_providerLabelForId(_activeInferenceProviderId()) || state.settings.model || "agent")} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -3324,6 +3327,17 @@
     renderImageTray();
   }
 
+  function _providerLabelForId(id) {
+    if (id === "codex_chatgpt") return "Codex via ChatGPT";
+    if (id === "local_llama") return "Local llama.cpp";
+    if (id === "openai") return "OpenAI API";
+    return null;
+  }
+
+  function _activeInferenceProviderId() {
+    return state.settings?.provider_id || state.selectedProviderId || "local_llama";
+  }
+
   // ---------- send / stream ----------
   async function send(opts = {}) {
     if (state.streaming) return;
@@ -3347,7 +3361,17 @@
     // A new request starts fresh: drop any prior turn's plan panel. The model
     // re-emits update_plan if this task is multi-step.
     renderPlanPanel([]);
-    if (!state.settings.model) {
+    const providerId = _activeInferenceProviderId();
+    if (providerId === "codex_chatgpt") {
+      const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
+      if (!cx || !cx.selectable) {
+        const why = (cx && (cx.selectionDisabledReason || cx.disabledReason))
+          || "Codex is not ready. Open Settings to sign in or check status.";
+        toast(why, "warn", 4200, "codex-not-ready");
+        openSettings();
+        return;
+      }
+    } else if (!state.settings.model) {
       toast("Pick a model in Settings first.", "warn", 3200, "no-model");
       openSettings();
       return;
@@ -3402,7 +3426,7 @@
         </div>
         <div class="tool-stack" id="tool-stack"></div>
         <div class="bubble agent hidden" id="stream-bubble"></div>
-        <div class="bubble-meta streaming">${esc(state.settings.model)} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
+        <div class="bubble-meta streaming">${esc(_providerLabelForId(_activeInferenceProviderId()) || state.settings.model || "agent")} · streaming<span class="typing"><span></span><span></span><span></span></span></div>
       </div>`;
     $("#chat-inner").appendChild(agentRow);
     scrollToBottom(true);
@@ -3532,6 +3556,14 @@
       }),
       signal,
     });
+    if (!resp.ok) {
+      let message = `chat failed (${resp.status})`;
+      try {
+        const errBody = await resp.json();
+        message = errBody.message || errBody.error || message;
+      } catch (_) { /* keep status message */ }
+      throw new Error(message);
+    }
     if (!resp.body) throw new Error("no response body");
 
     const reader = resp.body.getReader();
@@ -4104,7 +4136,24 @@
   }
 
   function handleEvent(evt, ctx) {
+    // Ignore stale fan-out / wrong-chat events so they cannot update this bubble.
+    if (evt && evt.chat_id && state.chatId && evt.chat_id !== state.chatId) return;
     const { bubble, toolStack, toolCards, row } = ctx;
+    if (evt.type === "provider") {
+      const label = evt.providerDisplayName || _providerLabelForId(evt.providerId) || "";
+      if (label && row) {
+        row._providerLabel = label;
+        const meta = row.querySelector(".bubble-meta");
+        if (meta) {
+          const streaming = meta.classList.contains("streaming");
+          meta.innerHTML = streaming
+            ? `${esc(label)} · streaming<span class="typing"><span></span><span></span><span></span></span>`
+            : esc(label);
+          if (streaming) meta.classList.add("streaming");
+        }
+      }
+      return;
+    }
     if (evt.type === "delta") {
       const newBuf = ctx.getBuf() + evt.content;
       ctx.setBuf(newBuf);
@@ -4134,7 +4183,11 @@
           const meta = ctx.row.querySelector(".bubble-meta.streaming");
           if (meta) {
             const dots = meta.querySelector(".typing");
-            meta.innerHTML = `${esc(state.settings.model)} · ${liveTps} tok/s · streaming`;
+            const label = ctx.row._providerLabel
+              || _providerLabelForId(_activeInferenceProviderId())
+              || state.settings.model
+              || "agent";
+            meta.innerHTML = `${esc(label)} · ${liveTps} tok/s · streaming`;
             if (dots) meta.appendChild(dots);
             else {
               const d = document.createElement("span");
@@ -4565,6 +4618,13 @@
         tokens: state._lastMsgTokens || 0,
         prompt_tokens: state._lastMsgPromptTokens || 0,
       };
+      if (row && row._providerLabel) {
+        msg.provider_label = row._providerLabel;
+        msg.provider_id = _activeInferenceProviderId();
+      } else if (evt.message && evt.message.provider_label) {
+        msg.provider_label = evt.message.provider_label;
+        msg.provider_id = evt.message.provider_id;
+      }
       // Fallback: if stats event never fired (some llama-server versions
       // don't emit timings/usage), use the streaming char estimate so the
       // cost widget isn't stuck at $0.00 after generation.
@@ -4593,6 +4653,11 @@
         const meta = lastRow.querySelector(".bubble-meta");
         if (meta && msg.tokens) {
           meta.title = `${msg.tokens.toLocaleString()} tokens${msg.prompt_tokens ? ` (prompt: ${msg.prompt_tokens.toLocaleString()})` : ""}`;
+        }
+        if (meta && msg.provider_label) {
+          const tip = meta.title || "";
+          meta.textContent = `${msg.provider_label} · ${relTime(msg.t)}`;
+          if (tip) meta.title = tip;
         }
         // Final-event bubble re-render: the streaming deltas can race or miss
         // a fence boundary, leaving the bubble blank when the model emitted
