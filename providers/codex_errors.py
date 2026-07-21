@@ -33,6 +33,10 @@ MSG_THREAD_INVALID = (
     "A new thread will be started on the next message — or pick Local llama.cpp."
 )
 MSG_PROTOCOL_FAILURE = "Codex protocol failure. Check the Codex CLI version and try again."
+MSG_UNSUPPORTED_MODEL = (
+    "That model is not available for Codex via ChatGPT. "
+    "Codex will use its default model on the next try — or pick Local llama.cpp."
+)
 MSG_TIMEOUT = "Codex timed out waiting for a reply. Try again, or pick Local llama.cpp."
 MSG_BUSY = "A Codex turn is already in progress. Wait for it to finish or press Stop."
 
@@ -51,6 +55,13 @@ def is_invalid_thread_message(message: Optional[str]) -> bool:
     )
 
 
+def is_unsupported_model_message(message: Optional[str]) -> bool:
+    text = (message or "").lower()
+    if "not supported when using codex" in text:
+        return True
+    return "model" in text and "not supported" in text and "chatgpt" in text
+
+
 def user_message_for_codex_error(
     exc: BaseException,
     *,
@@ -66,6 +77,8 @@ def user_message_for_codex_error(
             return MSG_APP_SERVER_EXITED
         if is_invalid_thread_message(exc.message):
             return MSG_THREAD_INVALID
+        if is_unsupported_model_message(exc.message):
+            return MSG_UNSUPPORTED_MODEL
         if exc.event_type == CodexInferenceEventType.PROTOCOL_ERROR:
             return MSG_PROTOCOL_FAILURE
         if "timeout" in (exc.message or "").lower() or "timed out" in (exc.message or "").lower():
@@ -83,6 +96,8 @@ def user_message_for_codex_error(
         return MSG_INFERENCE_DISABLED
     if is_invalid_thread_message(message):
         return MSG_THREAD_INVALID
+    if is_unsupported_model_message(message):
+        return MSG_UNSUPPORTED_MODEL
     if "app-server" in low or "process" in low and "exit" in low:
         return MSG_APP_SERVER_EXITED
     if "timeout" in low or "timed out" in low:

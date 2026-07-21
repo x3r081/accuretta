@@ -13768,14 +13768,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
     if provider_id == OPENAI_PROVIDER_ID:
         model = (settings.get("openai_model") or OPENAI_DEFAULT_MODEL).strip()
     elif provider_id == CODEX_PROVIDER_ID:
-        model = (settings.get("codex_model") or settings.get("model") or "codex").strip()
+        # Never forward local llama ``settings.model`` — Codex rejects it.
+        from providers.codex_provider import resolve_codex_inference_model
+        model = resolve_codex_inference_model(settings) or ""
     else:
         model = settings.get("model") or ""
     if not model and provider_id != CODEX_PROVIDER_ID:
         emit({"type": "error", "error": "no model selected. Pick one in Settings."})
         return None
-    if not model:
-        model = "codex"
 
     # Label the turn for the UI (text, not color alone).
     if provider_id == DEFAULT_PROVIDER_ID:
@@ -13963,7 +13963,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                             _user_text = _c.strip()
                             break
                 payload = {
-                    "model": model or "codex",
+                    "model": model or "",
                     "messages": [{"role": "user", "content": _user_text}],
                     "stream": True,
                 }

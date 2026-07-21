@@ -9,6 +9,7 @@ lists Codex when supportsInference is true; selection requires readiness.
 
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any, Iterator, Optional, Sequence
 
@@ -67,6 +68,59 @@ _ACTIVE_LOCK = threading.Lock()
 # Last completed turn metadata per chat (safe fields only) for persistence.
 _LAST_TURN_META: dict[str, dict] = {}
 _META_LOCK = threading.Lock()
+
+# Accuretta/local placeholders that must never be sent as Codex model ids.
+_CODEX_MODEL_BLOCKLIST = frozenset({
+    "codex",
+    "local",
+    "local_llama",
+    "llama",
+    "llama.cpp",
+    "llamacpp",
+})
+
+# llama.cpp quantized GGUF basename suffixes (e.g. qwen…-q4_k_m).
+_LOCAL_GGUF_QUANT_RE = re.compile(
+    r"(?:^|[-_])q[2-8](?:[_-][0-9a-z_]+)?$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_local_gguf_model_id(name: str) -> bool:
+    """Heuristic: local GGUF basenames / paths must not go to Codex."""
+    if not name:
+        return False
+    if name.endswith(".gguf") or name.endswith(".GGUF"):
+        return True
+    if "/" in name or "\\" in name:
+        return True
+    return bool(_LOCAL_GGUF_QUANT_RE.search(name.strip()))
+
+
+def resolve_codex_inference_model(
+    settings: Optional[dict] = None,
+    *,
+    requested: Optional[str] = None,
+) -> Optional[str]:
+    """Return an explicit Codex model override, or None for Codex defaults.
+
+    Never forwards the local llama.cpp ``settings.model`` id — ChatGPT Codex
+    rejects those with an unsupported-model protocol error.
+    """
+    cand = ""
+    if isinstance(requested, str) and requested.strip():
+        cand = requested.strip()
+    elif isinstance(settings, dict):
+        raw = settings.get("codex_model")
+        if isinstance(raw, str):
+            cand = raw.strip()
+    if not cand:
+        return None
+    if cand.lower() in _CODEX_MODEL_BLOCKLIST:
+        return None
+    if _looks_like_local_gguf_model_id(cand):
+        return None
+    return cand
 
 
 def bind_codex_thread(chat_id: str, thread_id: str) -> None:
@@ -295,7 +349,7 @@ class CodexProvider:
 
         chat_key = request.cancellation_id or (request.extra or {}).get("chat_id") or ""
         chat_key = str(chat_key) if chat_key else ""
-        model = (request.model or "").strip() or None
+        model = resolve_codex_inference_model(requested=request.model)
         correlation = str((request.extra or {}).get("correlation_id") or chat_key or "")
         svc = self._svc()
 
@@ -351,7 +405,45 @@ class CodexProvider:
 
             import queue
 
+            def _map_item(item, *, turn_id_box: dict):
+                """Yield provider InferenceEvents for one Codex inference event."""
+                if item.type == CodexInferenceEventType.STARTED:
+                    turn_id_box["id"] = item.turn_id
+                    yield InferenceEvent(
+                        event_type=InferenceEventType.TEXT_DELTA,
+                        text_delta="",
+                        raw={
+                            "status": "started",
+                            "turnId": item.turn_id,
+                            "threadId": thread_id,
+                            "correlationId": correlation,
+                        },
+                    )
+                elif item.type == CodexInferenceEventType.TEXT_DELTA and item.text_delta:
+                    yield InferenceEvent(
+                        event_type=InferenceEventType.TEXT_DELTA,
+                        text_delta=item.text_delta,
+                        raw={
+                            "turnId": item.turn_id or turn_id_box.get("id"),
+                            "correlationId": correlation,
+                        },
+                    )
+                elif item.type in {
+                    CodexInferenceEventType.PROTOCOL_ERROR,
+                    CodexInferenceEventType.PROCESS_ERROR,
+                    CodexInferenceEventType.AUTHENTICATION_REQUIRED,
+                    CodexInferenceEventType.UNAVAILABLE,
+                }:
+                    msg = user_message_for_codex_error(
+                        CodexInferenceError(
+                            item.message or item.type.value,
+                            event_type=item.type,
+                        )
+                    )
+                    yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
+
             def _run_once(active_thread: str):
+                """Run one Codex turn, yielding events live (not buffered until end)."""
                 q: queue.Queue = queue.Queue()
                 result_box: dict = {}
                 error_box: dict = {}
@@ -372,15 +464,26 @@ class CodexProvider:
                 t = threading.Thread(target=_worker, name="codex-turn", daemon=True)
                 t.start()
                 events: list = []
+                turn_id_box: dict = {}
                 while True:
                     item = q.get()
                     if item is None:
                         break
                     events.append(item)
+                    for mapped in _map_item(item, turn_id_box=turn_id_box):
+                        yield mapped
                 t.join(timeout=1.0)
-                return events, result_box.get("r"), error_box.get("e")
+                yield ("__done__", events, result_box.get("r"), error_box.get("e"), turn_id_box.get("id"))
 
-            events, result, err = _run_once(thread_id)
+            # First attempt — stream live. Invalid-thread recovery re-runs once.
+            done = None
+            for item in _run_once(thread_id):
+                if isinstance(item, tuple) and item and item[0] == "__done__":
+                    done = item
+                    continue
+                yield item
+            assert done is not None
+            _, events, result, err, turn_id = done
 
             # Invalid / missing remote thread → clear mapping, create once, retry.
             if err is not None and isinstance(err, CodexInferenceError):
@@ -390,7 +493,14 @@ class CodexProvider:
                         thread_id = svc.create_thread(model=model, cwd=cwd)
                         created_fresh = True
                         bind_codex_thread(chat_key, thread_id)
-                        events, result, err = _run_once(thread_id)
+                        done = None
+                        for item in _run_once(thread_id):
+                            if isinstance(item, tuple) and item and item[0] == "__done__":
+                                done = item
+                                continue
+                            yield item
+                        assert done is not None
+                        _, events, result, err, turn_id = done
                     except CodexInferenceError as exc2:
                         msg = user_message_for_codex_error(exc2)
                         yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
@@ -404,40 +514,6 @@ class CodexProvider:
                         if isinstance(err, CodexInferenceError):
                             raise self._map_inference_error(err, message=msg) from None
                         raise err
-
-            turn_id = None
-            for item in events:
-                if item.type == CodexInferenceEventType.STARTED:
-                    turn_id = item.turn_id
-                    yield InferenceEvent(
-                        event_type=InferenceEventType.TEXT_DELTA,
-                        text_delta="",
-                        raw={
-                            "status": "started",
-                            "turnId": item.turn_id,
-                            "threadId": thread_id,
-                            "correlationId": correlation,
-                        },
-                    )
-                elif item.type == CodexInferenceEventType.TEXT_DELTA and item.text_delta:
-                    yield InferenceEvent(
-                        event_type=InferenceEventType.TEXT_DELTA,
-                        text_delta=item.text_delta,
-                        raw={"turnId": item.turn_id or turn_id, "correlationId": correlation},
-                    )
-                elif item.type in {
-                    CodexInferenceEventType.PROTOCOL_ERROR,
-                    CodexInferenceEventType.PROCESS_ERROR,
-                    CodexInferenceEventType.AUTHENTICATION_REQUIRED,
-                    CodexInferenceEventType.UNAVAILABLE,
-                }:
-                    msg = user_message_for_codex_error(
-                        CodexInferenceError(
-                            item.message or item.type.value,
-                            event_type=item.type,
-                        )
-                    )
-                    yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)
 
             if err is not None:
                 if isinstance(err, CodexInferenceError):

@@ -368,6 +368,80 @@ class CodexChatWorkflowTest(unittest.TestCase):
         )
         self.assertIn("thread", MSG_THREAD_INVALID.lower())
 
+    def test_resolve_codex_inference_model_ignores_local_llama(self):
+        from providers.codex_errors import MSG_UNSUPPORTED_MODEL, is_unsupported_model_message
+        from providers.codex_provider import resolve_codex_inference_model
+
+        self.assertIsNone(
+            resolve_codex_inference_model(
+                {"model": "qwen2.5-coder-14b-instruct-q4_k_m", "codex_model": ""}
+            )
+        )
+        self.assertIsNone(resolve_codex_inference_model(requested="codex"))
+        self.assertIsNone(
+            resolve_codex_inference_model(
+                requested="/Users/johan/models/foo.gguf"
+            )
+        )
+        self.assertIsNone(
+            resolve_codex_inference_model(requested="qwen2.5-coder-14b-instruct-q4_k_m")
+        )
+        self.assertEqual(
+            resolve_codex_inference_model({"codex_model": "gpt-5.1-codex"}),
+            "gpt-5.1-codex",
+        )
+        raw = (
+            '{"type":"error","error":{"message":"The \'qwen2.5-coder-14b-instruct-q4_k_m\' '
+            'model is not supported when using Codex with a ChatGPT account."}}'
+        )
+        self.assertTrue(is_unsupported_model_message(raw))
+        self.assertEqual(
+            user_message_for_codex_error(Exception(raw)),
+            MSG_UNSUPPORTED_MODEL,
+        )
+
+    def test_stream_does_not_forward_local_model_to_thread_start(self):
+        provider = CodexProvider()
+        seen = {}
+
+        real_create = CodexInferenceService.create_thread
+
+        def _wrap(self, *args, **kwargs):
+            seen["model"] = kwargs.get("model", args[0] if args else "MISSING")
+            return real_create(self, *args, **kwargs)
+
+        with mock.patch.object(CodexInferenceService, "create_thread", _wrap):
+            req = InferenceRequest(
+                model="qwen2.5-coder-14b-instruct-q4_k_m",
+                messages=[{"role": "user", "content": "hi"}],
+                cancellation_id="c-local-model",
+                extra={"chat_id": "c-local-model"},
+            )
+            events = list(provider.stream_response(req))
+        self.assertEqual(seen.get("model"), None)
+        self.assertTrue(any(e.event_type == InferenceEventType.COMPLETED for e in events))
+
+    def test_stream_yields_deltas_before_turn_completes(self):
+        """Regression: Stop / live UI need deltas during the turn, not only at end."""
+        os.environ["FAKE_CODEX_TURN_DELAY_MS"] = "250"
+        provider = CodexProvider()
+        req = InferenceRequest(
+            model="",
+            messages=[{"role": "user", "content": "stream-me"}],
+            cancellation_id="c-live",
+            extra={"chat_id": "c-live"},
+        )
+        saw_delta_before_done = False
+        completed = False
+        for evt in provider.stream_response(req):
+            if evt.event_type == InferenceEventType.TEXT_DELTA and evt.text_delta:
+                if not completed:
+                    saw_delta_before_done = True
+            if evt.event_type == InferenceEventType.COMPLETED:
+                completed = True
+        self.assertTrue(saw_delta_before_done)
+        self.assertTrue(completed)
+
 
 if __name__ == "__main__":
     unittest.main()
