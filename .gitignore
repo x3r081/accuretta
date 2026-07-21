@@ -57,3 +57,7 @@ versions/
 
 # MCP server config — holds API keys (Shodan, VirusTotal, etc.). Local per-machine.
 bridge_mcp_config.json
+
+# Local GGUF weights / model trees — never commit (often multi-GB).
+models/
+*.gguf

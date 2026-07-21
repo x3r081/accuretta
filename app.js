@@ -43,7 +43,66 @@
     _ctxPoll: null,
     touchedFiles: new Set(),
     imageUrlToSourceMap: new Map(),
+    // Platform copy + feature flags from /api/setup/sysinfo (never from user-agent).
+    platform: null,
+    features: {},
+    uiCopy: {},
   };
+
+  // ---------- platform-aware UI copy (backend catalog) ----------
+  function t(key, fallback = "") {
+    const v = state.uiCopy && state.uiCopy[key];
+    return (v != null && v !== "") ? v : fallback;
+  }
+
+  function applyUiCopy() {
+    document.querySelectorAll("[data-copy]").forEach((el) => {
+      const key = el.getAttribute("data-copy");
+      if (!key) return;
+      const val = t(key);
+      if (val == null || val === "") return;
+      const attr = el.getAttribute("data-copy-attr") || "text";
+      if (attr === "placeholder") el.setAttribute("placeholder", val);
+      else if (attr === "title") el.setAttribute("title", val);
+      else if (attr === "html") el.innerHTML = val;
+      else el.textContent = val;
+    });
+    syncApprCopyFromCatalog();
+  }
+
+  // Filled after APPR_KIND_META exists; no-op until then.
+  let syncApprCopyFromCatalog = () => {};
+
+  function applyUiFeatures() {
+    const f = state.features || {};
+    document.querySelectorAll("[data-feature]").forEach((el) => {
+      const name = el.getAttribute("data-feature");
+      if (!name) return;
+      const on = !!f[name];
+      el.hidden = !on;
+      // Keep aria-hidden in sync for screen readers when the host uses it.
+      if (el.hasAttribute("aria-hidden") || el.getAttribute("role") === "region") {
+        el.setAttribute("aria-hidden", on ? "false" : "true");
+      }
+    });
+  }
+
+  function applyUiCapabilities(payload) {
+    if (!payload || typeof payload !== "object") return;
+    if (payload.os) state.platform = payload.os;
+    if (payload.features && typeof payload.features === "object") {
+      state.features = payload.features;
+    }
+    if (payload.copy && typeof payload.copy === "object") {
+      state.uiCopy = payload.copy;
+    }
+    applyUiCopy();
+    applyUiFeatures();
+  }
+
+  // Setup wizard (inline script) and tests call this; do not infer OS in the browser.
+  window.__accurettaApplyCapabilities = applyUiCapabilities;
+  window.__accurettaT = t;
 
   const app = $("#app");
   const isMobile = () => window.matchMedia("(max-width: 600px)").matches;
@@ -1964,9 +2023,32 @@
   }
 
   // ---------- bootstrap ----------
+  async function loadUiCapabilities() {
+    // Prefer full sysinfo (hardware + copy/features). If that fails, fall back to
+    // /api/ui-capabilities so Windows feature sections are not stuck hidden.
+    try {
+      const info = await api("/api/setup/sysinfo");
+      if (info && (info.features || info.copy)) {
+        applyUiCapabilities(info);
+        return;
+      }
+    } catch (e) {
+      console.warn("sysinfo unavailable, trying ui-capabilities:", e);
+    }
+    try {
+      const caps = await api("/api/ui-capabilities");
+      applyUiCapabilities(caps);
+    } catch (e) {
+      console.warn("ui capabilities unavailable:", e);
+    }
+  }
+
   async function boot() {
     // on-device hint
     if (isMobile()) document.body.classList.add("is-mobile");
+
+    // Apply platform copy/features as early as possible (same source as setup wizard).
+    await loadUiCapabilities();
 
     await Promise.all([
       loadSettings(),
@@ -5975,7 +6057,7 @@
     write_file:        { sub: "The model wants to write to a file on your system.",        info: "This will create or update the file at the specified location with the provided content." },
     edit_file:         { sub: "The model wants to edit a file on your system.",            info: "This will apply the listed search-and-replace edits in place. The previous content is captured in version history." },
     delete:            { sub: "The model wants to delete something from your filesystem.", info: "This is permanent — once approved, the file or folder cannot be restored from inside Accuretta." },
-    powershell:        { sub: "The model wants to run a PowerShell command on your machine.", info: "PowerShell commands run with your current user privileges. Read the command below carefully before approving." },
+    powershell:        { sub: "The model wants to run a shell command on your machine.", info: "Shell commands run with your current user privileges. Read the command below carefully before approving." },
     launch:            { sub: "The model wants to launch a program.",                       info: "This starts the program with your user privileges. Once running, it can do anything you can do." },
     network_snapshot:  { sub: "The model wants to read your active network connections.",   info: "Read-only: no packets are sent. The model will see open ports, owning processes, and your DNS cache." },
     "desktop.launch":  { sub: "The model wants to launch a desktop app.",                    info: "Only allowlisted apps (Settings → Desktop) can be launched this way." },
@@ -5993,6 +6075,16 @@
     carve_file:        { sub: "The model wants to carve a region out of a file.",            info: "Reads the requested byte range and writes it as a new file in the workspace." },
     registry:          { sub: "The model wants to MODIFY THE WINDOWS REGISTRY (user hive).", info: "Registry edits change how Windows and installed apps behave for your user account. They're not file-level — there's no undo. System hives (HKLM / HKCR / HKU) are hard-blocked at the bridge and never reach this card; only HKCU / HKCC writes can ask. Hold the Approve button for 2 seconds to confirm." },
   };
+
+  syncApprCopyFromCatalog = () => {
+    if (t("shell.approval_sub")) {
+      APPR_KIND_META.powershell = {
+        sub: t("shell.approval_sub"),
+        info: t("shell.approval_info", APPR_KIND_META.powershell.info),
+      };
+    }
+  };
+  syncApprCopyFromCatalog();
 
   // Build a friendly, language-style command preview from kind + details. We
   // intentionally don't surface the raw PowerShell / shell command in the main
@@ -6082,7 +6174,7 @@
     } else if (kind === "launch") {
       row(APPR_SVG.play, "Launches", d.path || "?");
     } else if (kind === "powershell") {
-      row(APPR_SVG.terminal, "Shell", "PowerShell");
+      row(APPR_SVG.terminal, "Shell", t("shell.name", "Shell"));
       row(APPR_SVG.info, "Read the command below", "before approving");
     } else if (kind === "registry") {
       // Surface every hive being touched as its own row so the user can
@@ -6643,6 +6735,7 @@
   }
 
   async function refreshSandboxStatus() {
+    if (!state.features?.sandbox_wsl) return;
     if (!$("#sandbox-chip")) return;
     try {
       const st = await api("/api/sandbox/status");
@@ -6668,7 +6761,7 @@
 
     if (busy) _sbxChip("installing", p.step || "setting up…");
     else if (st.state === "ready") _sbxChip("ready", "ready");
-    else if (st.state === "no_wsl") _sbxChip("no_wsl", "WSL not installed");
+    else if (st.state === "no_wsl") _sbxChip("no_wsl", t("sandbox.chip.no_wsl", "WSL not installed"));
     else if (st.state === "present_unprovisioned") _sbxChip("warn", "needs provisioning");
     else _sbxChip("off", "not set up");
 
@@ -6731,23 +6824,39 @@
   async function loadDetectedVram() {
     const hint = $("#vram-detected-hint");
     if (!hint) return;
-    hint.textContent = "detecting GPU...";
+    hint.textContent = t("memory_budget.detecting", "detecting memory…");
     try {
       const r = await api("/api/llama/detect-vram");
       _vramState.detected = r;
       const gb = Number(r?.gb || 0);
       if (gb > 0) {
         const name = r.name ? ` ${r.name}` : "";
-        hint.textContent = `detected: ${gb.toFixed(1)} GB${name} (via ${r.source || "nvidia-smi"})`;
+        if (r.memory_model === "unified" || r.source === "apple-unified") {
+          const total = Number(r.total_gb || 0);
+          const reserve = Number(r.reserve_gb || 0);
+          const metal = r.metal_llama_build
+            ? " · Metal build confirmed"
+            : (r.metal_hardware ? " · Metal hardware (verify llama.cpp build)" : "");
+          hint.textContent = total > 0
+            ? `detected: ${total.toFixed(0)} GB unified · ${gb.toFixed(1)} GB usable` +
+              (reserve > 0 ? ` (${reserve.toFixed(0)} GB reserved for macOS/apps)` : "") +
+              `${name}${metal}`
+            : `detected: ${gb.toFixed(1)} GB usable unified memory${name}${metal}`;
+        } else {
+          hint.textContent = `detected: ${gb.toFixed(1)} GB${name} (via ${r.source || "nvidia-smi"})`;
+        }
         // If the user hasn't picked a tier yet (it's still 0 = Manual), nudge to
         // the closest detected tier so the Suggest button is one click away.
         const sel = $("#set-vram-tier");
         if (sel && Number(sel.value) === 0) _pickClosestVramTier(gb);
       } else {
-        hint.textContent = "no NVIDIA GPU detected — pick a VRAM tier manually if you want a suggestion";
+        hint.textContent = t(
+          "memory_budget.none",
+          "no GPU memory auto-detected — pick a memory tier manually if you want a suggestion",
+        );
       }
     } catch (e) {
-      hint.textContent = `vram detect failed: ${e.message || e}`;
+      hint.textContent = `memory detect failed: ${e.message || e}`;
     }
   }
 
@@ -6762,7 +6871,7 @@
       return;
     }
     if (!tier) {
-      toast("pick a VRAM tier (or leave on Manual to skip auto-tune)", "warn", 3000);
+      toast(t("memory_budget.tier_toast", "pick a memory tier (or leave on Manual to skip auto-tune)"), "warn", 3000);
       return;
     }
     if (btn) btn.disabled = true;
@@ -6985,7 +7094,10 @@
     const body = $("#cmd-history-body");
     if (!body) return;
     if (!entries.length) {
-      body.innerHTML = `<div class="cmd-history-empty">No PowerShell commands recorded yet.<br><br><span style="font-size:11px;">Anything the agent runs via <code>run_powershell</code> shows up here.</span></div>`;
+      body.innerHTML = `<div class="cmd-history-empty">${t(
+        "shell.history_empty",
+        "No shell commands recorded yet.<br><br><span style=\"font-size:11px;\">Anything the agent runs via <code>run_powershell</code> shows up here.</span>",
+      )}</div>`;
       return;
     }
     const chatsMap = (state.chats && state.chats.chats) || {};
@@ -7060,7 +7172,7 @@
   async function clearCmdHistory() {
     const ok = await confirmModal({
       title: "Clear command history",
-      message: "Clear all PowerShell command history? This can't be undone.",
+      message: t("shell.history_clear", "Clear all shell command history? This can't be undone."),
       confirmText: "Clear history",
       danger: true,
       icon: "ph-trash",
@@ -8733,7 +8845,10 @@
     $("#btn-sandbox-remove")?.addEventListener("click", async () => {
       const ok = await confirmModal({
         title: "Remove sandbox?",
-        message: "Unregisters the accuretta-sbx WSL distro and deletes its disk image. You can set it up again anytime.",
+        message: t(
+          "sandbox.remove_confirm",
+          "Removes the sandbox guest and its disk image. You can set it up again anytime.",
+        ),
         confirmText: "Remove", danger: true,
       });
       if (!ok) return;
@@ -8839,7 +8954,11 @@
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ title: "Pick models folder" }),
         });
-        if (!r.path) return;
+        if (r.error || r.code) {
+          toast(r.message || "Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
+          return;
+        }
+        if (!r.path) return; // user cancelled
         $("#set-models-dir").value = r.path;
         await api("/api/models/scan-dir", {
           method: "POST", headers: {"Content-Type": "application/json"},
@@ -8848,7 +8967,7 @@
         await refreshModels();
         toast("models folder set", "ok", 2000);
       } catch (e) {
-        toast("browse failed: " + (e.message || e), "error");
+        toast("Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
       } finally { btn.disabled = false; }
     });
     $("#set-models-dir")?.addEventListener("change", async (e) => {
@@ -8932,7 +9051,7 @@
         trustBtn.classList.toggle("trust-on", next);
         try { await saveSettings({ auto_approve_write: next }); } catch (_) {}
         syncTrust();
-        toast(next ? "Trust writes on — files save and edit without asking. Registry, Windows system folders, and PowerShell still require approval."
+        toast(next ? t("trust.toast_on", "Trust writes on — files save and edit without asking. System-protected paths and shell commands still require approval.")
                    : "Trust writes off — file writes ask for approval again.",
               next ? "warn" : "info", next ? 5000 : 3000);
       });
@@ -9195,10 +9314,16 @@
       btn.disabled = true;
       try {
         const r = await api("/api/browse-folder", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+        if (r.error || r.code) {
+          toast(r.message || "Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
+          return;
+        }
         if (r.path) {
           $("#ws-input").value = r.path;
           await addWorkspaceFolder();
         }
+      } catch (e) {
+        toast("Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
       } finally { btn.disabled = false; }
     });
     $("#ws-input").addEventListener("keydown", e => {

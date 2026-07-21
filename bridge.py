@@ -16,6 +16,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -555,7 +556,7 @@ DEFAULT_SETTINGS = {
                                     # disables auto-restart until next /api/models/load.
     "models_dir": "",               # folder containing .gguf files (set via Settings -> Models folder)
     "model_path": "",               # full path to the currently loaded .gguf
-    "llama_bin": "",                # override path to llama-server.exe (auto-detected if blank)
+    "llama_bin": "",                # override path to llama-server (auto-detected if blank)
     "mmproj_path": "",              # full path to a vision multimodal projector (.gguf). When set,
                                     # llama-server boots with --mmproj <path> and the chat handler
                                     # sends images straight to the loaded model instead of routing
@@ -1307,32 +1308,176 @@ BLOCKED_PATH_PATTERNS = [
     re.compile(r"^[a-zA-Z]:\\Windows\\System32", re.IGNORECASE),
 ]
 
+# Absolute-deny prefixes on Darwin (canonical paths). ~/Library is NOT /Library.
+_MACOS_BLOCKED_SYSTEM_PREFIXES = (
+    "/System",
+    "/Library",
+    "/private/var/db",
+    "/private/var/root",
+)
+
+# Home-relative secret dirs — denied even if a user adds them as a workspace root.
+_MACOS_BLOCKED_HOME_RELATIVE = (
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    "Library/Keychains",
+)
+
 
 def normalize_path(p: str) -> str:
+    """Expand ~ and env vars, then canonicalize (follows symlinks when possible)."""
     p = os.path.expandvars(os.path.expanduser(p or ""))
+    if not p:
+        return ""
     try:
-        return str(Path(p).resolve())
+        return str(Path(p).resolve(strict=False))
     except Exception:
-        return p
+        try:
+            return os.path.abspath(p)
+        except Exception:
+            return p
+
+
+def path_is_under(root: str, path: str) -> bool:
+    """True if canonical `path` is root or a descendant (symlink-safe via resolve)."""
+    try:
+        r = normalize_path(root)
+        n = normalize_path(path)
+        if not r or not n:
+            return False
+        if sys.platform == "win32":
+            r, n = r.lower(), n.lower()
+        common = os.path.commonpath([r, n])
+        if sys.platform == "win32":
+            return common.lower() == r
+        return common == r
+    except Exception:
+        return False
+
+
+def _macos_secret_home_dirs() -> list[str]:
+    home = Path.home()
+    out: list[str] = []
+    for rel in _MACOS_BLOCKED_HOME_RELATIVE:
+        try:
+            out.append(str((home / rel).resolve(strict=False)))
+        except Exception:
+            out.append(str(home / rel))
+    return out
 
 
 def is_blocked_path(p: str) -> bool:
+    """True for hard-denied locations. Resolves symlinks before matching."""
     n = normalize_path(p)
+    if not n:
+        return False
     for pat in BLOCKED_PATH_PATTERNS:
         if pat.search(n):
             return True
+    if sys.platform == "darwin":
+        for prefix in _MACOS_BLOCKED_SYSTEM_PREFIXES:
+            if n == prefix or path_is_under(prefix, n):
+                return True
+        for secret in _macos_secret_home_dirs():
+            if n == secret or path_is_under(secret, n):
+                return True
     return False
 
 
 def is_in_workspace(p: str) -> bool:
-    """True if path is inside any workspace folder. Empty workspace = open access."""
+    """True if canonical path is inside a configured workspace folder.
+
+    Empty workspace refuses access (fail closed). Protected paths are never
+    treated as in-workspace, even if a folder root points at them.
+    """
     ws = get_workspace().get("folders", [])
     if not ws:
-        return True
-    n = normalize_path(p).lower()
+        return False
+    if is_blocked_path(p):
+        return False
     for folder in ws:
-        f = normalize_path(folder).lower()
-        if n == f or n.startswith(f + os.sep):
+        if path_is_under(folder, p):
+            return True
+    return False
+
+
+def _path_blocked_error() -> dict:
+    # Neutral — do not echo the path (may be a secret location).
+    return {"error": "path blocked (protected location)"}
+
+
+def _path_outside_workspace_error() -> dict:
+    return {"error": "path outside workspace. Add folder in Workspace panel."}
+
+
+def _default_workspace_root() -> str:
+    """First configured workspace folder, or '' if none."""
+    ws = get_workspace().get("folders", [])
+    for folder in ws:
+        if isinstance(folder, str) and folder.strip():
+            return normalize_path(folder)
+    return ""
+
+
+def _extract_path_candidates(cmd: str) -> list[str]:
+    """Best-effort path-like tokens from a shell/PowerShell command string."""
+    if not cmd:
+        return []
+    cands: list[str] = []
+    for m in re.finditer(r"(?P<q>['\"])(?P<body>(?:\\.|[^\\])*?)(?P=q)", cmd):
+        body = (m.group("body") or "").strip()
+        if not body:
+            continue
+        if any(x in body for x in ("/", "\\", "~", "$")) or re.match(r"^[a-zA-Z]:", body):
+            cands.append(body)
+    for m in re.finditer(
+        r"(?<![\w./])(~(?:/[^\s;|&<>()$`\"']*)?|"
+        r"/(?:[^\s;|&<>()$`\"']+)|"
+        r"\$(?:HOME|USERPROFILE|TMPDIR|TEMP|TMP)(?:/[^\s;|&<>()$`\"']*)?|"
+        r"[a-zA-Z]:\\(?:[^\s;|&<>()$`\"']*))",
+        cmd,
+    ):
+        cands.append(m.group(0))
+    return cands
+
+
+def command_touches_blocked_path(cmd: str) -> bool:
+    """True if any resolvable path token lands in a protected location."""
+    for raw in _extract_path_candidates(cmd):
+        try:
+            if is_blocked_path(raw):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def command_touches_outside_workspace(cmd: str) -> bool:
+    """True if command references an absolute/~/$ path outside the workspace.
+
+    Relative paths without `..` are not flagged (cwd is ambiguous). Tokens
+    containing `..` always require scrutiny → True.
+    """
+    if not cmd:
+        return False
+    if re.search(r"(^|[\s;=])\.\.(/|\\|$)", cmd):
+        return True
+    for raw in _extract_path_candidates(cmd):
+        if ".." in raw.replace("\\", "/").split("/"):
+            return True
+        looks_abs = (
+            raw.startswith(("/", "~", "$"))
+            or (len(raw) >= 2 and raw[1] == ":")
+        )
+        if not looks_abs:
+            continue
+        try:
+            if is_blocked_path(raw):
+                continue  # hard-refuse elsewhere
+            if not is_in_workspace(raw):
+                return True
+        except Exception:
             return True
     return False
 
@@ -1381,11 +1526,9 @@ def _read_ignore_rules(ws_root: str) -> list[tuple[bool, str]]:
 
 
 def _workspace_root_for(path: str) -> str | None:
-    n = normalize_path(path).lower()
     for folder in get_workspace().get("folders", []):
         f = normalize_path(folder)
-        fl = f.lower()
-        if n == fl or n.startswith(fl + os.sep):
+        if f and path_is_under(f, path):
             return f
     return None
 
@@ -1535,6 +1678,12 @@ WRITE_PATTERNS = [
     re.compile(r"\breg\s+(add|delete|import)\b", re.IGNORECASE),
     re.compile(r"\bformat\b", re.IGNORECASE),
     re.compile(r"\bdiskpart\b", re.IGNORECASE),
+    # POSIX / macOS mutators and host-control (approval-gated, not hard-block).
+    re.compile(r"\btee\b", re.IGNORECASE),
+    re.compile(r"\bsed\s+[^\n]*-i", re.IGNORECASE),
+    re.compile(r"\bosascript\b", re.IGNORECASE),
+    re.compile(r"\bdiskutil\b", re.IGNORECASE),
+    re.compile(r"\blaunchctl\b", re.IGNORECASE),
 ]
 
 
@@ -1545,6 +1694,11 @@ def needs_approval(cmd: str) -> bool:
         if pat.search(cmd):
             return True
     return False
+
+
+def shell_requires_approval(cmd: str) -> bool:
+    """Mutating patterns or absolute/~/$ paths outside the workspace."""
+    return bool(needs_approval(cmd) or command_touches_outside_workspace(cmd))
 
 
 # ---- registry guardrails ---------------------------------------------------
@@ -1661,12 +1815,12 @@ _BRIDGE_PID = os.getpid()
 # Patterns matched against the raw PowerShell command string.
 _PROT_BRIDGE_FILE_RE = re.compile(r"\bbridge\.py\b", re.IGNORECASE)
 _PROT_DESTROY_FILE_RE = re.compile(
-    r"\b(remove-item|del|erase|rd|rmdir|move-item|out-file|set-content|add-content|"
+    r"\b(remove-item|del|erase|rd|rmdir|rm|move-item|out-file|set-content|add-content|"
     r"clear-content|new-item\s+-force)\b",
     re.IGNORECASE,
 )
 _PROT_KILL_VERB_RE = re.compile(
-    r"\b(stop-process|taskkill|tskill|kill)\b",
+    r"\b(stop-process|taskkill|tskill|kill|pkill|killall)\b",
     re.IGNORECASE,
 )
 _PROT_PORT_RE = re.compile(r"(?<!\d)8787(?!\d)")
@@ -1862,11 +2016,19 @@ def replay_events_since(since_id: int, up_to_id: int) -> list:
 # ---- tool implementations --------------------------------------------------
 
 def tool_list_directory(args: dict) -> dict:
-    path = normalize_path(args.get("path") or str(Path.home()))
+    raw = args.get("path")
+    if raw is None or str(raw).strip() == "":
+        path = _default_workspace_root()
+        if not path:
+            return {"error": "no workspace folder configured. Add a folder in Workspace settings."}
+    else:
+        path = normalize_path(str(raw))
     if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+        return _path_blocked_error()
+    if not is_in_workspace(path):
+        return _path_outside_workspace_error()
     if not os.path.isdir(path):
-        return {"error": f"not a directory: {path}"}
+        return {"error": "not a directory"}
     out = []
     skipped = 0
     try:
@@ -2047,12 +2209,14 @@ def _file_staleness(path: str) -> str:
 
 def tool_read_file(args: dict) -> dict:
     path = normalize_path(args.get("path") or "")
-    if not path or not os.path.isfile(path):
-        return {"error": f"not a file: {path}"}
+    if not path:
+        return {"error": "missing path"}
     if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+        return _path_blocked_error()
     if not is_in_workspace(path):
-        return {"error": "path outside workspace. Add folder in Workspace panel."}
+        return _path_outside_workspace_error()
+    if not os.path.isfile(path):
+        return {"error": "not a file"}
     if is_ignored(path):
         return {"error": f"path ignored by .accurettaignore: {path}"}
     # PDFs are binary containers — reading the bytes as UTF-8 yields garbage
@@ -2311,11 +2475,11 @@ def tool_write_file(args: dict) -> dict:
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — edit it from your real IDE, not from a chat tool call. Restart the bridge afterward."}
     if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+        return _path_blocked_error()
     if not is_in_workspace(path):
-        return {"error": "path outside workspace. Add folder in Workspace panel."}
+        return _path_outside_workspace_error()
     if is_ignored(path):
-        return {"error": f"path ignored by .accurettaignore: {path}"}
+        return {"error": "path ignored by .accurettaignore"}
     # Anti-clobber: refuse a full overwrite of an existing file the model hasn't
     # read this session (or that changed since it read) — it would be writing
     # from a stale mental model. read_file first, or pass force=true to override.
@@ -2401,13 +2565,13 @@ def tool_edit_file(args: dict) -> dict:
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — edit it from your real IDE, not from a chat tool call. Restart the bridge afterward."}
     if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+        return _path_blocked_error()
     if not is_in_workspace(path):
-        return {"error": "path outside workspace. Add folder in Workspace panel."}
+        return _path_outside_workspace_error()
     if is_ignored(path):
-        return {"error": f"path ignored by .accurettaignore: {path}"}
+        return {"error": "path ignored by .accurettaignore"}
     if not os.path.isfile(path):
-        return {"error": f"not a file: {path}"}
+        return {"error": "not a file"}
 
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -2512,7 +2676,15 @@ def tool_replace_ast_node(args: dict) -> dict:
     
     if not path or not node_type or not node_name or not new_text:
         return {"error": "Missing required arguments: path, node_type, node_name, new_text"}
-        
+    if is_bridge_self_path(path):
+        return {"error": "refused: bridge.py is the running server — won't edit the file backing this process."}
+    if is_blocked_path(path):
+        return _path_blocked_error()
+    if not is_in_workspace(path):
+        return _path_outside_workspace_error()
+    if is_ignored(path):
+        return {"error": "path ignored by .accurettaignore"}
+
     ext = os.path.splitext(path)[1].lower()
     try:
         import tree_sitter
@@ -2697,17 +2869,19 @@ def tool_find_references(args: dict) -> dict:
 
 def tool_delete_file(args: dict) -> dict:
     path = normalize_path(args.get("path") or "")
-    if not path or not os.path.exists(path):
-        return {"error": f"not found: {path}"}
+    if not path:
+        return {"error": "missing path"}
     if is_bridge_self_path(path):
         return {"error": "refused: bridge.py is the running server — won't delete the file backing this process."}
     if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+        return _path_blocked_error()
     if not is_in_workspace(path):
-        return {"error": "path outside workspace"}
+        return _path_outside_workspace_error()
+    if not os.path.exists(path):
+        return {"error": "not found"}
     approval = request_approval(
         title="Delete",
-        command=f'Remove-Item -Path "{path}" -Recurse -Force',
+        command=f'delete {os.path.basename(path)}',
         details={"kind": "delete", "path": path, "dir": os.path.isdir(path)},
     )
     if approval.get("decision") != "approve":
@@ -2961,10 +3135,23 @@ def _catastrophic_cmd(cmd: str) -> str | None:
             r"/mnt/[a-z](?![/\w])",                     # a Windows drive mounted in WSL, e.g. /mnt/c
             r"/mnt/[a-z]/\*",                           # /mnt/c/*  — everything on the drive
             r"/mnt/[a-z]/users(?![/\w])",               # the whole Users tree via WSL
+            # macOS / POSIX sensitive roots. Exact roots OR anything under
+            # /System, /Library, /Volumes, /private — but NOT every path under
+            # /Users (that would hard-block normal project deletes).
+            r"/(system|library|applications)(?![/\w])",
+            r"/(system|library|applications)/\S+",
+            r"/users(?![/\w])",                      # whole /Users only
+            r"/volumes(?![/\w])|/volumes/\S+",
+            r"/private(?![/\w])|/private/\S+",
+            r"\$home/library(?![/\w])|\$home/library/\S+",
+            r"~/library(?![/\w])|~/library/\S+",
         ]
         for pat in targets:
             if re.search(pat, c):
-                return "would recursively force-delete a drive root, Windows, or your whole profile"
+                return (
+                    "would recursively force-delete a drive root, OS directory, "
+                    "or your whole profile"
+                )
     return None
 
 
@@ -2995,6 +3182,11 @@ def tool_run_powershell(args: dict) -> dict:
             "refused_command": cmd,
             "catastrophic": True,
         }
+    if command_touches_blocked_path(cmd):
+        return {
+            "error": "refused: command references a protected location.",
+            "refused_command": cmd,
+        }
     # Registry tier check runs BEFORE the generic powershell approval so
     # system-hive writes never even reach the approval queue. Refusal here
     # is the catastrophic-failure safeguard that prevents another "one rule
@@ -3024,9 +3216,14 @@ def tool_run_powershell(args: dict) -> dict:
         )
         if approval.get("decision") != "approve":
             return {"error": f"user denied registry edit ({approval.get('status')})"}
-    elif needs_approval(cmd):
+    elif shell_requires_approval(cmd):
+        title = (
+            "Shell (outside workspace)"
+            if command_touches_outside_workspace(cmd) and not needs_approval(cmd)
+            else "PowerShell (write/modify)"
+        )
         approval = request_approval(
-            title="PowerShell (write/modify)",
+            title=title,
             command=cmd,
             details={"kind": "powershell"},
         )
@@ -3222,7 +3419,10 @@ def tool_session_send(args: dict) -> dict:
     if catastrophic:
         return {"error": f"refused: this input {catastrophic}. Run it yourself if you truly mean to.",
                 "refused_input": text, "catastrophic": True}
-    if needs_approval(text):
+    if command_touches_blocked_path(text):
+        return {"error": "refused: command references a protected location.",
+                "refused_input": text}
+    if shell_requires_approval(text):
         approval = request_approval(title="Session input (write/modify)", command=text,
                                     details={"kind": "session", "session_id": sid})
         if approval.get("decision") != "approve":
@@ -3405,15 +3605,15 @@ def tool_network_snapshot(args: dict) -> dict:
 
 
 def tool_open_program(args: dict) -> dict:
-    """Launch a program. Allowed from Program Files and user areas; blocked for Windows/System32 only."""
+    """Launch a program. Blocked for protected system/secret paths; otherwise approval-gated."""
     path = normalize_path(args.get("path") or "")
     if not path or not os.path.exists(path):
-        return {"error": f"not found: {path}"}
+        return {"error": "not found"}
     if is_blocked_path(path):
-        return {"error": "path blocked (Windows/System32)"}
+        return _path_blocked_error()
     approval = request_approval(
         title="Launch program",
-        command=f'Start-Process "{path}"',
+        command=f'launch {os.path.basename(path)}',
         details={"kind": "launch", "path": path},
     )
     if approval.get("decision") != "approve":
@@ -4940,12 +5140,12 @@ def _fw_check_path(path: str, must_exist: bool = True) -> tuple[str, dict | None
     p = normalize_path(path or "")
     if not p:
         return "", {"error": "missing path"}
-    if must_exist and not os.path.exists(p):
-        return p, {"error": f"not found: {p}"}
     if is_blocked_path(p):
-        return p, {"error": "path blocked (Windows/System32)"}
+        return "", _path_blocked_error()
     if not is_in_workspace(p):
-        return p, {"error": "path outside workspace. Add folder in Workspace panel."}
+        return "", _path_outside_workspace_error()
+    if must_exist and not os.path.exists(p):
+        return p, {"error": "not found"}
     return p, None
 
 
@@ -10147,34 +10347,63 @@ def tool_check_syntax(args: dict) -> dict:
 
 
 def tool_run_tests(args: dict) -> dict:
-    command = args.get("command", "")
-    cwd = normalize_path(args.get("cwd", str(ROOT)))
-    
+    command = (args.get("command") or "").strip()
+    if not command:
+        return {"error": "empty command"}
+    cwd = normalize_path(args.get("cwd") or _default_workspace_root() or str(ROOT))
+    if is_blocked_path(cwd):
+        return _path_blocked_error()
     if not is_in_workspace(cwd):
         return {"error": "CWD is outside workspace bounds."}
-    
-    # Approval gating tests might be needed if they run arbitrary scripts, but typically tests are safe.
-    # We will just run them.
+    threat = bridge_self_threat(command)
+    if threat:
+        return {"error": f"refused: {threat}", "refused_command": command}
+    catastrophic = _catastrophic_cmd(command)
+    if catastrophic:
+        return {
+            "error": f"refused: this command {catastrophic}.",
+            "refused_command": command,
+            "catastrophic": True,
+        }
+    if command_touches_blocked_path(command):
+        return {
+            "error": "refused: command references a protected location.",
+            "refused_command": command,
+        }
+    # Arbitrary argv — always approval-gated (same trust boundary as shell).
+    approval = request_approval(
+        title="Run tests / command",
+        command=command,
+        details={"kind": "run_tests", "cwd": cwd},
+    )
+    if approval.get("decision") != "approve":
+        return {"error": f"user denied command ({approval.get('status')})"}
+    timeout = int(args.get("timeout") or 120)
+    timeout = max(5, min(timeout, 600))
     try:
-        res = subprocess.run(shlex.split(command), cwd=cwd, capture_output=True, text=True)
-        output = res.stdout + "\n" + res.stderr
-        
+        res = subprocess.run(
+            shlex.split(command),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (res.stdout or "") + "\n" + (res.stderr or "")
         failures = [
-            line.strip() for line in output.splitlines() 
+            line.strip() for line in output.splitlines()
             if any(kw in line for kw in ("FAIL", "Error:", "Exception", "Traceback", "FAILED"))
         ]
-        
         summary = {
             "passed": res.returncode == 0,
             "returncode": res.returncode,
             "failure_hints": failures[:15],
-            "output_tail": output[-2000:]
+            "output_tail": output[-2000:],
         }
-        
         if res.returncode == 0:
             return {"result": summary}
         return {"error": "Tests failed", "details": summary}
-        
+    except subprocess.TimeoutExpired:
+        return {"error": f"timeout after {timeout}s"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -13085,8 +13314,13 @@ def recommended_settings(model: str) -> dict:
     }
 
 
-def llama_post_stream(path: str, payload: dict, base: str | None = None):
-    """POST and return the raw response object — caller iterates over SSE lines."""
+def llama_post_stream(path: str, payload: dict, base: str | None = None,
+                      timeout: float | None = None):
+    """POST and return the raw response object — caller iterates over SSE lines.
+
+    `timeout` is the socket idle timeout for connect/read. Prefer wrapping the
+    response with `iter_llama_sse` for generation idle + wall timeouts.
+    """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{base or LLAMA}{path}",
@@ -13094,7 +13328,10 @@ def llama_post_stream(path: str, payload: dict, base: str | None = None):
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         method="POST",
     )
-    return urllib.request.urlopen(req, timeout=None)
+    # Distinct from startup timeout: this only bounds individual socket ops.
+    # Full generation wall/idle limits are enforced by iter_llama_sse.
+    sock_timeout = timeout if timeout is not None else _llama_gen_idle_timeout_s()
+    return urllib.request.urlopen(req, timeout=sock_timeout)
 
 
 def _is_ctx_overflow(e: Exception) -> bool:
@@ -13672,6 +13909,8 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             resp = None
             for _ctx_attempt in range(4):
                 try:
+                    emit({"type": "notice",
+                          "note": "waiting for llama-server to accept chat completion…"})
                     resp = llama_post_stream("/v1/chat/completions", payload)
                     break
                 except Exception as e:
@@ -13687,15 +13926,24 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         emit({"type": "error",
                               "error": ("prompt still exceeds the context window after trimming — the system "
                                         "prompt + tool specs alone are near your num_ctx. Raise num_ctx in "
-                                        "Settings, or turn off some tools for this turn.")})
+                                        "Settings, or turn off some tools for this turn."),
+                              "code": "generation_failed"})
                     else:
+                        life = _llama.lifecycle_snapshot()
                         emit({"type": "error",
-                              "error": f"llama-server request failed at {LLAMA}: {e}. Is it running? "
-                                       f"Start it with: llama-server -m <model.gguf> --host 127.0.0.1 --port 8080 --jinja"})
+                              "error": (
+                                  f"llama-server request failed (state={life.get('state')}, "
+                                  f"waiting_for={life.get('waiting_for') or 'n/a'}): {e}. "
+                                  f"Is it running?"
+                              ),
+                              "code": "generation_failed",
+                              "lifecycle": life})
+                    _llama.end_generation(failed=True, reason=str(e))
                     return None
             if resp is None:
                 return None
             _set_cancel_resp(chat_id, resp)
+            _llama.begin_generation()
 
             content_buf: list[str] = []
             tool_calls_by_index: dict[int, dict] = {}
@@ -13718,7 +13966,22 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 _think_cap = 2048
 
             try:
-                for raw in resp:
+                def _stream_child_alive() -> bool:
+                    # Only treat death of a *managed* child as a crash. Unit tests
+                    # and externally hosted LLAMA have _proc is None.
+                    with _llama._lock:
+                        p = _llama._proc
+                    if p is None:
+                        return True
+                    return p.poll() is None
+
+                for raw in iter_llama_sse(
+                    resp,
+                    idle_timeout=_llama_gen_idle_timeout_s(),
+                    wall_timeout=_llama_gen_wall_timeout_s(),
+                    cancel_ev=cancel_ev,
+                    proc_alive=_stream_child_alive,
+                ):
                     if cancel_ev.is_set():
                         break
                     line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -13839,6 +14102,30 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if _last_prompt_tokens:
                         _last_prompt_tokens_by_chat[chat_id] = _last_prompt_tokens
                         _CTX_EST_CACHE.pop(chat_id, None)
+                _llama.end_generation()
+            except LlamaStreamTimeout as e:
+                _llama.end_generation(timed_out=True, reason=str(e))
+                emit({
+                    "type": "error",
+                    "error": str(e),
+                    "code": "timed_out",
+                    "waiting_for": getattr(e, "waiting_for", "next SSE chunk"),
+                    "lifecycle": _llama.lifecycle_snapshot(),
+                })
+                partial = {"role": "assistant", "content": "".join(content_buf)}
+                partial["_appended_intermediate"] = list(conversation[_start_len:])
+                return partial
+            except LlamaStreamError as e:
+                _llama.end_generation(failed=True, reason=str(e))
+                emit({
+                    "type": "error",
+                    "error": str(e),
+                    "code": getattr(e, "code", "generation_failed"),
+                    "lifecycle": _llama.lifecycle_snapshot(),
+                })
+                partial = {"role": "assistant", "content": "".join(content_buf)}
+                partial["_appended_intermediate"] = list(conversation[_start_len:])
+                return partial
             finally:
                 try:
                     resp.close()
@@ -13848,7 +14135,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
 
             if cancel_ev.is_set():
                 try:
-                    emit({"type": "notice", "note": "stopped by user"})
+                    emit({"type": "notice", "note": "stopped by user", "code": "cancelled"})
                 except Exception:
                     pass
                 partial = {"role": "assistant", "content": "".join(content_buf)}
@@ -14380,16 +14667,360 @@ DOWNLOAD_STATE = {
     "error_msg": ""
 }
 
-def detect_hardware_specs() -> dict:
-    """Detect GPU hardware availability on Windows to suggest the best build."""
+# ---- hardware / accelerator detection --------------------------------------
+# Apple Silicon uses unified memory (not discrete NVIDIA VRAM). Metal must be
+# evidenced by llama-server --list-devices (MTL*), not assumed from arm64 alone.
+
+_HW_SPECS_CACHE: tuple[float, dict] | None = None
+_HW_SPECS_TTL_S = 45.0
+# Set True after a successful llama-server spawn when a Metal-capable build was
+# confirmed and GPU offload is enabled. Cleared on stop.
+_METAL_RUNTIME_SELECTED = False
+
+
+def _apple_memory_reserve_gb(total_gb: float) -> float:
+    """RAM reserved for macOS, browser, Python, tools — not available to the model."""
+    t = float(total_gb or 0)
+    if t <= 0:
+        return 0.0
+    if t <= 16:
+        return 6.5
+    if t <= 24:
+        return 8.0
+    if t <= 32:
+        return 8.5
+    if t <= 48:
+        return 11.0
+    if t <= 64:
+        return 13.0
+    return 15.0
+
+
+def _apple_model_class_for_usable(usable_gb: float) -> str:
+    u = float(usable_gb or 0)
+    if u < 10:
+        return "approximately 3B–8B quantized"
+    if u < 18:
+        return "approximately 7B–14B quantized"
+    if u < 28:
+        return "approximately 14B–32B quantized"
+    if u < 40:
+        return "approximately 32B–70B quantized (or large MoE with care)"
+    return "large quantized models (70B-class) with careful context sizing"
+
+
+def _apple_context_recommendation(usable_gb: float) -> tuple[str, int, int]:
+    """Return (label, preferred_num_ctx, soft_max_ctx) for Apple unified memory."""
+    u = float(usable_gb or 0)
+    if u < 10:
+        return ("4K–8K", 8192, 8192)
+    if u < 18:
+        # 24 GB UMA class (e.g. M4 Pro 24 GB): keep first-run context modest.
+        return ("8K–16K", 16384, 16384)
+    if u < 28:
+        return ("16K–32K", 32768, 32768)
+    if u < 40:
+        return ("32K–65K", 32768, 65536)
+    return ("32K–131K", 65536, 131072)
+
+
+def _run_sysctl_n(keys: list[str], *, run: Any = None) -> dict[str, str]:
+    runner = run or subprocess.run
+    out: dict[str, str] = {}
+    for key in keys:
+        try:
+            r = runner(
+                ["sysctl", "-n", key],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip():
+                out[key] = r.stdout.strip()
+        except Exception:
+            continue
+    return out
+
+
+def parse_llama_list_devices(text: str) -> list[dict]:
+    """Parse `llama-server --list-devices` output into structured device dicts."""
+    devices: list[dict] = []
+    if not text:
+        return devices
+    # Examples:
+    #   MTL0: Apple M4 Pro (18186 MiB, 18185 MiB free)
+    #   CUDA0: NVIDIA GeForce RTX 4090 (24564 MiB, 24000 MiB free)
+    #   BLAS: Accelerate (0 MiB, 0 MiB free)
+    line_re = re.compile(
+        r"^\s*([A-Za-z]+)\s*(\d*)\s*:\s*(.+?)\s*(?:\((\d+)\s*MiB(?:,\s*(\d+)\s*MiB\s*free)?\))?\s*$",
+        re.IGNORECASE,
+    )
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.lower().startswith("available devices"):
+            continue
+        m = line_re.match(line)
+        if not m:
+            continue
+        kind = (m.group(1) or "").upper()
+        idx = m.group(2) or ""
+        name = (m.group(3) or "").strip()
+        total_mib = int(m.group(4)) if m.group(4) else None
+        free_mib = int(m.group(5)) if m.group(5) else None
+        devices.append({
+            "id": f"{kind}{idx}" if idx != "" else kind,
+            "backend": kind,
+            "name": name,
+            "memory_mib": total_mib,
+            "free_mib": free_mib,
+        })
+    return devices
+
+
+def probe_llama_devices(
+    bin_path: str = "",
+    *,
+    timeout: float = 2.5,
+    run: Any = None,
+    list_devices_text: str | None = None,
+) -> dict:
+    """Probe llama-server backends. Never claims Metal without MTL* evidence."""
+    result = {
+        "ok": False,
+        "devices": [],
+        "metal_llama_build": False,
+        "cuda": False,
+        "vulkan": False,
+        "error": None,
+    }
+    text = list_devices_text
+    if text is None:
+        path = (bin_path or "").strip() or find_llama_bin()
+        if not path:
+            result["error"] = "llama-server not found"
+            return result
+        runner = run or subprocess.run
+        try:
+            kwargs: dict[str, Any] = {
+                "capture_output": True,
+                "text": True,
+                "timeout": max(0.5, float(timeout)),
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            r = runner([path, "--list-devices"], **kwargs)
+            text = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+        except subprocess.TimeoutExpired:
+            result["error"] = "list-devices timed out"
+            return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+    devices = parse_llama_list_devices(text or "")
+    result["devices"] = devices
+    result["ok"] = True
+    backends = {(d.get("backend") or "").upper() for d in devices}
+    result["metal_llama_build"] = any(b.startswith("MTL") for b in backends)
+    result["cuda"] = any(b.startswith("CUDA") for b in backends)
+    result["vulkan"] = any(b.startswith("VULKAN") or b.startswith("VK") for b in backends)
+    return result
+
+
+def _detect_hardware_apple(
+    *,
+    architecture: str,
+    sysctl_values: dict[str, str] | None = None,
+    run: Any = None,
+    llama_bin: str = "",
+    list_devices_text: str | None = None,
+    probe_llama: bool = True,
+) -> dict:
+    """Darwin / Apple Silicon profile with conservative unified-memory guidance."""
+    vals = dict(sysctl_values or {})
+    if not vals:
+        vals = _run_sysctl_n(
+            ["machdep.cpu.brand_string", "hw.memsize", "hw.optional.arm64"],
+            run=run,
+        )
+
+    brand = (vals.get("machdep.cpu.brand_string") or "").strip()
+    mem_raw = (vals.get("hw.memsize") or "").strip()
+    arm_flag = (vals.get("hw.optional.arm64") or "").strip()
+
+    arch = (architecture or "").lower()
+    is_apple_silicon = (
+        arch == "arm64"
+        or arm_flag == "1"
+        or brand.lower().startswith("apple m")
+    )
+
+    chip_name = brand if brand else ("Apple Silicon" if is_apple_silicon else "")
+    # Never label confident Apple Silicon as "Generic CPU".
+    if is_apple_silicon and not chip_name:
+        chip_name = "Apple Silicon"
+
+    total_gb = 0.0
+    if mem_raw.isdigit():
+        total_gb = round(int(mem_raw) / (1024 ** 3), 1)
+
+    reserve_gb = _apple_memory_reserve_gb(total_gb) if total_gb > 0 else 0.0
+    usable_gb = round(max(0.0, total_gb - reserve_gb), 1) if total_gb > 0 else 0.0
+
+    # Hardware Metal: Apple GPU SoCs are Metal-capable. This is NOT "Metal active"
+    # and NOT proof the installed llama.cpp was built with Metal.
+    metal_hardware = bool(is_apple_silicon and chip_name)
+
+    metal_llama_build = False
+    llama_devices: list = []
+    llama_probe_error = None
+    device_free_gb = None
+    if probe_llama:
+        probed = probe_llama_devices(
+            llama_bin, run=run, list_devices_text=list_devices_text,
+        )
+        llama_devices = probed.get("devices") or []
+        metal_llama_build = bool(probed.get("metal_llama_build"))
+        llama_probe_error = probed.get("error")
+        for d in llama_devices:
+            if str(d.get("backend") or "").upper().startswith("MTL"):
+                free_mib = d.get("free_mib")
+                total_mib = d.get("memory_mib")
+                mib = free_mib if free_mib is not None else total_mib
+                if mib:
+                    device_free_gb = round(float(mib) / 1024.0, 1)
+                    # Prefer the tighter of reserve-based usable vs device-reported free.
+                    if usable_gb > 0 and device_free_gb > 0:
+                        usable_gb = min(usable_gb, device_free_gb)
+                    elif device_free_gb > 0 and usable_gb <= 0:
+                        usable_gb = device_free_gb
+                if not chip_name and d.get("name"):
+                    chip_name = str(d["name"]).strip()
+                break
+
+    ctx_label, pref_ctx, max_ctx = _apple_context_recommendation(usable_gb or total_gb)
+    model_class = _apple_model_class_for_usable(usable_gb or total_gb)
+
+    if metal_llama_build:
+        recommended_build = "Metal"
+        metal_status = "build_ready"  # hardware + llama.cpp Metal devices seen
+        metal_ui = "Metal acceleration available"
+    elif metal_hardware:
+        recommended_build = "CPU"
+        metal_status = "hardware_only"  # chip can do Metal; this binary did not expose MTL*
+        metal_ui = "Metal-capable hardware (llama.cpp Metal build not confirmed)"
+    else:
+        recommended_build = "CPU"
+        metal_status = "unavailable"
+        metal_ui = "Metal not detected"
+
+    # metal_selected: true only after a successful launch with Metal offload.
+    metal_selected = bool(_METAL_RUNTIME_SELECTED and metal_llama_build)
+    if metal_selected:
+        metal_status = "active"
+        metal_ui = "Metal acceleration active"
+
+    gpu_name = chip_name if is_apple_silicon else (chip_name or "Generic CPU")
+    if is_apple_silicon and gpu_name == "Generic CPU":
+        gpu_name = "Apple Silicon"
+
+    summary_lines = []
+    if chip_name:
+        summary_lines.append(chip_name)
+    if total_gb > 0:
+        summary_lines.append(f"{total_gb:g} GB unified memory")
+    summary_lines.append(metal_ui)
+    summary_lines.append(f"Recommended model class: {model_class}")
+    summary_lines.append(f"Recommended initial context: {ctx_label}")
+
+    return {
+        "gpu_name": gpu_name,
+        "recommended_build": recommended_build,
+        "os": "macos",
+        "architecture": architecture or "arm64",
+        "chip_name": chip_name,
+        "is_apple_silicon": bool(is_apple_silicon),
+        "memory_model": "unified",
+        "unified_memory_gb": total_gb,
+        "total_memory_gb": total_gb,
+        "memory_reserve_gb": reserve_gb,
+        "usable_memory_gb": usable_gb,
+        "device_free_gb": device_free_gb,
+        "metal_hardware": metal_hardware,
+        "metal_llama_build": metal_llama_build,
+        "metal_selected": metal_selected,
+        "metal_status": metal_status,
+        "metal_label": metal_ui,
+        "llama_devices": llama_devices,
+        "llama_probe_error": llama_probe_error,
+        "recommended_model_class": model_class,
+        "recommended_context_label": ctx_label,
+        "recommended_num_ctx": pref_ctx,
+        "recommended_num_ctx_max": max_ctx,
+        # Offload recommendation only when the *build* exposed MTL* devices.
+        # metal_hardware alone must not imply ngl=99 (CPU llama.cpp is common).
+        "recommended_num_gpu": 99 if metal_llama_build else 0,
+        "recommended_n_parallel": 1,
+        "recommended_flash_attn": True,
+        "summary_lines": summary_lines,
+        # Back-compat alias used by older UI copy paths.
+        "build_mode_label": gpu_name,
+    }
+
+
+def detect_hardware_specs(
+    *,
+    platform_name: str | None = None,
+    machine: str | None = None,
+    sysctl_values: dict[str, str] | None = None,
+    list_devices_text: str | None = None,
+    llama_bin: str = "",
+    run: Any = None,
+    probe_llama: bool = True,
+    use_cache: bool = True,
+) -> dict:
+    """Cross-platform hardware summary for setup + tuning.
+
+    On macOS/Apple Silicon returns unified-memory guidance and Metal evidence
+    from llama-server --list-devices when available. Never reports
+    \"Generic CPU\" when Apple Silicon is confidently detected.
+    """
+    global _HW_SPECS_CACHE
+    plat = platform_name if platform_name is not None else sys.platform
+    try:
+        import platform as _plat
+        arch = machine if machine is not None else (_plat.machine() or "")
+    except Exception:
+        arch = machine or ""
+
+    # Cache only the live (non-injected) path so tests stay deterministic.
+    injected = any(v is not None for v in (platform_name, machine, sysctl_values, list_devices_text)) or bool(llama_bin) or run is not None
+    if use_cache and not injected and _HW_SPECS_CACHE is not None:
+        ts, cached = _HW_SPECS_CACHE
+        if time.time() - ts < _HW_SPECS_TTL_S:
+            return dict(cached)
+
+    if str(plat).lower() == "darwin" or str(plat).lower() == "macos":
+        info = _detect_hardware_apple(
+            architecture=arch,
+            sysctl_values=sysctl_values,
+            run=run,
+            llama_bin=llama_bin,
+            list_devices_text=list_devices_text,
+            probe_llama=probe_llama,
+        )
+        if use_cache and not injected:
+            _HW_SPECS_CACHE = (time.time(), dict(info))
+        return info
+
+    # Windows / Linux: preserve prior nvidia-smi + wmic behavior.
     gpu_name = "Generic CPU"
-    recommended_build = "CPU" # CPU, Vulkan, CUDA
+    recommended_build = "CPU"
     is_nvidia = False
+    runner = run or subprocess.run
 
     try:
-        # Check via nvidia-smi command first
-        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], 
-                             capture_output=True, text=True, timeout=2)
+        res = runner(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=2,
+        )
         if res.returncode == 0 and res.stdout.strip():
             gpu_name = res.stdout.strip().split("\n")[0]
             recommended_build = "CUDA"
@@ -14397,16 +15028,16 @@ def detect_hardware_specs() -> dict:
     except Exception:
         pass
 
-    if not is_nvidia:
+    if not is_nvidia and (str(plat).startswith("win") or os.name == "nt"):
         try:
-            # Query via WMI on Windows
-            res = subprocess.run(["wmic", "path", "win32_VideoController", "get", "name"], 
-                                 capture_output=True, text=True, timeout=2)
+            res = runner(
+                ["wmic", "path", "win32_VideoController", "get", "name"],
+                capture_output=True, text=True, timeout=2,
+            )
             if res.returncode == 0 and res.stdout.strip():
                 lines = [l.strip() for l in res.stdout.strip().split("\n")[1:] if l.strip()]
                 if lines:
                     gpu_name = lines[0]
-                    # AMD, Nvidia or Intel GPUs get Vulkan
                     lower_name = gpu_name.lower()
                     if "nvidia" in lower_name:
                         recommended_build = "CUDA"
@@ -14415,15 +15046,64 @@ def detect_hardware_specs() -> dict:
         except Exception:
             pass
 
-    return {
+    os_name = "windows" if str(plat).startswith("win") else (
+        "linux" if "linux" in str(plat).lower() else str(plat)
+    )
+    info = {
         "gpu_name": gpu_name,
-        "recommended_build": recommended_build
+        "recommended_build": recommended_build,
+        "os": os_name,
+        "architecture": arch or "unknown",
+        "chip_name": gpu_name if gpu_name != "Generic CPU" else "",
+        "is_apple_silicon": False,
+        "memory_model": "discrete_vram" if is_nvidia else "unknown",
+        "unified_memory_gb": 0,
+        "total_memory_gb": 0,
+        "memory_reserve_gb": 0,
+        "usable_memory_gb": 0,
+        "device_free_gb": None,
+        "metal_hardware": False,
+        "metal_llama_build": False,
+        "metal_selected": False,
+        "metal_status": "unavailable",
+        "metal_label": "Metal not applicable",
+        "llama_devices": [],
+        "llama_probe_error": None,
+        "recommended_model_class": "",
+        "recommended_context_label": "",
+        "recommended_num_ctx": 0,
+        "recommended_num_ctx_max": 0,
+        "recommended_num_gpu": 99 if recommended_build in ("CUDA", "Vulkan") else 0,
+        "recommended_n_parallel": 1,
+        "recommended_flash_attn": True,
+        "summary_lines": [gpu_name, f"Recommended build: {recommended_build}"],
+        "build_mode_label": gpu_name,
     }
+    if use_cache and not injected:
+        _HW_SPECS_CACHE = (time.time(), dict(info))
+    return info
+
+
+def windows_llama_zip_download_allowed(platform_name: str | None = None) -> bool:
+    """True only on Windows — zip assets are win-*.exe builds (see download URLs)."""
+    from ui_copy import normalize_os, ui_features
+    return bool(ui_features(normalize_os(platform_name)).get("llama_one_click_windows"))
 
 
 def download_and_extract_llama(build_type: str):
     """Downloads and extracts the correct llama-server package inside a background thread."""
     global DOWNLOAD_STATE
+
+    if not windows_llama_zip_download_allowed():
+        with DOWNLOAD_LOCK:
+            DOWNLOAD_STATE.update({
+                "status": "failed",
+                "error_msg": (
+                    "Windows llama.cpp zip install is not available on this platform. "
+                    "Install llama-server via your package manager (e.g. Homebrew) or set llama_bin."
+                ),
+            })
+        return
     
     # Map to release b4600 assets (which contains mtmd.dll, llama-server.exe, and full speculation decoding)
     urls = {
@@ -14665,6 +15345,22 @@ def _wsl_distros() -> list:
 def wsl_probe() -> dict:
     """Cheap snapshot of WSL + sandbox state for the setup wizard and settings.
     Safe to call on a poll."""
+    from ui_copy import normalize_os
+    # WSL is a Windows feature. On macOS/Linux report unsupported_platform
+    # without invoking the WSL CLI (which does not exist there).
+    if normalize_os() != "windows":
+        info = {
+            "wsl_installed": False, "wsl_version": "", "kernel": "",
+            "distros": [], "sandbox_distro": SANDBOX_DISTRO,
+            "sandbox_present": False, "sandbox_provisioned": False,
+            "ready": False, "state": "unsupported_platform",
+            "unsupported_platform": True, "provision": None,
+        }
+        with SANDBOX_LOCK:
+            info["provision"] = dict(
+                SANDBOX_PROGRESS, log=list(SANDBOX_PROGRESS["log"][-40:])
+            )
+        return info
     info = {
         "wsl_installed": False, "wsl_version": "", "kernel": "",
         "distros": [], "sandbox_distro": SANDBOX_DISTRO,
@@ -15019,6 +15715,150 @@ STATIC_WHITELIST = {
 }
 
 
+# ---- native folder picker -------------------------------------------------
+# /api/browse-folder must never abort the bridge process. On macOS, in-process
+# Tkinter/AppKit called from a ThreadingHTTPServer worker thread raises an
+# uncaught NSException (not a Python Exception) and kills the interpreter.
+# Darwin therefore uses `osascript` in a subprocess; Windows/Linux keep the
+# existing Tkinter dialog. Override via `_pick_folder_impl` in tests.
+
+_PICKER_PASTE_HINT = "Paste the folder path into the text field instead."
+
+# Optional test seam: Callable[[str], dict] replacing the real picker.
+_pick_folder_impl = None
+
+
+def _gui_picker_disabled() -> bool:
+    return os.environ.get("ACCURETTA_NO_GUI", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _picker_error(code: str, detail: str) -> dict:
+    """Structured picker failure for the API (no traceback in the body)."""
+    return {
+        "path": "",
+        "cancelled": False,
+        "error": detail,
+        "code": code,
+        "message": f"{detail} {_PICKER_PASTE_HINT}",
+    }
+
+
+def _picker_cancel() -> dict:
+    return {
+        "path": "",
+        "cancelled": True,
+        "error": None,
+        "code": None,
+        "message": None,
+    }
+
+
+def _picker_ok(path: str) -> dict:
+    return {
+        "path": path,
+        "cancelled": False,
+        "error": None,
+        "code": None,
+        "message": None,
+    }
+
+
+def _escape_applescript_string(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _pick_folder_osascript(title: str) -> dict:
+    """macOS folder dialog via osascript (separate process — AppKit-safe)."""
+    prompt = _escape_applescript_string(title)
+    script = f'POSIX path of (choose folder with prompt "{prompt}")'
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except FileNotFoundError:
+        print("[browse-folder] osascript not found", flush=True)
+        return _picker_error("unavailable", "Folder picker unavailable.")
+    except subprocess.TimeoutExpired:
+        print("[browse-folder] osascript timed out", flush=True)
+        return _picker_error("unavailable", "Folder picker timed out.")
+    except Exception as e:
+        print(f"[browse-folder] osascript spawn failed: {e}", flush=True)
+        traceback.print_exc()
+        return _picker_error("picker_failed", "Folder picker failed.")
+
+    stdout = (r.stdout or "").strip()
+    stderr = (r.stderr or "").strip()
+    if r.returncode != 0:
+        combined = f"{stderr}\n{stdout}".strip()
+        low = combined.lower()
+        # AppleScript: "User canceled." (US spelling); also accept "cancelled".
+        if ("cancel" in low) or (r.returncode == 1 and not combined):
+            print("[browse-folder] user cancelled (osascript)", flush=True)
+            return _picker_cancel()
+        print(
+            f"[browse-folder] osascript failed rc={r.returncode} stderr={stderr!r}",
+            flush=True,
+        )
+        return _picker_error("unavailable", "Folder picker unavailable.")
+
+    path = stdout.rstrip("\r\n")
+    # choose folder returns a trailing slash; normalize for Path consumers.
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    if not path:
+        return _picker_cancel()
+    print(f"[browse-folder] selected path={path!r}", flush=True)
+    return _picker_ok(path)
+
+
+def _pick_folder_tk(title: str) -> dict:
+    """Windows/Linux folder dialog (unchanged Tkinter behavior)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askdirectory(title=title)
+        root.destroy()
+        path = (path or "").strip()
+        if not path:
+            return _picker_cancel()
+        return _picker_ok(path)
+    except Exception as e:
+        print(f"[browse-folder] tkinter picker failed: {e}", flush=True)
+        traceback.print_exc()
+        return _picker_error("picker_failed", "Folder picker failed.")
+
+
+def pick_folder(title: str = "Pick a folder") -> dict:
+    """Open a native folder picker. Always returns a structured dict; never raises
+    an ObjC/AppKit exception into the HTTP worker (Darwin uses a subprocess)."""
+    title = (title or "Pick a folder").strip() or "Pick a folder"
+    try:
+        if _pick_folder_impl is not None:
+            return _pick_folder_impl(title)
+        if _gui_picker_disabled():
+            print("[browse-folder] ACCURETTA_NO_GUI set — native picker skipped", flush=True)
+            return _picker_error(
+                "no_gui",
+                "Folder picker disabled in this environment.",
+            )
+        if sys.platform == "darwin":
+            return _pick_folder_osascript(title)
+        return _pick_folder_tk(title)
+    except Exception as e:
+        # Last-resort guard: keep the bridge alive for any unexpected failure.
+        print(f"[browse-folder] unexpected error: {e}", flush=True)
+        traceback.print_exc()
+        return _picker_error("picker_failed", "Folder picker failed.")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Accuretta/1.0"
 
@@ -15056,6 +15896,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _peer_ip(self):
+        import ipaddress
+        try:
+            addr = getattr(self, "client_address", None) or ("",)
+            return ipaddress.ip_address(addr[0])
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    def _peer_is_loopback(self) -> bool:
+        ip = self._peer_ip()
+        return bool(ip is not None and ip.is_loopback)
+
     def _peer_ok(self) -> bool:
         # Only THIS machine (loopback) or YOUR Tailnet (Tailscale's
         # 100.64.0.0/10 and fd7a:115c:a1e0::/48 ranges) may connect. Everyone
@@ -15063,9 +15915,8 @@ class Handler(BaseHTTPRequestHandler):
         # Tailscale already proves the remote device is yours, so no password is
         # needed. client_address is the real TCP peer; it can't be forged.
         import ipaddress
-        try:
-            ip = ipaddress.ip_address((self.client_address or ("",))[0])
-        except (ValueError, IndexError, TypeError):
+        ip = self._peer_ip()
+        if ip is None:
             return False
         if ip.is_loopback:
             return True
@@ -15202,6 +16053,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_api_get(self, p: str, parsed):
         if p == "/api/health":
+            life = _llama.lifecycle_snapshot()
             return self._send_json(200, {
                 "ok": True,
                 "llama": LLAMA,
@@ -15209,7 +16061,10 @@ class Handler(BaseHTTPRequestHandler):
                 "llama_up": llama_ping(timeout=1.0),
                 # legacy alias so older frontend builds don't break
                 "ollama": LLAMA,
+                "llama_lifecycle": life,
             })
+        if p == "/api/llama/lifecycle":
+            return self._send_json(200, _llama.lifecycle_snapshot())
         if p == "/api/llama-log":
             # Live tail of the llama.cpp backend's stdout/stderr — powers the
             # Backend terminal tab so model loads/reloads show real progress.
@@ -15249,6 +16104,7 @@ class Handler(BaseHTTPRequestHandler):
                 "llama_running": _llama.is_running() or llama_ping(timeout=0.5),
                 "vision_capable": _llama.is_vision_capable(),
                 "loaded_mmproj": _llama.loaded_mmproj(),
+                "llama_lifecycle": _llama.lifecycle_snapshot(),
                 "models": files,
             })
         if p.startswith("/api/model-info/"):
@@ -15466,8 +16322,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             return self._send_bytes(200, data, ct, extra_headers=extra)
         if p == "/api/llama/detect-vram":
-            # GET — best-effort GPU VRAM probe via nvidia-smi. Used by the
-            # Settings drawer to pre-fill the VRAM tier dropdown.
+            # GET — memory budget for auto-tune (NVIDIA VRAM or Apple unified usable).
             return self._send_json(200, detect_vram_gb())
         if p == "/api/list-folder":
             qs = urllib.parse.parse_qs(parsed.query)
@@ -15513,52 +16368,91 @@ class Handler(BaseHTTPRequestHandler):
             except PermissionError:
                 return self._send_json(403, {"error": "permission denied"})
             return self._send_json(200, {"path": str(target_resolved), "entries": entries})
+        if p == "/api/ui-capabilities":
+            # Lightweight capabilities (os/features/copy) without hardware probing.
+            # Used as a fail-open path so Windows UI sections are not stuck hidden
+            # when full sysinfo fails.
+            from ui_copy import build_ui_capabilities
+            return self._send_json(200, build_ui_capabilities())
         if p == "/api/setup/sysinfo":
-            info = detect_hardware_specs()
-            return self._send_json(200, info)
+            from ui_copy import attach_ui_capabilities
+            try:
+                info = detect_hardware_specs()
+            except Exception as e:
+                print(f"[sysinfo] hardware detect failed: {e!r}", file=sys.stderr)
+                traceback.print_exc()
+                info = {
+                    "gpu_name": "unknown",
+                    "recommended_build": "CPU",
+                    "error": f"hardware detect failed: {e}",
+                }
+            return self._send_json(200, attach_ui_capabilities(info))
         if p == "/api/setup/download-status":
             with DOWNLOAD_LOCK:
                 return self._send_json(200, DOWNLOAD_STATE)
         if p == "/api/sandbox/status":
             return self._send_json(200, wsl_probe())
         if p == "/api/setup/detect":
-            # Scan for llama-server.exe in common locations and list available models.
-            # Returns data for the initial setup wizard so new users don't have to
-            # manually edit settings.json.
+            # Discover llama-server + models for the setup wizard.
             s = get_settings()
             mdir = (s.get("models_dir") or "").strip()
-            
-            # Detect llama-server paths
+
+            resolved = resolve_llama_bin()
             llama_paths = []
-            explicit = (s.get("llama_bin") or "").strip()
-            if explicit and safe_exists(explicit):
-                llama_paths.append({"path": explicit, "found": True, "label": "Custom path (settings)"})
-                
-            # Auto-detect via find_llama_bin
-            auto = find_llama_bin()
-            if auto and not any(lp["path"] == auto for lp in llama_paths):
-                llama_paths.append({"path": auto, "found": True, "label": "Auto-detected"})
-                
-            # Scan common fallback locations
-            home = Path.home()
-            candidates = [
-                (home / ".unsloth/llama.cpp/build/bin/Release/llama-server.exe", "Unstable build (Release)"),
-                (home / ".unsloth/llama.cpp/build/bin/llama-server.exe", "Unstable build"),
-                (home / ".docker/bin/inference/llama-server.exe", "Docker inference"),
-                (home / "llama.cpp/build/bin/Release/llama-server.exe", "llama.cpp Release"),
-                (home / "llama.cpp/llama-server.exe", "llama.cpp root"),
-                (Path("C:/llama.cpp/build/bin/Release/llama-server.exe"), "C:/llama.cpp Release"),
-                (Path("C:/llama.cpp/llama-server.exe"), "C:/llama.cpp root"),
-            ]
-            for c, label in candidates:
-                if safe_exists(c) and not any(lp["path"] == str(c) for lp in llama_paths):
-                    llama_paths.append({"path": str(c), "found": True, "label": label})
-                    
+            seen_lp: set[str] = set()
+
+            def _add_lp(path: str, label: str, *, found: bool, source: str = "",
+                        version: str | None = None):
+                if not path or path in seen_lp:
+                    return
+                seen_lp.add(path)
+                llama_paths.append({
+                    "path": path,
+                    "found": found,
+                    "label": label,
+                    "source": source,
+                    "version": version,
+                })
+
+            if resolved.get("path"):
+                src = resolved.get("source") or "auto"
+                label = {
+                    "settings": "Custom path (settings)",
+                    "env": "ACCURETTA_LLAMA_BIN",
+                    "path": "On PATH",
+                    "homebrew": "Homebrew",
+                    "bundled": "Bundled (./bin/llama)",
+                    "well_known": "Well-known location",
+                    "scan": "Auto-detected",
+                }.get(src, "Auto-detected")
+                if resolved.get("version"):
+                    label = f"{label} — {resolved['version']}"
+                _add_lp(
+                    resolved["path"], label,
+                    found=(resolved.get("validation") == "ok"),
+                    source=src,
+                    version=resolved.get("version"),
+                )
+
+            # If the user pinned settings/env, still offer auto-discovered
+            # alternatives in the dropdown (resolve itself never replaces them).
+            if (s.get("llama_bin") or "").strip() or (os.environ.get("ACCURETTA_LLAMA_BIN") or "").strip():
+                alt = resolve_llama_bin(settings_bin="", env_bin="", probe_version=False)
+                if alt.get("validation") == "ok" and alt.get("path"):
+                    _add_lp(alt["path"], "Auto-detected", found=True,
+                            source=alt.get("source") or "auto")
+
+            for cand, source in _well_known_llama_paths():
+                v = validate_llama_executable(cand)
+                if v.get("ok"):
+                    _add_lp(v["path"], source.replace("_", " ").title(),
+                            found=True, source=source)
+
             # List models in the configured directory if any
             models = []
             if mdir and safe_exists(mdir):
                 models = scan_gguf_dir(mdir)
-                
+
             # If no models found in configured directory or models_dir is empty,
             # scan other drives/common folders to auto-suggest models
             auto_models = find_all_gguf_files()
@@ -15571,9 +16465,11 @@ class Handler(BaseHTTPRequestHandler):
                         mdir = str(Path(best_model_path).parent.resolve())
                     except Exception:
                         pass
-                        
+
             return self._send_json(200, {
                 "llama_paths": llama_paths,
+                "llama_resolution": resolved,
+                "llama_basename": resolved.get("basename") or llama_server_basename(),
                 "models_dir": mdir,
                 "models": models,
                 "settings": s,
@@ -15583,6 +16479,14 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_api_post(self, p: str, parsed):
         body = self._read_json()
         if p == "/api/setup/download-llama":
+            if not windows_llama_zip_download_allowed():
+                return self._send_json(400, {
+                    "success": False,
+                    "error": (
+                        "Windows llama.cpp zip install is not available on this platform. "
+                        "Install llama-server via your package manager (e.g. Homebrew) or set llama_bin."
+                    ),
+                })
             build_type = body.get("build_type", "CPU")
             threading.Thread(target=download_and_extract_llama, args=(build_type,), daemon=True).start()
             return self._send_json(200, {"success": True})
@@ -15710,36 +16614,64 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/llama/auto-tune":
             # POST {model_path?, vram_gb} -> suggested llama-server settings.
             # If model_path is omitted, uses the currently configured model_path
-            # from settings. If vram_gb is omitted or 0, tries nvidia-smi.
+            # from settings. If vram_gb is omitted or 0, auto-detects memory budget.
             mp = (body.get("model_path") or get_settings().get("model_path") or "").strip()
             vram = float(body.get("vram_gb") or 0)
             detected = None
+            mem_model = (body.get("memory_model") or "").strip() or None
             if vram <= 0:
                 detected = detect_vram_gb()
                 vram = float(detected.get("gb") or 0)
-            suggested = auto_tune(mp, vram)
+                mem_model = mem_model or detected.get("memory_model")
+            elif not mem_model:
+                # User-picked tier: still prefer Apple unified rules on Darwin.
+                try:
+                    hw = detect_hardware_specs()
+                    if hw.get("memory_model") == "unified":
+                        mem_model = "unified"
+                except Exception:
+                    pass
+            suggested = auto_tune(mp, vram, memory_model=mem_model)
+            # Prefer hardware soft-cap for Apple first-run context when tighter.
+            try:
+                hw = detect_hardware_specs()
+                if hw.get("is_apple_silicon") and hw.get("recommended_num_ctx"):
+                    soft = int(hw["recommended_num_ctx_max"] or hw["recommended_num_ctx"])
+                    if suggested.get("num_ctx") and int(suggested["num_ctx"]) > soft:
+                        suggested["num_ctx"] = soft
+                        suggested["notes"] = (
+                            (suggested.get("notes") or "")
+                            + f" Context capped to {soft} for Apple Silicon first-run defaults "
+                            f"(raise manually if you want more)."
+                        ).strip()
+                if hw.get("recommended_n_parallel"):
+                    suggested["n_parallel"] = int(hw["recommended_n_parallel"])
+            except Exception:
+                pass
             profile = inspect_model(mp)
             return self._send_json(200, {
                 "vram_gb": vram,
                 "vram_source": (detected or {}).get("source", "user"),
                 "vram_name": (detected or {}).get("name", ""),
+                "memory_model": mem_model or (detected or {}).get("memory_model") or "",
                 "model": profile,
                 "suggested": suggested,
             })
         if p == "/api/browse-folder":
-            # native OS folder picker, only on the machine running the bridge.
+            # Native OS folder picker on the machine running the bridge.
+            # Loopback-only: Tailscale/remote peers must paste a path instead.
+            if not self._peer_is_loopback():
+                return self._send_json(403, {
+                    "error": "Native folder picker is only available from this machine.",
+                    "code": "picker_local_only",
+                    "message": (
+                        "Paste the folder path into the text field instead. "
+                        "Remote clients cannot open a host folder dialog."
+                    ),
+                })
             title = (body.get("title") or "Pick a folder").strip()
-            try:
-                import tkinter as tk
-                from tkinter import filedialog
-                root = tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = filedialog.askdirectory(title=title)
-                root.destroy()
-                return self._send_json(200, {"path": path or ""})
-            except Exception as e:
-                return self._send_json(200, {"path": "", "error": str(e)})
+            result = pick_folder(title)
+            return self._send_json(200, result)
         if p == "/api/models/scan-dir":
             # Save settings.models_dir and immediately return the scan.
             new_dir = (body.get("path") or "").strip()
@@ -16519,12 +17451,47 @@ class Handler(BaseHTTPRequestHandler):
 # field. Heuristics here are deliberately conservative — leaving 10-15% VRAM
 # headroom beats hitting an OOM mid-generation.
 
-def detect_vram_gb() -> dict:
-    """Best-effort GPU VRAM probe. Returns {gb, name, source} or
-    {gb: 0, name: "", source: "none"} on failure. Tries nvidia-smi first
-    (most common), then falls back to silence. Never raises."""
-    out = {"gb": 0, "name": "", "source": "none"}
-    # nvidia-smi --query-gpu=memory.total,name --format=csv,noheader,nounits
+def detect_vram_gb(*, hw: dict | None = None) -> dict:
+    """Best-effort memory budget for auto-tune.
+
+    On Apple Silicon returns *usable* unified memory (total minus OS/app reserve),
+    never the raw RAM stick size as if it were discrete VRAM.
+    On NVIDIA hosts, preserves nvidia-smi VRAM detection.
+    Never raises.
+    """
+    out = {
+        "gb": 0,
+        "name": "",
+        "source": "none",
+        "memory_model": "unknown",
+        "total_gb": 0,
+        "reserve_gb": 0,
+        "metal_llama_build": False,
+        "metal_hardware": False,
+    }
+
+    # Apple Silicon / unified memory first when on Darwin.
+    try:
+        profile = hw if hw is not None else detect_hardware_specs()
+    except Exception:
+        profile = {}
+    if profile.get("is_apple_silicon") or profile.get("memory_model") == "unified":
+        usable = float(profile.get("usable_memory_gb") or 0)
+        total = float(profile.get("unified_memory_gb") or profile.get("total_memory_gb") or 0)
+        reserve = float(profile.get("memory_reserve_gb") or 0)
+        name = (profile.get("chip_name") or profile.get("gpu_name") or "Apple Silicon").strip()
+        out.update({
+            "gb": usable,
+            "name": f"{name} (unified)" if name else "Apple unified memory",
+            "source": "apple-unified",
+            "memory_model": "unified",
+            "total_gb": total,
+            "reserve_gb": reserve,
+            "metal_llama_build": bool(profile.get("metal_llama_build")),
+            "metal_hardware": bool(profile.get("metal_hardware")),
+        })
+        return out
+
     smi = shutil.which("nvidia-smi")
     if smi:
         try:
@@ -16542,6 +17509,8 @@ def detect_vram_gb() -> dict:
                     out["gb"] = round(mb / 1024, 1)
                     out["name"] = parts[1] if len(parts) > 1 else "NVIDIA GPU"
                     out["source"] = "nvidia-smi"
+                    out["memory_model"] = "discrete_vram"
+                    out["total_gb"] = out["gb"]
                     return out
         except Exception:
             pass
@@ -16872,8 +17841,8 @@ def _kv_per_1k_mb(profile: dict, kv_dtype: str, file_size_gb: float) -> float:
     return base
 
 
-def auto_tune(model_path: str, vram_gb: float) -> dict:
-    """Suggest llama-server flags for a (model, VRAM) pair.
+def auto_tune(model_path: str, vram_gb: float, *, memory_model: str | None = None) -> dict:
+    """Suggest llama-server flags for a (model, memory-budget) pair.
 
     Uses GGUF header metadata (layer count, expert count, GQA config) when
     available for accurate KV cache + MoE expert offload math. Falls back to
@@ -16881,9 +17850,10 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     keys the Settings drawer uses plus `notes` (multi-line reasoning) and
     `quant_downshift` (banner shown when the model needs heavy offload).
 
-    Leaves ~8% VRAM headroom when GGUF math is exact, ~15% when falling back
-    to filename heuristics. Disables speculative decoding for MoE because
-    independent benchmarks show it's net-negative there.
+    For discrete VRAM: ~8–15% headroom. For Apple unified memory, `vram_gb`
+    is already the *usable* budget (OS reserve subtracted); apply extra slack
+    and keep initial context conservative. Disables speculative decoding for
+    MoE because independent benchmarks show it's net-negative there.
     """
     profile = inspect_model(model_path)
     notes: list[str] = []
@@ -16892,13 +17862,15 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     n_layer = profile.get("block_count", 0) or 0
     src = profile.get("metadata_source", "filename")
     vram = max(float(vram_gb or 0), 0)
+    mem_model = (memory_model or "").strip().lower() or "discrete_vram"
+    unified = mem_model == "unified"
 
     # Default flags everyone gets
     out = {
         "num_gpu": 99,                 # all non-MoE layers on GPU
         "n_cpu_moe": 0,                # MoE-only; auto below
         "kv_cache_type": "q8_0",       # best balance
-        "num_ctx": 32768,
+        "num_ctx": 16384 if unified else 32768,
         "num_batch": 512,
         "n_ubatch": 0,                 # auto in spawn
         "num_thread": 0,               # auto = let llama-server pick
@@ -16906,20 +17878,27 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
         "spec_strategy": "ngram-mod",   # off | ngram-mod | draft-mtp — set per-model below
         "no_warmup": False,
         "enable_metrics": False,
+        "n_parallel": 1,
         "quant_downshift": "",          # banner string; "" = no suggestion
     }
 
     if vram <= 0:
-        out["notes"] = "no VRAM tier set — using safe defaults. set a tier and Suggest again."
+        out["notes"] = (
+            "no memory budget set — using safe defaults. "
+            "set a VRAM/unified-memory tier and Suggest again."
+        )
         return out
     if size_gb <= 0:
         out["notes"] = "no model selected — pick a model first, then Suggest."
         return out
 
-    # Useable VRAM budget. With exact GGUF-derived KV math we can run hot —
-    # ~8% headroom for CUDA workspace + alignment. Filename fallback is fuzzier
-    # so we leave more slack.
-    headroom = 0.92 if src == "gguf" else 0.85
+    # Budget headroom. Unified: vram_gb is already post-reserve usable memory.
+    if unified:
+        headroom = 0.78 if src == "gguf" else 0.70
+        compute_buf_mb = 2048.0
+    else:
+        headroom = 0.92 if src == "gguf" else 0.85
+        compute_buf_mb = 1536.0
     budget_mb = vram * headroom * 1024
     if src == "gguf":
         moe_tag = ""
@@ -16931,13 +17910,26 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
             f"GQA head_kv={profile['head_count_kv']} key_len={profile['key_length']}{moe_tag}"
         )
     else:
-        notes.append("GGUF header unreadable — using size-bucket fallback (less accurate).")
-    notes.append(f"VRAM budget: {vram:.1f} GB · usable {budget_mb/1024:.1f} GB ({int(headroom*100)}% of total).")
+        notes.append("GGUF header unreadable — using size-bucket heuristics (less accurate).")
+    if unified:
+        notes.append(
+            f"Unified memory budget: {vram:.1f} GB usable · "
+            f"planning {budget_mb/1024:.1f} GB ({int(headroom*100)}% of usable; "
+            f"macOS/app reserve already subtracted)."
+        )
+    else:
+        notes.append(
+            f"VRAM budget: {vram:.1f} GB · usable {budget_mb/1024:.1f} GB "
+            f"({int(headroom*100)}% of total)."
+        )
 
     # -- KV cache dtype --
-    # q8_0 is the quality/cost sweet spot. We enforce it as a minimum to
-    # guarantee zero perplexity loss, sacrificing context length instead if tight.
-    if vram >= 24 and size_gb < vram * 0.4:
+    # q8_0 is the quality/cost sweet spot. On unified memory stay on q8_0 unless
+    # the model is clearly small vs usable budget (avoid treating UMA like 24GB VRAM).
+    f16_ok = (not unified and vram >= 24 and size_gb < vram * 0.4) or (
+        unified and vram >= 20 and size_gb < vram * 0.35
+    )
+    if f16_ok:
         out["kv_cache_type"] = "f16"
         notes.append("KV cache: f16 (you have headroom).")
     else:
@@ -16951,9 +17943,6 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     # gives the user "biggest context that's still fast" instead of the old
     # "fixed 45%-of-budget cap that left context on the table".
     kv_per_1k = _kv_per_1k_mb(profile, out["kv_cache_type"], size_gb)
-    # Compute buffer: ~1.5 GB for activations, scratch, CUDA workspace,
-    # attention work area. Padded to accommodate explicit 512+ ubatch sizing.
-    compute_buf_mb = 1536.0
     size_mb = size_gb * 1024
     # Tier ladder. We deliberately do NOT cap to GGUF-reported trained_max —
     # many GGUFs report a conservative trained context that the model handles
@@ -16961,7 +17950,18 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
     # context that previously worked. trained_max is shown in notes for info
     # but never enforced.
     trained_max = int(profile.get("context_length", 0) or 0)
-    ctx_tiers = (262144, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 12288, 8192, 4096)
+    if unified:
+        # Conservative first-run caps for Apple Silicon (user can raise later).
+        if vram < 10:
+            ctx_tiers = (8192, 4096)
+        elif vram < 18:
+            ctx_tiers = (16384, 12288, 8192, 4096)
+        elif vram < 28:
+            ctx_tiers = (32768, 24576, 16384, 8192)
+        else:
+            ctx_tiers = (65536, 49152, 32768, 16384, 8192)
+    else:
+        ctx_tiers = (262144, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 12288, 8192, 4096)
 
     if is_moe and n_layer > 0:
         # Dense share: attention + embeddings + router + LM head. Empirically
@@ -17122,39 +18122,297 @@ def auto_tune(model_path: str, vram_gb: float) -> dict:
         out["num_batch"] = 2048
     elif vram >= 16:
         out["num_batch"] = 1024
-        
+
     # Explicitly lock micro-batch to 512. Higher values on CPU-offloaded MoEs
     # cause massive L3 cache thrashing and RAM bandwidth bottlenecks.
     out["n_ubatch"] = 512
+    out["n_parallel"] = 1
+
+    if unified:
+        if out["num_gpu"] >= 99 or (is_moe and out["n_cpu_moe"] == 0):
+            notes.append("GPU offload: full (-ngl 99) where Metal supports it.")
+        notes.append("parallel sequences: 1 (chat default).")
+        # Soft warning if the GGUF itself is large vs usable unified budget —
+        # do not auto-pick another model; just advise.
+        if size_gb > vram * 0.85:
+            out["quant_downshift"] = (
+                out.get("quant_downshift")
+                or (
+                    f"This GGUF (~{size_gb:.1f} GB) is large for ~{vram:.0f} GB usable "
+                    f"unified memory. Prefer a ~7B–14B Q4 quant (or shorter context) "
+                    f"for responsive Metal inference."
+                )
+            )
 
     out["notes"] = " ".join(notes)
     return out
 
 
-def find_llama_bin() -> str:
-    """Locate llama-server.exe — settings override > env > PATH > known dirs > recursive scan."""
-    s = get_settings()
-    explicit = (s.get("llama_bin") or "").strip()
-    if explicit and safe_exists(explicit):
-        return explicit
-    env = (os.environ.get("ACCURETTA_LLAMA_BIN") or "").strip()
-    if env and safe_exists(env):
-        return env
-    found = shutil.which("llama-server.exe") or shutil.which("llama-server")
-    if found:
-        return found
-    
+# ---- llama-server discovery -------------------------------------------------
+# Structured, platform-aware resolution. UI copy stays separate; callers use
+# basename()/hints for messages. Explicit settings/env paths are never silently
+# replaced by auto-discovery when set (valid or not).
+
+
+def llama_server_basename(platform_name: str | None = None) -> str:
+    """Canonical on-disk name: llama-server.exe on Windows, else llama-server."""
+    plat = (platform_name or sys.platform or "").lower()
+    if plat.startswith("win"):
+        return "llama-server.exe"
+    return "llama-server"
+
+
+def _llama_detected_platform(platform_name: str | None = None) -> str:
+    plat = (platform_name or sys.platform or "").lower()
+    if plat.startswith("win"):
+        return "windows"
+    if plat == "darwin":
+        return "macos"
+    if plat.startswith("linux"):
+        return "linux"
+    return plat or "unknown"
+
+
+def _llama_architecture(machine: str | None = None) -> str:
+    try:
+        import platform as _plat
+        return (machine or _plat.machine() or "").strip() or "unknown"
+    except Exception:
+        return (machine or "unknown").strip() or "unknown"
+
+
+def validate_llama_executable(path: str | Path | None) -> dict:
+    """Check that path exists, is a file, and is executable. Never raises."""
+    raw = (str(path) if path is not None else "").strip()
+    if not raw:
+        return {
+            "path": "",
+            "validation": "unset",
+            "ok": False,
+            "error": "no path configured",
+        }
+    try:
+        # Use abspath (no symlink follow). Homebrew's /opt/homebrew/bin/llama-server
+        # symlink answers --version quickly; the resolved Cellar target can hang.
+        p = Path(os.path.abspath(os.path.expanduser(raw)))
+        resolved = str(p)
+        if not p.exists():
+            return {
+                "path": resolved,
+                "validation": "missing",
+                "ok": False,
+                "error": f"not found: {resolved}",
+            }
+        # is_file() is False for broken symlinks; True for symlink-to-file.
+        if not p.is_file():
+            return {
+                "path": resolved,
+                "validation": "not_file",
+                "ok": False,
+                "error": f"not a file: {resolved}",
+            }
+        # Windows: existence of a regular file is enough (PATHEXT / .exe).
+        # POSIX: require the executable bit (covers Homebrew symlinks).
+        if os.name != "nt" and not os.access(resolved, os.X_OK):
+            return {
+                "path": resolved,
+                "validation": "not_executable",
+                "ok": False,
+                "error": f"not executable: {resolved}",
+            }
+        return {
+            "path": resolved,
+            "validation": "ok",
+            "ok": True,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "path": raw,
+            "validation": "missing",
+            "ok": False,
+            "error": str(e),
+        }
+
+
+# path -> (mtime_ns or -1, version_or_None). Avoids re-running --version on
+# every settings read / launch attempt.
+_LLAMA_VERSION_CACHE: dict[str, tuple[int, str | None]] = {}
+
+
+def probe_llama_version(
+    path: str,
+    timeout: float = 1.0,
+    *,
+    run: Any = None,
+) -> str | None:
+    """Best-effort `llama-server --version`. Never hangs startup; never raises."""
+    if not path:
+        return None
+    mtime_ns = -1
+    try:
+        mtime_ns = int(Path(path).stat().st_mtime_ns)
+    except Exception:
+        pass
+    cached = _LLAMA_VERSION_CACHE.get(path)
+    if cached and cached[0] == mtime_ns:
+        return cached[1]
+
+    runner = run or subprocess.run
+    version: str | None = None
+    try:
+        kwargs: dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "timeout": max(0.2, float(timeout)),
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        r = runner([path, "--version"], **kwargs)
+        out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+        if out:
+            # First non-empty line, capped for API/UI safety.
+            for line in out.splitlines():
+                line = line.strip()
+                if line:
+                    version = line[:300]
+                    break
+    except subprocess.TimeoutExpired:
+        print(f"[llama] --version timed out for {path!r} (continuing without version)", flush=True)
+        version = None
+    except Exception as e:
+        print(f"[llama] --version failed for {path!r}: {e}", flush=True)
+        version = None
+
+    _LLAMA_VERSION_CACHE[path] = (mtime_ns, version)
+    return version
+
+
+def _llama_missing_hint(platform_name: str | None = None) -> str:
+    plat = _llama_detected_platform(platform_name)
+    name = llama_server_basename(platform_name)
+    if plat == "macos":
+        return (
+            f"Install with Homebrew (`brew install llama.cpp`), ensure "
+            f"/opt/homebrew/bin or /usr/local/bin is on PATH, or set llama_bin "
+            f"to your {name} path."
+        )
+    if plat == "linux":
+        return (
+            f"Install llama.cpp, put {name} on PATH, or set llama_bin to the "
+            f"full executable path."
+        )
+    return (
+        f"Install llama.cpp, put {name} on PATH, or set llama_bin in Settings."
+    )
+
+
+def _empty_llama_resolution(
+    *,
+    platform_name: str | None = None,
+    machine: str | None = None,
+    source: str | None = None,
+    validation: str = "unset",
+    path: str = "",
+    error: str | None = None,
+) -> dict:
+    plat = _llama_detected_platform(platform_name)
+    return {
+        "path": path or "",
+        "detected_platform": plat,
+        "architecture": _llama_architecture(machine),
+        "version": None,
+        "source": source,
+        "validation": validation,
+        "basename": llama_server_basename(platform_name),
+        "error": error,
+        "hint": _llama_missing_hint(platform_name) if validation != "ok" else None,
+    }
+
+
+def _finalize_llama_candidate(
+    path: str,
+    source: str,
+    *,
+    platform_name: str | None = None,
+    machine: str | None = None,
+    probe_version: bool = True,
+    version_timeout: float = 2.0,
+    version_runner: Any = None,
+) -> dict:
+    v = validate_llama_executable(path)
+    info = _empty_llama_resolution(
+        platform_name=platform_name,
+        machine=machine,
+        source=source,
+        validation=v["validation"],
+        path=v.get("path") or (path or ""),
+        error=v.get("error"),
+    )
+    if v.get("ok"):
+        info["validation"] = "ok"
+        info["error"] = None
+        info["hint"] = None
+        if probe_version:
+            info["version"] = probe_llama_version(
+                info["path"], timeout=version_timeout, run=version_runner
+            )
+    return info
+
+
+def _well_known_llama_paths(platform_name: str | None = None) -> list[tuple[str, str]]:
+    """(path, source) pairs for platform-specific locations. Order matters."""
+    plat = _llama_detected_platform(platform_name)
+    name = llama_server_basename(platform_name)
+    home = Path.home()
+    out: list[tuple[str, str]] = []
+
+    if plat == "macos":
+        out.extend([
+            ("/opt/homebrew/bin/llama-server", "homebrew"),
+            ("/usr/local/bin/llama-server", "homebrew"),
+        ])
+    elif plat == "linux":
+        out.extend([
+            (f"/usr/local/bin/{name}", "well_known"),
+            (f"/usr/bin/{name}", "well_known"),
+        ])
+
+    # Bundled / downloaded binary next to the app (Windows zip or manual drop).
+    out.append((str(ROOT / "bin" / "llama" / name), "bundled"))
+
+    if plat == "windows":
+        out.extend([
+            (str(home / ".unsloth/llama.cpp/build/bin/Release/llama-server.exe"), "well_known"),
+            (str(home / ".unsloth/llama.cpp/build/bin/llama-server.exe"), "well_known"),
+            (str(home / ".docker/bin/inference/llama-server.exe"), "well_known"),
+            (str(home / "llama.cpp/build/bin/Release/llama-server.exe"), "well_known"),
+            (str(home / "llama.cpp/llama-server.exe"), "well_known"),
+            (r"C:\llama.cpp\build\bin\Release\llama-server.exe", "well_known"),
+            (r"C:\llama.cpp\llama-server.exe", "well_known"),
+        ])
+    else:
+        # Source builds — check bin paths directly (rglob ignores "build" dirs).
+        out.extend([
+            (str(home / "llama.cpp/build/bin" / name), "well_known"),
+            (str(home / "llama.cpp" / name), "well_known"),
+            (str(home / ".unsloth/llama.cpp/build/bin" / name), "well_known"),
+        ])
+    return out
+
+
+def _scan_llama_bin_candidates(platform_name: str | None = None) -> list[str]:
+    """Shallow recursive scan of common user folders for the platform basename."""
+    name = llama_server_basename(platform_name)
     home = Path.home()
     search_roots = [
         ROOT,
         home / "Downloads",
         home / "Desktop",
         home / "Documents",
-        Path("C:/llama.cpp"),
     ]
-    
-    # Scan other drive letters for common top-level llama folders
-    if os.name == "nt":
+    if _llama_detected_platform(platform_name) == "windows":
+        search_roots.append(Path("C:/llama.cpp"))
         for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
             drive = Path(f"{letter}:\\")
             if safe_exists(drive):
@@ -17162,47 +18420,201 @@ def find_llama_bin() -> str:
                     cand = drive / candidate_folder
                     if safe_exists(cand) and safe_is_dir(cand):
                         search_roots.append(cand)
-                        
-    seen_roots = set()
-    valid_roots = []
-    for r in search_roots:
+
+    seen: set[str] = set()
+    found: list[str] = []
+    for root in search_roots:
         try:
-            r_abs = str(r.resolve())
-            if r_abs not in seen_roots and safe_exists(r) and safe_is_dir(r):
-                seen_roots.add(r_abs)
-                valid_roots.append(r)
+            r_abs = str(root.resolve())
+            if r_abs in seen or not safe_exists(root) or not safe_is_dir(root):
+                continue
+            seen.add(r_abs)
         except Exception:
             continue
-            
-    pattern = "llama-server.exe" if os.name == "nt" else "llama-server"
-    for root in valid_roots:
-        depth = 3
         try:
-            matches = safe_rglob_files(root, pattern, max_depth=depth)
-            if matches:
-                # Prioritize Release builds
-                for m in matches:
-                    if "release" in str(m).lower():
-                        return str(m.resolve())
-                return str(matches[0].resolve())
+            matches = safe_rglob_files(root, name, max_depth=3)
+            # Prefer Release builds when present.
+            ordered = sorted(
+                matches,
+                key=lambda m: (0 if "release" in str(m).lower() else 1, str(m).lower()),
+            )
+            for m in ordered:
+                try:
+                    # abspath: keep symlinks (see validate_llama_executable).
+                    found.append(os.path.abspath(str(m)))
+                except Exception:
+                    found.append(str(m))
         except Exception:
             continue
-            
-    candidates = [
-        home / ".unsloth/llama.cpp/build/bin/Release/llama-server.exe",
-        home / ".unsloth/llama.cpp/build/bin/llama-server.exe",
-        home / ".docker/bin/inference/llama-server.exe",
-        home / "llama.cpp/build/bin/Release/llama-server.exe",
-        home / "llama.cpp/llama-server.exe",
-        Path("C:/llama.cpp/build/bin/Release/llama-server.exe"),
-        Path("C:/llama.cpp/llama-server.exe"),
-    ]
-    for c in candidates:
-        if safe_exists(c):
-            return str(c)
-            
+    return found
+
+
+def resolve_llama_bin(
+    *,
+    settings_bin: str | None = None,
+    env_bin: str | None = None,
+    which: Any = None,
+    platform_name: str | None = None,
+    machine: str | None = None,
+    probe_version: bool = True,
+    version_timeout: float = 2.0,
+    version_runner: Any = None,
+    skip_scan: bool = False,
+) -> dict:
+    """Resolve llama-server with structured metadata.
+
+    Priority:
+      1. Explicit settings.llama_bin (never auto-replaced when set)
+      2. ACCURETTA_LLAMA_BIN (never auto-replaced when set)
+      3. shutil.which(canonical name) [Windows also tries .exe / bare]
+      4. Homebrew / well-known / bundled paths
+      5. Shallow folder scan
+
+    Always returns a dict with path, detected_platform, architecture, version,
+    source, validation, basename, error, hint.
+    """
+    which_fn = which or shutil.which
+    plat_key = platform_name or sys.platform
+    basename = llama_server_basename(plat_key)
+
+    if settings_bin is None:
+        try:
+            settings_bin = (get_settings().get("llama_bin") or "").strip()
+        except Exception:
+            settings_bin = ""
+    else:
+        settings_bin = (settings_bin or "").strip()
+
+    if env_bin is None:
+        env_bin = (os.environ.get("ACCURETTA_LLAMA_BIN") or "").strip()
+    else:
+        env_bin = (env_bin or "").strip()
+
+    # 1) Explicit settings — honor even when invalid (do not silently replace).
+    if settings_bin:
+        return _finalize_llama_candidate(
+            settings_bin,
+            "settings",
+            platform_name=plat_key,
+            machine=machine,
+            probe_version=probe_version,
+            version_timeout=version_timeout,
+            version_runner=version_runner,
+        )
+
+    # 2) Environment override — same exclusivity.
+    if env_bin:
+        return _finalize_llama_candidate(
+            env_bin,
+            "env",
+            platform_name=plat_key,
+            machine=machine,
+            probe_version=probe_version,
+            version_timeout=version_timeout,
+            version_runner=version_runner,
+        )
+
+    # 3) PATH
+    path_candidates: list[str] = []
+    if _llama_detected_platform(plat_key) == "windows":
+        for n in ("llama-server.exe", "llama-server"):
+            try:
+                hit = which_fn(n)
+            except Exception:
+                hit = None
+            if hit:
+                path_candidates.append(hit)
+    else:
+        try:
+            hit = which_fn(basename)
+        except Exception:
+            hit = None
+        if hit:
+            path_candidates.append(hit)
+
+    seen_paths: set[str] = set()
+    for cand in path_candidates:
+        info = _finalize_llama_candidate(
+            cand,
+            "path",
+            platform_name=plat_key,
+            machine=machine,
+            probe_version=probe_version,
+            version_timeout=version_timeout,
+            version_runner=version_runner,
+        )
+        if info["validation"] == "ok":
+            return info
+        seen_paths.add(info["path"] or cand)
+
+    # 4) Well-known / Homebrew / bundled
+    for cand, source in _well_known_llama_paths(plat_key):
+        key = str(Path(cand))
+        if key in seen_paths:
+            continue
+        info = _finalize_llama_candidate(
+            cand,
+            source,
+            platform_name=plat_key,
+            machine=machine,
+            probe_version=probe_version,
+            version_timeout=version_timeout,
+            version_runner=version_runner,
+        )
+        seen_paths.add(info["path"] or cand)
+        if info["validation"] == "ok":
+            return info
+
+    # 5) Shallow scan
+    if not skip_scan:
+        for cand in _scan_llama_bin_candidates(plat_key):
+            if cand in seen_paths:
+                continue
+            info = _finalize_llama_candidate(
+                cand,
+                "scan",
+                platform_name=plat_key,
+                machine=machine,
+                probe_version=probe_version,
+                version_timeout=version_timeout,
+                version_runner=version_runner,
+            )
+            if info["validation"] == "ok":
+                return info
+
+    return _empty_llama_resolution(
+        platform_name=plat_key,
+        machine=machine,
+        source=None,
+        validation="missing",
+        path="",
+        error=f"{basename} not found",
+    )
+
+
+def find_llama_bin() -> str:
+    """Compatibility wrapper: absolute path of a validated llama-server, or "".
+
+    Skips --version probing so PATH/Homebrew checks stay cheap at startup.
+    """
+    info = resolve_llama_bin(probe_version=False)
+    if info.get("validation") == "ok" and info.get("path"):
+        return info["path"]
     return ""
 
+
+def _llama_bin_error_message(info: dict | None = None) -> str:
+    info = info or resolve_llama_bin(probe_version=False)
+    name = info.get("basename") or llama_server_basename()
+    if info.get("source") in ("settings", "env") and info.get("path"):
+        detail = info.get("error") or f"invalid {name}"
+        return (
+            f"Configured {name} is not usable ({detail}). "
+            f"{info.get('hint') or _llama_missing_hint()}"
+        )
+    return (
+        f"{name} not found. {info.get('hint') or _llama_missing_hint()}"
+    )
 
 
 def _parse_llama_port() -> int:
@@ -17408,6 +18820,204 @@ def find_all_gguf_files() -> list[dict]:
 
 
 
+# ---- llama-server lifecycle observability ---------------------------------
+# Structured states for startup / generation / teardown. Safe diagnostics only
+# (no prompt bodies, secrets, full env, or absolute home paths unless debug).
+
+LLAMA_LIFECYCLE_STATES = (
+    "not_configured",
+    "validating_binary",
+    "starting",
+    "loading_model",
+    "waiting_for_ready",
+    "ready",
+    "generating",
+    "stopping",
+    "stopped",
+    "exited_unexpectedly",
+    "startup_failed",
+    "generation_failed",
+    "timed_out",
+)
+
+_LLAMA_LOG_MAX_LINES = 800
+_LLAMA_LOG_MAX_LINE_CHARS = 2000
+_LLAMA_LOG_FLOOD_PER_SEC = 200
+
+
+def _llama_debug_logging() -> bool:
+    return os.environ.get("ACCURETTA_DEBUG_LLAMA", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _llama_gen_idle_timeout_s() -> float:
+    try:
+        # Floor is 1s so tests can set short stalls; production default is 120s.
+        return max(1.0, float(os.environ.get("ACCURETTA_LLAMA_GEN_IDLE_TIMEOUT") or 120))
+    except Exception:
+        return 120.0
+
+
+def _llama_gen_wall_timeout_s() -> float:
+    try:
+        # Floor is 1s (not 30s) so ACCURETTA_LLAMA_GEN_MAX_S can be shortened in tests.
+        return max(1.0, float(os.environ.get("ACCURETTA_LLAMA_GEN_MAX_S") or 600))
+    except Exception:
+        return 600.0
+
+
+def _redact_llama_text(text: str, *, model_path: str = "") -> str:
+    """Strip sensitive absolute paths from llama logs / launch lines."""
+    if not text:
+        return text
+    if _llama_debug_logging():
+        return text
+    out = text
+    try:
+        home = str(Path.home().resolve())
+        if home and home not in ("/", ""):
+            out = out.replace(home, "~")
+    except Exception:
+        pass
+    if model_path:
+        try:
+            mp = str(Path(model_path).resolve(strict=False))
+            base = Path(model_path).name
+            if mp:
+                out = out.replace(mp, f"<model:{base}>")
+            parent = str(Path(model_path).resolve(strict=False).parent)
+            if parent and parent not in ("/", ""):
+                out = out.replace(parent, "<model_dir>")
+        except Exception:
+            pass
+    # Collapse remaining /Users/... or /home/... segments that look private.
+    out = re.sub(r"(?i)(/Users|/home)/[^/\s\"']+", r"\1/<user>", out)
+    return out
+
+
+class LlamaStreamError(RuntimeError):
+    """Stream aborted because llama-server died or failed mid-generation."""
+
+    def __init__(self, message: str, *, code: str = "generation_failed"):
+        super().__init__(message)
+        self.code = code
+
+
+class LlamaStreamTimeout(LlamaStreamError):
+    def __init__(self, message: str, *, waiting_for: str = "next SSE chunk"):
+        super().__init__(message, code="timed_out")
+        self.waiting_for = waiting_for
+
+
+def iter_llama_sse(resp, *, idle_timeout: float, wall_timeout: float,
+                   cancel_ev: threading.Event | None = None,
+                   proc_alive: Any = None):
+    """Iterate SSE bytes with idle/wall timeouts and process-liveness checks.
+
+    Uses a helper thread + join timeout so wall/idle limits are enforced even
+    when the HTTP client ignores socket timeouts on a busy endless stream.
+    Closing `resp` unblocks a stuck reader.
+    """
+    idle_timeout = max(1.0, float(idle_timeout))
+    # Wall may be shorter than idle (e.g. tests exercising overall generation max).
+    wall_timeout = max(1.0, float(wall_timeout))
+    deadline = time.monotonic() + wall_timeout
+    sock = None
+    try:
+        fp = getattr(resp, "fp", None)
+        raw = getattr(fp, "raw", None) if fp is not None else None
+        sock = getattr(raw, "_sock", None) if raw is not None else None
+    except Exception:
+        sock = None
+    stream_iter = iter(resp)
+    _NEXT = object()
+    _STOP = object()
+
+    def _read_next(box: list):
+        try:
+            box.append(next(stream_iter))
+        except StopIteration:
+            box.append(_STOP)
+        except Exception as e:
+            box.append(e)
+
+    while True:
+        if cancel_ev is not None and cancel_ev.is_set():
+            return
+        if callable(proc_alive) and not proc_alive():
+            raise LlamaStreamError(
+                "llama-server exited during generation",
+                code="exited_unexpectedly",
+            )
+        remaining_wall = deadline - time.monotonic()
+        if remaining_wall <= 0:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise LlamaStreamTimeout(
+                f"generation exceeded {wall_timeout:.0f}s wall timeout",
+                waiting_for="generation to finish",
+            )
+        slice_s = min(idle_timeout, remaining_wall)
+        if sock is not None:
+            try:
+                sock.settimeout(slice_s)
+            except Exception:
+                pass
+        box: list = []
+        t = threading.Thread(target=_read_next, args=(box,), daemon=True)
+        t.start()
+        t.join(timeout=slice_s)
+        if t.is_alive() or not box:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            # Distinguish idle stall vs overall wall clock.
+            if time.monotonic() >= deadline:
+                raise LlamaStreamTimeout(
+                    f"generation exceeded {wall_timeout:.0f}s wall timeout",
+                    waiting_for="generation to finish",
+                )
+            raise LlamaStreamTimeout(
+                f"stalled {slice_s:.0f}s waiting for next token/SSE chunk",
+                waiting_for="next SSE chunk from llama-server",
+            )
+        item = box[0]
+        if item is _STOP:
+            return
+        if isinstance(item, Exception):
+            e = item
+            name = type(e).__name__
+            err_l = str(e).lower()
+            if cancel_ev is not None and cancel_ev.is_set():
+                return
+            if (
+                "timeout" in name.lower()
+                or "timed out" in err_l
+                or isinstance(e, TimeoutError)
+                or isinstance(e, socket.timeout)
+            ):
+                raise LlamaStreamTimeout(
+                    f"stalled {slice_s:.0f}s waiting for next token/SSE chunk",
+                    waiting_for="next SSE chunk from llama-server",
+                ) from e
+            if callable(proc_alive) and not proc_alive():
+                raise LlamaStreamError(
+                    "llama-server exited during generation",
+                    code="exited_unexpectedly",
+                ) from e
+            raise e
+        chunk = item
+        if not chunk:
+            return
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", errors="replace")
+        yield chunk
+
+
 class LlamaProcess:
     """Single llama-server subprocess; thread-safe start / stop / swap-model.
 
@@ -17466,6 +19076,31 @@ class LlamaProcess:
         self._log_lines: list[str] = []
         self._log_lock = threading.Lock()
         self._log_reader: Optional[threading.Thread] = None
+        self._log_flood_count = 0
+        self._log_flood_window = 0.0
+        self._log_flood_suppressed = 0
+        # Structured lifecycle observability.
+        self._state = "not_configured"
+        self._waiting_for = ""
+        self._diag: dict[str, Any] = {
+            "discovery_source": None,
+            "platform": sys.platform,
+            "architecture": (os.environ.get("ACCURETTA_FAKE_ARCH") or __import__("platform").machine()),
+            "llama_version": None,
+            "port": None,
+            "startup_s": None,
+            "readiness_s": None,
+            "exit_code": None,
+            "termination_reason": None,
+            "metal_build": None,
+            "metal_offload": None,
+            "model_basename": None,
+            "pid": None,
+        }
+        self._t_start: float | None = None
+        self._t_spawn: float | None = None
+        self._generating = 0
+        self._pgid: int | None = None
 
     def loaded_model(self) -> str:
         with self._lock:
@@ -17483,21 +19118,148 @@ class LlamaProcess:
         with self._lock:
             return self._proc is not None and self._proc.poll() is None
 
+    def lifecycle_snapshot(self) -> dict:
+        """Safe diagnostics for API / SSE — no secrets or absolute home paths."""
+        with self._lock:
+            state = self._state
+            waiting = self._waiting_for
+            diag = dict(self._diag)
+            running = self._proc is not None and self._proc.poll() is None
+            pid = self._proc.pid if self._proc is not None else diag.get("pid")
+            exit_code = diag.get("exit_code")
+            if self._proc is not None and self._proc.poll() is not None:
+                exit_code = self._proc.returncode
+        return {
+            "state": state,
+            "waiting_for": waiting,
+            "running": running,
+            "pid": pid,
+            "diagnostics": diag,
+            "exit_code": exit_code,
+        }
+
+    def _set_state(self, state: str, *, waiting_for: str = "",
+                   termination_reason: str | None = None,
+                   broadcast: bool = True, log: bool = True, **diag_updates) -> None:
+        if state not in LLAMA_LIFECYCLE_STATES:
+            state = "startup_failed"
+        with self._lock:
+            self._state = state
+            self._waiting_for = waiting_for or ""
+            if termination_reason is not None:
+                self._diag["termination_reason"] = termination_reason
+            for k, v in diag_updates.items():
+                if k in self._diag or k in (
+                    "discovery_source", "platform", "architecture", "llama_version",
+                    "port", "startup_s", "readiness_s", "exit_code",
+                    "termination_reason", "metal_build", "metal_offload",
+                    "model_basename", "pid",
+                ):
+                    self._diag[k] = v
+            snap = {
+                "state": self._state,
+                "waiting_for": self._waiting_for,
+                "diagnostics": dict(self._diag),
+            }
+        if log:
+            msg = f"[llama:lifecycle] state={state}"
+            if waiting_for:
+                msg += f" waiting_for={waiting_for!r}"
+            if termination_reason:
+                msg += f" reason={termination_reason!r}"
+            print(msg, flush=True)
+        if broadcast:
+            try:
+                broadcast_event({"type": "llama:lifecycle", **snap})
+            except Exception:
+                pass
+
+    def begin_generation(self) -> None:
+        with self._lock:
+            self._generating += 1
+            if self._state in ("ready", "generating"):
+                self._state = "generating"
+                self._waiting_for = "SSE tokens from llama-server"
+        try:
+            broadcast_event({
+                "type": "llama:lifecycle",
+                "state": "generating",
+                "waiting_for": "SSE tokens from llama-server",
+                "diagnostics": dict(self._diag),
+            })
+        except Exception:
+            pass
+
+    def end_generation(self, *, failed: bool = False, timed_out: bool = False,
+                       reason: str = "") -> None:
+        with self._lock:
+            self._generating = max(0, self._generating - 1)
+            still = self._generating > 0
+            running = self._proc is not None and self._proc.poll() is None
+        if timed_out:
+            self._set_state("timed_out", waiting_for="", termination_reason=reason or "generation idle/wall timeout")
+            if running:
+                self._set_state("ready", waiting_for="")
+            return
+        if failed:
+            self._set_state(
+                "generation_failed",
+                waiting_for="",
+                termination_reason=reason or "generation failed",
+            )
+            if running:
+                self._set_state("ready", waiting_for="")
+            return
+        if still:
+            self._set_state("generating", waiting_for="SSE tokens from llama-server")
+        elif running:
+            self._set_state("ready", waiting_for="")
+
     def _append_log(self, line: str) -> None:
+        now = time.monotonic()
         with self._log_lock:
-            self._log_lines.append(line)
-            if len(self._log_lines) > 800:
-                del self._log_lines[:-800]
+            if now - self._log_flood_window >= 1.0:
+                if self._log_flood_suppressed:
+                    self._log_lines.append(
+                        f"[accuretta] suppressed {self._log_flood_suppressed} flood log lines"
+                    )
+                self._log_flood_window = now
+                self._log_flood_count = 0
+                self._log_flood_suppressed = 0
+            self._log_flood_count += 1
+            if self._log_flood_count > _LLAMA_LOG_FLOOD_PER_SEC:
+                self._log_flood_suppressed += 1
+                return
+            text = (line or "").rstrip("\r\n")
+            if len(text) > _LLAMA_LOG_MAX_LINE_CHARS:
+                text = text[:_LLAMA_LOG_MAX_LINE_CHARS] + "…"
+            text = _redact_llama_text(text, model_path=self._loaded_model)
+            # Infer loading phase from llama.cpp chatter (macOS Metal diagnostics).
+            low = text.lower()
+            if "metal" in low or "ggml-metal" in low:
+                self._diag["metal_build"] = True
+            if "offloading" in low or "offloaded" in low or "ngl" in low:
+                if "metal" in low or "gpu" in low:
+                    self._diag["metal_offload"] = True
+            if self._state in ("starting", "loading_model", "waiting_for_ready"):
+                if any(x in low for x in ("loading model", "load_tensors", "mmap", "metal")):
+                    if self._state == "starting":
+                        self._state = "loading_model"
+                        self._waiting_for = "model weights to load into memory"
+            self._log_lines.append(text)
+            if len(self._log_lines) > _LLAMA_LOG_MAX_LINES:
+                del self._log_lines[:-_LLAMA_LOG_MAX_LINES]
 
     def _start_log_reader(self, proc: "subprocess.Popen") -> None:
         # Drain the child's combined stdout/stderr into the ring buffer. Daemon
-        # thread; ends on EOF when the process exits or is respawned.
+        # thread; ends on EOF when the process exits or is respawned. Combined
+        # pipe avoids stdout/stderr deadlock.
         def _pump():
             try:
                 if not proc.stdout:
                     return
                 for raw in iter(proc.stdout.readline, ""):
-                    self._append_log(raw.rstrip("\r\n"))
+                    self._append_log(raw)
             except Exception:
                 pass
         t = threading.Thread(target=_pump, name="llama-log", daemon=True)
@@ -17507,28 +19269,81 @@ class LlamaProcess:
     def read_log(self, tail: int = 400) -> dict:
         running = self.is_running()
         model = self.loaded_model()
+        base = Path(model).name if model else ""
         with self._log_lock:
             lines = list(self._log_lines[-tail:])
-        return {"running": running, "model": model, "lines": lines}
+        snap = self.lifecycle_snapshot()
+        return {
+            "running": running,
+            "model": base if not _llama_debug_logging() else model,
+            "lines": lines,
+            "lifecycle": snap,
+        }
+
+    def _terminate_child(self, p: "subprocess.Popen", timeout: float = 5.0,
+                         reason: str = "stopped") -> None:
+        if not p:
+            return
+        try:
+            if sys.platform != "win32":
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+            else:
+                p.terminate()
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if sys.platform != "win32":
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                else:
+                    p.kill()
+                try:
+                    p.wait(timeout=2.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for stream in (getattr(p, "stdout", None), getattr(p, "stderr", None)):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                pass
+        with self._lock:
+            self._diag["exit_code"] = p.poll()
+            self._diag["termination_reason"] = reason
+            self._pgid = None
 
     def stop(self, timeout: float = 5.0) -> bool:
+        global _METAL_RUNTIME_SELECTED, _HW_SPECS_CACHE
+        self._set_state("stopping", waiting_for="llama-server process to exit",
+                        termination_reason="user_or_bridge_stop", broadcast=True)
         with self._lock:
             p = self._proc
             self._proc = None
             self._loaded_model = ""
             self._loaded_mmproj = ""
+            self._generating = 0
         _llama_props_ctx_invalidate()
+        _METAL_RUNTIME_SELECTED = False
+        _HW_SPECS_CACHE = None
         if not p:
+            self._set_state("stopped", termination_reason="already_stopped")
             return True
-        try:
-            p.terminate()
-            try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait(timeout=2.0)
-        except Exception:
-            pass
+        self._terminate_child(p, timeout=timeout, reason="stopped")
+        self._set_state("stopped", termination_reason="stopped")
         return True
 
     # ---- watchdog --------------------------------------------------------
@@ -17610,6 +19425,20 @@ class LlamaProcess:
             return  # never had a successful start to remember
         if self.is_running():
             return  # process is fine
+
+        # Process is dead unexpectedly (unless we were stopping).
+        with self._lock:
+            prior = self._state
+            code = None
+            if self._proc is not None:
+                code = self._proc.poll()
+        if prior not in ("stopping", "stopped", "startup_failed", "not_configured"):
+            self._set_state(
+                "exited_unexpectedly",
+                waiting_for="",
+                termination_reason="process_died",
+                exit_code=code,
+            )
 
         # Process is dead. Apply the circuit breaker.
         now = time.time()
@@ -17705,14 +19534,46 @@ class LlamaProcess:
         # counts toward the crash limit (otherwise the breaker never trips).
         if not _from_watchdog:
             self.reset_circuit_breaker()
-        bin_path = find_llama_bin()
+        self._t_start = time.perf_counter()
+        self._set_state(
+            "validating_binary",
+            waiting_for="llama-server executable discovery",
+            platform=sys.platform,
+            architecture=__import__("platform").machine(),
+            model_basename=Path(model_path).name if model_path else None,
+        )
+        # Resolve path without blocking on --version; probe once afterward.
+        resolved = resolve_llama_bin(probe_version=False)
+        bin_path = resolved["path"] if resolved.get("validation") == "ok" else ""
         if not bin_path:
-            return {"ok": False, "error": "llama-server.exe not found. Set llama_bin in Settings or install llama.cpp."}
+            self._set_state(
+                "not_configured",
+                waiting_for="",
+                termination_reason="binary_not_found",
+                discovery_source=resolved.get("source"),
+            )
+            return {"ok": False, "error": _llama_bin_error_message(resolved)}
+        version = probe_llama_version(bin_path, timeout=1.0)
+        resolved["version"] = version
+        self._set_state(
+            "validating_binary",
+            waiting_for="llama-server --version probe",
+            discovery_source=resolved.get("source"),
+            llama_version=version,
+        )
+        src = resolved.get("source")
+        bin_disp = Path(bin_path).name if not _llama_debug_logging() else bin_path
+        if version:
+            print(f"[llama] using {bin_disp} ({src}) — {version}", flush=True)
+        else:
+            print(f"[llama] using {bin_disp} ({src})", flush=True)
         if not model_path or not safe_exists(model_path):
-            return {"ok": False, "error": f"model not found: {model_path}"}
+            self._set_state("startup_failed", termination_reason="model_not_found")
+            return {"ok": False, "error": "model not found"}
 
         s = get_settings()
         port = port_override if port_override > 0 else _parse_llama_port()
+        self._diag["port"] = port
         # Cap ctx to keep KV cache from blowing past VRAM. A 256k ctx with f16
         # KV on a 16-attn-head model burns ~16 GiB by itself, leaving nothing
         # for the weights and forcing layer offload to system RAM. 32k is a
@@ -17813,7 +19674,26 @@ class LlamaProcess:
         # If something *else* is squatting on the port (e.g. user launched
         # llama-server manually before bridge), refuse rather than fight it.
         if llama_ping(timeout=0.8, base_url=f"http://127.0.0.1:{port}"):
+            self._set_state("startup_failed", termination_reason="port_in_use", port=port)
             return {"ok": False, "error": f"port {port} already in use by another llama-server. Stop it first."}
+
+        self._set_state(
+            "starting",
+            waiting_for="llama-server process spawn",
+            port=port,
+            discovery_source=resolved.get("source"),
+            llama_version=version,
+            model_basename=Path(model_path).name,
+        )
+
+        # Metal build evidence (cheap probe; does not claim offload is active yet).
+        metal_build = None
+        try:
+            probed = probe_llama_devices(bin_path, timeout=2.0)
+            metal_build = bool(probed.get("metal_llama_build"))
+            self._diag["metal_build"] = metal_build
+        except Exception:
+            pass
 
         cmd = [
             bin_path,
@@ -17903,43 +19783,46 @@ class LlamaProcess:
                 cmd += shlex.split(extra_args_raw, posix=False)
             except Exception:
                 cmd += extra_args_raw.split()
-        # Log the exact command before spawning so flag-rename / unknown-flag
-        # crashes are debuggable. On Windows llama-server runs in a separate
-        # CREATE_NEW_CONSOLE window that closes the instant llama-server exits,
-        # which is faster than a human can read — having the cmd here lets the
-        # user paste it into their own PowerShell and see the real error.
+        # Log a redacted launch line (full paths only when ACCURETTA_DEBUG_LLAMA=1).
         try:
             import shlex as _shlex
-            print(f"[llama] launch: {_shlex.join(cmd) if hasattr(_shlex, 'join') else ' '.join(cmd)}")
+            launch_s = _shlex.join(cmd) if hasattr(_shlex, "join") else " ".join(cmd)
         except Exception:
-            print(f"[llama] launch: {cmd}")
+            launch_s = str(cmd)
+        launch_s = _redact_llama_text(launch_s, model_path=model_path)
+        print(f"[llama] launch: {launch_s}", flush=True)
         try:
-            creationflags = 0
-            # Always run windowless and capture stdout+stderr so the backend's
-            # load progress and errors surface in the app's Backend tab, instead
-            # of a hidden (desktop app) or stray (browser mode) console window.
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            popen_kwargs: dict[str, Any] = {
+                "cwd": str(Path(bin_path).parent),
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,  # single pipe — avoids stdout/stderr deadlock
+                "bufsize": 1,
+                "encoding": "utf-8",
+                "errors": "replace",
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            else:
+                # New session ⇒ process group; stop() can killpg the whole tree.
+                popen_kwargs["start_new_session"] = True
             with self._log_lock:
                 self._log_lines.clear()
-            self._append_log("[accuretta] launching: " + " ".join(cmd))
-            p = subprocess.Popen(
-                cmd,
-                cwd=str(Path(bin_path).parent),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=creationflags,
-            )
+                self._log_flood_count = 0
+                self._log_flood_suppressed = 0
+            self._append_log("[accuretta] launching: " + launch_s)
+            self._t_spawn = time.perf_counter()
+            p = subprocess.Popen(cmd, **popen_kwargs)
             self._start_log_reader(p)
         except Exception as e:
+            self._set_state("startup_failed", termination_reason=f"spawn_failed:{e}")
             return {"ok": False, "error": f"spawn failed: {e}"}
 
         with self._lock:
             self._proc = p
             self._loaded_model = model_path
             self._loaded_mmproj = mmproj_path
+            self._diag["pid"] = p.pid
+            self._pgid = p.pid if sys.platform != "win32" else None
         # Remember exactly how to respawn this configuration. The watchdog
         # uses these args verbatim, so any change in user settings between
         # crash and restart is intentionally NOT picked up — we replay the
@@ -17955,22 +19838,113 @@ class LlamaProcess:
         }
         self._ensure_watchdog()
 
+        def _mark_metal_runtime(ok: bool):
+            global _METAL_RUNTIME_SELECTED, _HW_SPECS_CACHE
+            if not ok:
+                _METAL_RUNTIME_SELECTED = False
+                _HW_SPECS_CACHE = None
+                self._diag["metal_offload"] = False
+                return
+            try:
+                hw = detect_hardware_specs(probe_llama=True, use_cache=True)
+                # Selected only when the build exposed MTL* and we requested GPU layers.
+                metal_off = bool(hw.get("metal_llama_build") and ngl != 0)
+                _METAL_RUNTIME_SELECTED = metal_off
+                self._diag["metal_build"] = bool(hw.get("metal_llama_build"))
+                self._diag["metal_offload"] = metal_off
+            except Exception:
+                _METAL_RUNTIME_SELECTED = False
+            _HW_SPECS_CACHE = None  # refresh metal_selected / metal_status for UI
+
+        base_url = f"http://127.0.0.1:{port}"
+        self._set_state(
+            "loading_model",
+            waiting_for="model load (watch Backend log for Metal/mmap progress)",
+        )
+        self._set_state(
+            "waiting_for_ready",
+            waiting_for=f"GET {base_url}/v1/models readiness",
+        )
+
         if not wait:
-            return {"ok": True, "pid": p.pid, "model": model_path,
-                    "ready": False, "mmproj": mmproj_path,
-                    "vision_capable": bool(mmproj_path)}
-        if wait_for_llama(wait_seconds):
-            return {"ok": True, "pid": p.pid, "model": model_path,
-                    "ready": True, "mmproj": mmproj_path,
-                    "vision_capable": bool(mmproj_path)}
+            _mark_metal_runtime(True)
+            # Asynchronous ready: caller/UI polls. Stay in waiting_for_ready.
+            return {"ok": True, "pid": p.pid, "model": Path(model_path).name,
+                    "ready": False, "mmproj": bool(mmproj_path),
+                    "vision_capable": bool(mmproj_path),
+                    "lifecycle": self.lifecycle_snapshot()}
+
+        ready = wait_for_llama(
+            wait_seconds,
+            base_url=base_url,
+            proc=p,
+            on_wait=lambda elapsed: self._set_state(
+                "waiting_for_ready",
+                waiting_for=f"GET {base_url}/v1/models ({elapsed:.1f}s/{wait_seconds}s)",
+                broadcast=False,
+                log=False,
+            ),
+        )
+        startup_s = round(time.perf_counter() - (self._t_start or time.perf_counter()), 3)
+        readiness_s = None
+        if self._t_spawn is not None:
+            readiness_s = round(time.perf_counter() - self._t_spawn, 3)
+        self._diag["startup_s"] = startup_s
+        self._diag["readiness_s"] = readiness_s
+
+        if ready:
+            _mark_metal_runtime(True)
+            self._set_state(
+                "ready",
+                waiting_for="",
+                startup_s=startup_s,
+                readiness_s=readiness_s,
+                metal_build=self._diag.get("metal_build"),
+                metal_offload=self._diag.get("metal_offload"),
+            )
+            return {"ok": True, "pid": p.pid, "model": Path(model_path).name,
+                    "ready": True, "mmproj": bool(mmproj_path),
+                    "vision_capable": bool(mmproj_path),
+                    "lifecycle": self.lifecycle_snapshot()}
         # if we waited but nothing came up, the child likely died
         if p.poll() is not None:
+            code = p.returncode
             with self._lock:
                 self._proc = None
                 self._loaded_model = ""
                 self._loaded_mmproj = ""
-            return {"ok": False, "error": f"llama-server exited (code {p.returncode}) — check the model file or VRAM."}
-        return {"ok": False, "error": "llama-server didn't answer in time. Still loading; check the spawned window."}
+            _mark_metal_runtime(False)
+            self._set_state(
+                "startup_failed",
+                termination_reason="exited_before_ready",
+                exit_code=code,
+                startup_s=startup_s,
+            )
+            return {
+                "ok": False,
+                "error": (
+                    f"llama-server exited before ready (code {code}). "
+                    f"Check Backend log for Metal/model load errors."
+                ),
+                "lifecycle": self.lifecycle_snapshot(),
+            }
+        self._set_state(
+            "timed_out",
+            waiting_for=f"GET {base_url}/v1/models",
+            termination_reason="startup_timeout",
+            startup_s=startup_s,
+            readiness_s=readiness_s,
+        )
+        # Leave process running — it may still finish loading; UI can poll.
+        return {
+            "ok": False,
+            "error": (
+                f"llama-server didn't answer /v1/models within {wait_seconds}s "
+                f"(still waiting for readiness on port {port}). "
+                f"See Backend log for load progress."
+            ),
+            "lifecycle": self.lifecycle_snapshot(),
+        }
 
 
 _llama = LlamaProcess()
@@ -17990,19 +19964,35 @@ def llama_ping(timeout: float = 2.0, base_url: str = None) -> bool:
 
 
 
-def wait_for_llama(wait_seconds: int = 30) -> bool:
-    """Poll llama-server up to wait_seconds. Returns True once it's up."""
-    if llama_ping():
+def wait_for_llama(wait_seconds: int = 30, base_url: str | None = None,
+                   proc: "subprocess.Popen | None" = None,
+                   on_wait: Any = None) -> bool:
+    """Poll llama-server up to wait_seconds. Returns True once it's up.
+
+    Startup timeout is distinct from generation timeouts. If `proc` exits
+    early, returns False immediately (caller classifies startup_failed).
+    """
+    base = base_url or LLAMA
+    if llama_ping(timeout=0.5, base_url=base):
         return True
     t0 = time.time()
     printed = False
     while time.time() - t0 < wait_seconds:
-        time.sleep(0.6)
-        if llama_ping(timeout=1.5):
-            print(f"  llama-server up in {time.time() - t0:.1f}s")
+        if proc is not None and proc.poll() is not None:
+            return False
+        elapsed = time.time() - t0
+        if callable(on_wait):
+            try:
+                on_wait(elapsed)
+            except Exception:
+                pass
+        # Short poll interval — avoid long sleeps when process dies or becomes ready.
+        time.sleep(0.15)
+        if llama_ping(timeout=0.8, base_url=base):
+            print(f"  llama-server up in {time.time() - t0:.1f}s at {base}")
             return True
         if not printed and time.time() - t0 > 2:
-            print(f"  waiting for llama-server at {LLAMA} ...")
+            print(f"  waiting for llama-server readiness at {base} ...")
             printed = True
     return False
 
@@ -18357,10 +20347,10 @@ def main():
             print(f"  [warn] llama-server didn't start: {res.get('error')}")
             print(f"         pick a different model or update settings via the UI.")
     else:
-        bin_path = find_llama_bin()
+        resolved = resolve_llama_bin()
+        bin_path = resolved["path"] if resolved.get("validation") == "ok" else ""
         if not bin_path:
-            print(f"  [warn] llama-server.exe not found.")
-            print(f"         install llama.cpp or set llama_bin in Settings.")
+            print(f"  [warn] {_llama_bin_error_message(resolved)}")
         elif not s_initial.get("models_dir"):
             print(f"  [info] no models folder set yet.")
             print(f"         open Settings -> Models folder, pick where your .gguf files live.")
