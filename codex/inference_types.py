@@ -20,11 +20,15 @@ class CodexInferenceEventType(str, Enum):
     UNAVAILABLE = "unavailable"
     PROTOCOL_ERROR = "protocol_error"
     PROCESS_ERROR = "process_error"
-    # Explicit timeouts — never classify these via ambiguous human strings.
-    TURN_TIMEOUT = "turn_timeout"
+    # Idle watchdog — no meaningful activity for configured idle period.
+    IDLE_TIMEOUT = "idle_timeout"
+    # Optional absolute safety ceiling (independent of activity).
+    MAX_TASK_DURATION = "max_task_duration"
     APPROVAL_TIMEOUT = "approval_timeout"
     # Alias name used in docs / audits (same wire value as PROCESS_ERROR).
     PROCESS_EXIT = "process_error"
+    # Deprecated wall-clock alias → idle timeout wire value.
+    TURN_TIMEOUT = "idle_timeout"
 
 
 @dataclass(frozen=True)

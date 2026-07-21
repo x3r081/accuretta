@@ -3,8 +3,8 @@
 Newly written for Accuretta.
 
 Prefer explicit ``CodexInferenceEventType`` classification. String matching is
-only a defensive fallback for legacy / external errors — and must never map the
-old ambiguous turn-timeout wording to an approval timeout.
+only a defensive fallback for legacy / external errors — and must never map
+timeouts to an approval message unless the type is APPROVAL_TIMEOUT.
 """
 
 from __future__ import annotations
@@ -41,11 +41,17 @@ MSG_UNSUPPORTED_MODEL = (
     "That model is not available for Codex via ChatGPT. "
     "Codex will use its default model on the next try — or pick Local llama.cpp."
 )
-MSG_TIMEOUT = (
-    "Codex did not finish within the configured task timeout. "
-    "The task may still have been processing. Retry it, increase the Codex task "
-    "timeout in Settings, or split the request into smaller steps."
+MSG_IDLE_TIMEOUT = (
+    "Codex stopped producing activity and may be stuck. "
+    "No progress was received during the configured idle period. Retry the task, "
+    "increase the idle timeout, or inspect the Codex logs."
 )
+MSG_MAX_TASK_DURATION = (
+    "Codex reached the configured maximum task duration. "
+    "The task was still active, but Accuretta stopped it at the optional safety limit."
+)
+# Deprecated alias — same copy as idle (old wall-clock wording retired).
+MSG_TIMEOUT = MSG_IDLE_TIMEOUT
 MSG_APPROVAL_TIMEOUT = (
     "The Codex turn timed out while waiting for approval. "
     "Approve or deny the pending request more quickly, or enable Trust writes "
@@ -56,10 +62,11 @@ MSG_APPROVAL_UI = "The approval request could not be displayed."
 MSG_APPROVAL_REJECTED = "Codex rejected the approval response."
 MSG_BUSY = "A Codex turn is already in progress. Wait for it to finish or press Stop."
 
-# Legacy internal string from older builds — must map to general timeout, never approval.
 _LEGACY_AMBIGUOUS_TURN_TIMEOUT = (
     "codex turn timed out while waiting for approval or a reply"
 )
+_LEGACY_WALL_CLOCK = "configured turn timeout"
+_LEGACY_TASK_TIMEOUT = "configured task timeout"
 
 
 def is_invalid_thread_message(message: Optional[str]) -> bool:
@@ -85,8 +92,13 @@ def is_unsupported_model_message(message: Optional[str]) -> bool:
 
 def _message_for_event_type(event_type: CodexInferenceEventType, msg: str) -> Optional[str]:
     """Type-first mapping. Returns None when the type alone is not decisive."""
-    if event_type == CodexInferenceEventType.TURN_TIMEOUT:
-        return MSG_TIMEOUT
+    if event_type in {
+        CodexInferenceEventType.IDLE_TIMEOUT,
+        CodexInferenceEventType.TURN_TIMEOUT,  # deprecated alias
+    }:
+        return MSG_IDLE_TIMEOUT
+    if event_type == CodexInferenceEventType.MAX_TASK_DURATION:
+        return MSG_MAX_TASK_DURATION
     if event_type == CodexInferenceEventType.APPROVAL_TIMEOUT:
         return MSG_APPROVAL_TIMEOUT
     if event_type == CodexInferenceEventType.CANCELLED:
@@ -99,7 +111,6 @@ def _message_for_event_type(event_type: CodexInferenceEventType, msg: str) -> Op
     }:
         return MSG_APP_SERVER_EXITED
     if event_type == CodexInferenceEventType.UNAVAILABLE:
-        # Keep specific messages when present; otherwise generic unavailable.
         cleaned = sanitize_error_message(msg)
         return cleaned or MSG_UNAVAILABLE
     return None
@@ -110,11 +121,16 @@ def _legacy_string_fallback(message: str) -> Optional[str]:
     low = (message or "").lower().strip()
     if not low:
         return None
-    # Old ambiguous turn-timeout copy → general timeout (never approval).
     if _LEGACY_AMBIGUOUS_TURN_TIMEOUT in low:
-        return MSG_TIMEOUT
+        return MSG_IDLE_TIMEOUT
+    if "maximum task duration" in low or "safety limit" in low:
+        return MSG_MAX_TASK_DURATION
+    if "stopped producing activity" in low or "idle period" in low:
+        return MSG_IDLE_TIMEOUT
+    if _LEGACY_WALL_CLOCK in low or _LEGACY_TASK_TIMEOUT in low:
+        return MSG_IDLE_TIMEOUT
     if low in {"codex turn timed out", "turn timed out", "codex timed out"}:
-        return MSG_TIMEOUT
+        return MSG_IDLE_TIMEOUT
     if is_invalid_thread_message(message):
         return MSG_THREAD_INVALID
     if is_unsupported_model_message(message):
@@ -129,16 +145,12 @@ def _legacy_string_fallback(message: str) -> Optional[str]:
         return MSG_APP_SERVER_EXITED
     if "sign in" in low or "authentication" in low:
         return MSG_SIGN_IN_EXPIRED
-    # Real approval-timeout wording only — require approval + timeout without the
-    # legacy ambiguous phrase (already handled above).
     if "approval" in low and ("timed out" in low or "timeout" in low):
-        if "configured turn timeout" in low or "configured task timeout" in low:
-            return MSG_TIMEOUT
-        if "did not finish" in low:
-            return MSG_TIMEOUT
+        if "idle" in low or "did not finish" in low or "maximum task" in low:
+            return MSG_IDLE_TIMEOUT
         return MSG_APPROVAL_TIMEOUT
     if "timed out" in low or "timeout" in low:
-        return MSG_TIMEOUT
+        return MSG_IDLE_TIMEOUT
     return None
 
 
@@ -154,14 +166,19 @@ def user_message_for_codex_error(
         msg = exc.message or ""
         typed = _message_for_event_type(exc.event_type, msg)
         if typed is not None:
-            # PROTOCOL_ERROR still needs finer string handling below.
             if exc.event_type != CodexInferenceEventType.PROTOCOL_ERROR:
                 return typed
         if exc.event_type == CodexInferenceEventType.PROTOCOL_ERROR:
             fallback = _legacy_string_fallback(msg)
             if fallback is not None:
-                # Never blame CLI version for ordinary timeouts.
-                if fallback in {MSG_TIMEOUT, MSG_APPROVAL_TIMEOUT, MSG_BUSY, MSG_THREAD_INVALID, MSG_UNSUPPORTED_MODEL}:
+                if fallback in {
+                    MSG_IDLE_TIMEOUT,
+                    MSG_MAX_TASK_DURATION,
+                    MSG_APPROVAL_TIMEOUT,
+                    MSG_BUSY,
+                    MSG_THREAD_INVALID,
+                    MSG_UNSUPPORTED_MODEL,
+                }:
                     return fallback
             low = msg.lower()
             if "protocol" in low and "version" in low:

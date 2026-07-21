@@ -638,15 +638,29 @@ DEFAULT_SETTINGS = {
     # Codex native write policy for the active workspace (never outside it).
     # chat_only | ask (recommended) | workspace_auto. Shell still requires approval.
     "codex_write_mode": "ask",
-    # Overall Codex task/turn wall-clock timeout (seconds). Separate from the
-    # Approvals UI wait (90s). Range 60–3600; default 15 minutes.
-    "codex_turn_timeout_seconds": 900,
+    # Idle watchdog: stop only after this many seconds with no Codex activity.
+    # Range 60–1800; default 5 minutes. Separate from Approvals UI wait (90s).
+    "codex_idle_timeout_seconds": 300,
+    # Optional absolute safety ceiling (0 = disabled). Range 900–14400 when set.
+    "codex_max_task_duration_seconds": 0,
 }
 
 
 def get_settings() -> dict:
     s = load_json(SETTINGS_FILE, {})
     out = {**DEFAULT_SETTINGS, **(s if isinstance(s, dict) else {})}
+    try:
+        from codex.timeouts import migrate_codex_timeout_settings
+        out, changed = migrate_codex_timeout_settings(out)
+        if changed and isinstance(s, dict):
+            # Persist migration: strip deprecated wall-clock key, write idle/max.
+            disk = dict(s)
+            disk.pop("codex_turn_timeout_seconds", None)
+            disk["codex_idle_timeout_seconds"] = out["codex_idle_timeout_seconds"]
+            disk["codex_max_task_duration_seconds"] = out["codex_max_task_duration_seconds"]
+            save_json(SETTINGS_FILE, disk)
+    except Exception:
+        out.pop("codex_turn_timeout_seconds", None)
     return out
 
 
@@ -16934,16 +16948,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"removed": rc == 0, "output": (out or "").strip()[:400]})
         if p == "/api/settings":
             from codex.approvals import normalize_codex_write_mode
-            from codex.timeouts import normalize_codex_turn_timeout_seconds
+            from codex.timeouts import migrate_codex_timeout_settings
             cur = get_settings()
             prev_write_mode = normalize_codex_write_mode(cur.get("codex_write_mode"))
             cur.update({k: v for k, v in body.items() if k in DEFAULT_SETTINGS})
+            # Drop deprecated wall-clock key if a client still sends it.
+            cur.pop("codex_turn_timeout_seconds", None)
             if "codex_write_mode" in body or "codex_write_mode" in cur:
                 cur["codex_write_mode"] = normalize_codex_write_mode(cur.get("codex_write_mode"))
-            if "codex_turn_timeout_seconds" in body or "codex_turn_timeout_seconds" in cur:
-                cur["codex_turn_timeout_seconds"] = normalize_codex_turn_timeout_seconds(
-                    cur.get("codex_turn_timeout_seconds")
-                )
+            cur, _ = migrate_codex_timeout_settings(cur)
             save_json(SETTINGS_FILE, cur)
             if prev_write_mode != cur.get("codex_write_mode"):
                 try:

@@ -295,7 +295,7 @@ class CodexErrorMessageTest(unittest.TestCase):
         msg = user_message_for_codex_error(
             CodexInferenceError(
                 "Codex did not finish within the configured turn timeout.",
-                event_type=CodexInferenceEventType.TURN_TIMEOUT,
+                event_type=CodexInferenceEventType.IDLE_TIMEOUT,
             )
         )
         self.assertEqual(msg, MSG_TIMEOUT)

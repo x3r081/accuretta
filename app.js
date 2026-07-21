@@ -8663,12 +8663,19 @@
       const mode = s.codex_write_mode || "ask";
       codexWriteSel.value = ["chat_only", "ask", "workspace_auto"].includes(mode) ? mode : "ask";
     }
-    const codexTimeoutSel = $("#set-codex-turn-timeout");
-    if (codexTimeoutSel) {
-      const allowed = ["300", "600", "900", "1800", "3600"];
-      let t = String(s.codex_turn_timeout_seconds ?? 900);
-      if (!allowed.includes(t)) t = "900";
-      codexTimeoutSel.value = t;
+    const codexIdleSel = $("#set-codex-idle-timeout");
+    if (codexIdleSel) {
+      const allowed = ["120", "300", "600", "900", "1800"];
+      let t = String(s.codex_idle_timeout_seconds ?? 300);
+      if (!allowed.includes(t)) t = "300";
+      codexIdleSel.value = t;
+    }
+    const codexMaxSel = $("#set-codex-max-duration");
+    if (codexMaxSel) {
+      const allowed = ["0", "900", "1800", "3600", "7200", "14400"];
+      let t = String(s.codex_max_task_duration_seconds ?? 0);
+      if (!allowed.includes(t)) t = "0";
+      codexMaxSel.value = t;
     }
   }
 
@@ -8753,10 +8760,15 @@
       use_tailwind_cdn: !!state.settings.use_tailwind_cdn,
       ide_multifile: !!state.settings.ide_multifile,
       codex_write_mode: ($("#set-codex-write-mode")?.value || state.settings.codex_write_mode || "ask"),
-      codex_turn_timeout_seconds: Number(
-        $("#set-codex-turn-timeout")?.value
-        || state.settings.codex_turn_timeout_seconds
-        || 900
+      codex_idle_timeout_seconds: Number(
+        $("#set-codex-idle-timeout")?.value
+        || state.settings.codex_idle_timeout_seconds
+        || 300
+      ),
+      codex_max_task_duration_seconds: Number(
+        $("#set-codex-max-duration")?.value
+        ?? state.settings.codex_max_task_duration_seconds
+        ?? 0
       ),
     };
 
@@ -10237,15 +10249,31 @@
         toast("Could not save Codex write mode: " + (err.message || err), "error");
       }
     });
-    $("#set-codex-turn-timeout")?.addEventListener("change", async () => {
-      const sel = $("#set-codex-turn-timeout");
-      const raw = Number(sel?.value || 900);
+    $("#set-codex-idle-timeout")?.addEventListener("change", async () => {
+      const sel = $("#set-codex-idle-timeout");
+      const raw = Number(sel?.value || 300);
       try {
-        await saveSettings({ codex_turn_timeout_seconds: raw });
+        await saveSettings({ codex_idle_timeout_seconds: raw });
         const mins = Math.round(raw / 60);
-        toast(`Codex task timeout: ${mins} minutes`, "ok", 2200);
+        toast(`Codex idle timeout: ${mins} minutes`, "ok", 2200);
       } catch (err) {
-        toast("Could not save Codex task timeout: " + (err.message || err), "error");
+        toast("Could not save Codex idle timeout: " + (err.message || err), "error");
+      }
+    });
+    $("#set-codex-max-duration")?.addEventListener("change", async () => {
+      const sel = $("#set-codex-max-duration");
+      const raw = Number(sel?.value ?? 0);
+      try {
+        await saveSettings({ codex_max_task_duration_seconds: raw });
+        toast(
+          raw > 0
+            ? `Codex max duration: ${raw >= 3600 ? `${raw / 3600} hour${raw > 3600 ? "s" : ""}` : `${Math.round(raw / 60)} minutes`}`
+            : "Codex max duration: disabled",
+          "ok",
+          2200
+        );
+      } catch (err) {
+        toast("Could not save Codex max duration: " + (err.message || err), "error");
       }
     });
     $("#set-provider")?.addEventListener("change", () => {

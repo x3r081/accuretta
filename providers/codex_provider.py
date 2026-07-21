@@ -24,7 +24,10 @@ from codex.inference_types import (
 from codex.process import CodexProcessError
 from codex.protocol import sanitize_error_message
 from codex.session import get_codex_session
-from codex.timeouts import get_codex_turn_timeout_seconds
+from codex.timeouts import (
+    get_codex_idle_timeout_seconds,
+    get_codex_max_task_duration_seconds,
+)
 
 from .base import (
     ApiMode,
@@ -479,7 +482,9 @@ class CodexProvider:
                     CodexInferenceEventType.PROCESS_ERROR,
                     CodexInferenceEventType.AUTHENTICATION_REQUIRED,
                     CodexInferenceEventType.UNAVAILABLE,
+                    CodexInferenceEventType.IDLE_TIMEOUT,
                     CodexInferenceEventType.TURN_TIMEOUT,
+                    CodexInferenceEventType.MAX_TASK_DURATION,
                     CodexInferenceEventType.APPROVAL_TIMEOUT,
                 }:
                     msg = user_message_for_codex_error(
@@ -501,12 +506,14 @@ class CodexProvider:
 
                 def _worker():
                     try:
-                        timeout_s = float(get_codex_turn_timeout_seconds())
+                        idle_s = float(get_codex_idle_timeout_seconds())
+                        hard = get_codex_max_task_duration_seconds()
                         result_box["r"] = svc.run_turn(
                             active_thread,
                             text,
                             on_event=on_event,
-                            timeout_s=timeout_s,
+                            idle_timeout_s=idle_s,
+                            max_duration_s=float(hard) if hard else None,
                         )
                     except Exception as exc:
                         error_box["e"] = exc

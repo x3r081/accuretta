@@ -608,15 +608,31 @@
           <span class="hint">Applies to the active Accuretta workspace only. Paths outside it are always declined. Shell commands still require approval. Changing this starts a fresh Codex thread on the next turn.</span>
         </div>
         <div class="form-row" style="margin-top:10px;">
-          <label for="set-codex-turn-timeout">Codex task timeout</label>
-          <select id="set-codex-turn-timeout" title="Maximum time for one Codex task before Accuretta stops waiting">
-            <option value="300">5 minutes</option>
+          <label for="set-codex-idle-timeout">Codex idle timeout</label>
+          <select id="set-codex-idle-timeout" title="How long Accuretta waits without Codex progress before stopping the task">
+            <option value="120">2 minutes</option>
+            <option value="300">5 minutes (recommended)</option>
             <option value="600">10 minutes</option>
-            <option value="900">15 minutes (recommended)</option>
+            <option value="900">15 minutes</option>
             <option value="1800">30 minutes</option>
-            <option value="3600">60 minutes</option>
           </select>
-          <span class="hint">Limits the total time for one Codex task. Complex coding tasks can take several minutes. Approval dialogs have their own separate timeout.</span>
+          <span class="hint">Stops a task only when Codex produces no progress or protocol activity for this long.</span>
+        </div>
+        <div class="form-row" style="margin-top:10px;">
+          <label for="set-codex-max-duration">Maximum task duration</label>
+          <select id="set-codex-max-duration" title="Optional absolute safety limit for one Codex task">
+            <option value="0">Disabled (recommended)</option>
+            <option value="900">15 minutes</option>
+            <option value="1800">30 minutes</option>
+            <option value="3600">1 hour</option>
+            <option value="7200">2 hours</option>
+            <option value="14400">4 hours</option>
+          </select>
+          <span class="hint">Optional absolute safety limit. Active tasks may otherwise continue as long as they keep making progress.</span>
+        </div>
+        <div class="form-row" style="margin-top:10px;">
+          <label>Approval timeout</label>
+          <span class="hint" style="display:block;margin-top:2px;">File-write approval dialogs time out after 90 seconds if unanswered. This is separate from idle and maximum task duration.</span>
         </div>
         <div id="codex-browser-row" style="display:none;margin-top:10px;">
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">

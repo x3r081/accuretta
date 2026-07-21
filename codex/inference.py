@@ -39,7 +39,21 @@ from .inference_types import (
     CodexInferenceEventType,
     CodexTurnResult,
 )
-from .timeouts import DEFAULT_CODEX_TURN_TIMEOUT_S
+from .timeouts import (
+    ACTIVITY_APPROVAL_REQUESTED,
+    ACTIVITY_APPROVAL_RESOLVED,
+    ACTIVITY_FILE_CHANGE,
+    ACTIVITY_OUTPUT,
+    ACTIVITY_PROTOCOL_PROGRESS,
+    ACTIVITY_STATUS,
+    ACTIVITY_TOOL_COMPLETE,
+    ACTIVITY_TOOL_PROGRESS,
+    ACTIVITY_TOOL_START,
+    DEFAULT_CODEX_IDLE_TIMEOUT_S,
+    VALID_ACTIVITY_TYPES,
+    get_codex_idle_timeout_seconds,
+    get_codex_max_task_duration_seconds,
+)
 from .process import CodexProcessError
 from .protocol import (
     build_thread_start_params,
@@ -83,6 +97,14 @@ class CodexInferenceService:
         self._file_change_items: dict = {}
         # JSON-RPC request id → pending approval metadata (dedupe / cancel).
         self._pending_approvals: dict = {}
+        # Idle / hard-max watchdog (monotonic clock; scoped to active generation).
+        self._turn_started_monotonic: float = 0.0
+        self._last_activity_monotonic: float = 0.0
+        self._last_activity_type: Optional[str] = None
+        self._last_activity_event: Optional[str] = None
+        self._idle_timeout_s: float = float(DEFAULT_CODEX_IDLE_TIMEOUT_S)
+        self._max_duration_s: Optional[float] = None
+        self._watchdog_generation: int = 0
 
     # ---- availability -----------------------------------------------------
 
@@ -227,8 +249,15 @@ class CodexInferenceService:
         text: str,
         *,
         on_event: Optional[EventCallback] = None,
-        timeout_s: float = float(DEFAULT_CODEX_TURN_TIMEOUT_S),
+        idle_timeout_s: Optional[float] = None,
+        max_duration_s: Optional[float] = None,
+        timeout_s: Optional[float] = None,
     ) -> CodexTurnResult:
+        """Run one Codex turn with an activity-based idle watchdog.
+
+        ``timeout_s`` is a deprecated alias for ``idle_timeout_s`` (not a
+        wall-clock total duration).
+        """
         self._assert_can_infer()
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise CodexInferenceError(
@@ -236,6 +265,13 @@ class CodexInferenceService:
                 event_type=CodexInferenceEventType.PROTOCOL_ERROR,
             )
         thread_id = thread_id.strip()
+        idle = idle_timeout_s if idle_timeout_s is not None else timeout_s
+        if idle is None:
+            idle = float(get_codex_idle_timeout_seconds())
+        hard = max_duration_s
+        if hard is None:
+            hard = get_codex_max_task_duration_seconds()
+        hard_f = float(hard) if hard is not None and float(hard) > 0 else None
 
         if not self._busy.acquire(blocking=False):
             raise CodexInferenceError(
@@ -244,10 +280,112 @@ class CodexInferenceService:
             )
         try:
             return self._run_turn_locked(
-                thread_id, text, on_event=on_event, timeout_s=timeout_s
+                thread_id,
+                text,
+                on_event=on_event,
+                idle_timeout_s=float(idle),
+                max_duration_s=hard_f,
             )
         finally:
             self._busy.release()
+
+    def record_turn_activity(
+        self,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+        activity_type: str,
+        event_name: Optional[str] = None,
+    ) -> bool:
+        """Reset the idle watchdog for the active turn. Returns True if recorded."""
+        if activity_type not in VALID_ACTIVITY_TYPES:
+            return False
+        now = time.monotonic()
+        with self._state_lock:
+            if getattr(self, "_watchdog_generation", 0) == 0:
+                return False
+            if getattr(self, "_active_generation", 0) == 0:
+                return False
+            if self._watchdog_generation != self._active_generation:
+                return False
+            if self._terminal is not None:
+                return False
+            active_thread = getattr(self, "_active_thread_id", None)
+            active_turn = getattr(self, "_active_turn_id", None)
+            if not active_thread:
+                return False
+            if thread_id and thread_id != active_thread:
+                return False
+            if active_turn and turn_id and turn_id != active_turn:
+                return False
+            self._last_activity_monotonic = now
+            self._last_activity_type = activity_type
+            if isinstance(event_name, str) and event_name.strip():
+                self._last_activity_event = event_name.strip()[:80]
+            return True
+
+    def _reset_watchdog(
+        self,
+        *,
+        generation: int,
+        idle_timeout_s: float,
+        max_duration_s: Optional[float],
+    ) -> None:
+        now = time.monotonic()
+        with self._state_lock:
+            self._watchdog_generation = generation
+            self._idle_timeout_s = max(1.0, float(idle_timeout_s))
+            self._max_duration_s = (
+                float(max_duration_s)
+                if max_duration_s is not None and float(max_duration_s) > 0
+                else None
+            )
+            self._turn_started_monotonic = now
+            self._last_activity_monotonic = now
+            self._last_activity_type = ACTIVITY_PROTOCOL_PROGRESS
+            self._last_activity_event = "turn/start"
+
+    def _clear_watchdog(self, *, generation: int) -> None:
+        with self._state_lock:
+            if self._watchdog_generation == generation:
+                self._watchdog_generation = 0
+                self._last_activity_type = None
+                self._last_activity_event = None
+
+    def _log_timeout_diagnostics(self, *, kind: str) -> None:
+        with self._state_lock:
+            started = self._turn_started_monotonic
+            last = self._last_activity_monotonic
+            activity = self._last_activity_type
+            event = self._last_activity_event
+            pending = bool(self._pending_approvals)
+            pending_n = len(self._pending_approvals)
+            thread_id = self._active_thread_id
+            turn_id = self._active_turn_id
+            idle_cfg = self._idle_timeout_s
+            max_cfg = self._max_duration_s
+        now = time.monotonic()
+        try:
+            proc_alive = self._session.process_state() == "ready"
+        except Exception:
+            proc_alive = False
+        log.info(
+            "codex timeout: type=%s elapsed=%.1fs idle=%.1fs "
+            "idle_cfg=%.1fs max_cfg=%s last_activity=%s last_event=%s "
+            "pending_approvals=%s count=%s process_ready=%s "
+            "thread=%s turn=%s",
+            kind,
+            (now - started) if started else -1.0,
+            (now - last) if last else -1.0,
+            idle_cfg,
+            max_cfg if max_cfg is not None else "disabled",
+            activity or "-",
+            event or "-",
+            pending,
+            pending_n,
+            proc_alive,
+            (thread_id[:12] + "…") if isinstance(thread_id, str) and len(thread_id) > 12 else thread_id,
+            (turn_id[:12] + "…") if isinstance(turn_id, str) and len(turn_id) > 12 else turn_id,
+        )
 
     def cancel_active_turn(self) -> bool:
         """Interrupt the active turn if one is running. Safe if idle."""
@@ -294,7 +432,7 @@ class CodexInferenceService:
 
     def _on_notification(self, method: str, params) -> None:
         # Only handle inference methods; account notifications stay with account ctrl.
-        if method not in {
+        progress_methods = {
             "turn/started",
             "turn/completed",
             "item/agentMessage/delta",
@@ -302,7 +440,14 @@ class CodexInferenceService:
             "thread/started",
             "item/started",
             "item/completed",
-        }:
+            # Tool / command progress (when emitted by Codex).
+            "item/commandExecution/started",
+            "item/commandExecution/outputDelta",
+            "item/commandExecution/completed",
+            "item/fileChange/completed",
+            "turn/plan/updated",
+        }
+        if method not in progress_methods:
             return
 
         with self._state_lock:
@@ -325,6 +470,12 @@ class CodexInferenceService:
                 if self._active_generation != gen:
                     return
                 self._text_parts.append(delta)
+            self.record_turn_activity(
+                parsed.get("threadId") or active_thread,
+                parsed.get("turnId") or active_turn,
+                ACTIVITY_OUTPUT,
+                event_name=method,
+            )
             self._emit(
                 CodexInferenceEvent(
                     type=CodexInferenceEventType.TEXT_DELTA,
@@ -345,6 +496,9 @@ class CodexInferenceService:
                     return
                 if turn_id and not self._active_turn_id:
                     self._active_turn_id = turn_id
+            self.record_turn_activity(
+                active_thread, turn_id or active_turn, ACTIVITY_PROTOCOL_PROGRESS, event_name=method
+            )
             self._emit(
                 CodexInferenceEvent(
                     type=CodexInferenceEventType.STARTED,
@@ -402,6 +556,12 @@ class CodexInferenceService:
             if active_turn and parsed.get("turnId") and parsed["turnId"] != active_turn:
                 return
             if parsed.get("willRetry"):
+                self.record_turn_activity(
+                    active_thread,
+                    parsed.get("turnId") or active_turn,
+                    ACTIVITY_STATUS,
+                    event_name=method,
+                )
                 self._emit(
                     CodexInferenceEvent(
                         type=CodexInferenceEventType.STATUS,
@@ -427,14 +587,64 @@ class CodexInferenceService:
             self._emit(evt)
             return
 
-        if method in {"item/started", "item/completed", "thread/started"}:
-            if method in {"item/started", "item/completed"} and isinstance(params, dict):
+        if method in {
+            "item/started",
+            "item/completed",
+            "thread/started",
+            "item/commandExecution/started",
+            "item/commandExecution/outputDelta",
+            "item/commandExecution/completed",
+            "item/fileChange/completed",
+            "turn/plan/updated",
+        }:
+            item_thread = None
+            item_turn = None
+            if isinstance(params, dict):
+                item_thread = params.get("threadId") or params.get("thread_id")
+                item_turn = params.get("turnId") or params.get("turn_id")
                 item = params.get("item")
-                cached = cache_file_change_item(item)
-                if cached:
-                    item_id, entry = cached
-                    with self._state_lock:
-                        self._file_change_items[item_id] = entry
+                if isinstance(item, dict):
+                    if not item_thread:
+                        item_thread = item.get("threadId")
+                    if not item_turn:
+                        item_turn = item.get("turnId")
+                if method in {"item/started", "item/completed"}:
+                    cached = cache_file_change_item(item)
+                    if cached:
+                        item_id, entry = cached
+                        with self._state_lock:
+                            self._file_change_items[item_id] = entry
+            if item_thread and item_thread != active_thread:
+                return
+            if active_turn and item_turn and item_turn != active_turn:
+                return
+            if method in {"item/commandExecution/started"}:
+                act = ACTIVITY_TOOL_START
+            elif method in {"item/commandExecution/outputDelta"}:
+                act = ACTIVITY_TOOL_PROGRESS
+            elif method in {"item/commandExecution/completed", "item/completed"}:
+                act = ACTIVITY_TOOL_COMPLETE
+            elif method in {"item/started", "item/fileChange/completed"}:
+                act = ACTIVITY_FILE_CHANGE if "fileChange" in method or method == "item/started" else ACTIVITY_STATUS
+                if method == "item/started" and isinstance(params, dict):
+                    it = params.get("item")
+                    kind = ""
+                    if isinstance(it, dict):
+                        kind = str(it.get("type") or it.get("itemType") or "")
+                    if "command" in kind.lower() or "Command" in kind:
+                        act = ACTIVITY_TOOL_START
+                    elif "file" in kind.lower() or "File" in kind or "change" in kind.lower():
+                        act = ACTIVITY_FILE_CHANGE
+                    else:
+                        act = ACTIVITY_STATUS
+            else:
+                act = ACTIVITY_STATUS
+            self.record_turn_activity(
+                item_thread or active_thread,
+                item_turn or active_turn,
+                act,
+                event_name=method,
+            )
             self._emit(
                 CodexInferenceEvent(
                     type=CodexInferenceEventType.STATUS,
@@ -495,6 +705,12 @@ class CodexInferenceService:
                 "itemId": params.get("itemId"),
                 "started": time.time(),
             }
+        self.record_turn_activity(
+            params.get("threadId") or active_thread,
+            params.get("turnId") or active_turn,
+            ACTIVITY_APPROVAL_REQUESTED,
+            event_name=method,
+        )
 
         # Safe protocol diagnostic (no paths/content/tokens).
         log.info(
@@ -516,6 +732,12 @@ class CodexInferenceService:
 
         def _request_approval(title, command, details=None, timeout_s=APPROVAL_UI_TIMEOUT_S):
             import bridge
+            self.record_turn_activity(
+                active_thread,
+                active_turn,
+                ACTIVITY_APPROVAL_REQUESTED,
+                event_name=method,
+            )
             self._emit(
                 CodexInferenceEvent(
                     type=CodexInferenceEventType.STATUS,
@@ -531,6 +753,13 @@ class CodexInferenceService:
                 self._signal_approval_timeout(
                     thread_id=active_thread,
                     turn_id=active_turn,
+                )
+            else:
+                self.record_turn_activity(
+                    active_thread,
+                    active_turn,
+                    ACTIVITY_APPROVAL_RESOLVED,
+                    event_name="approval/resolved",
                 )
             return result
 
@@ -619,6 +848,12 @@ class CodexInferenceService:
                 req_id,
                 (decision or {}).get("decision"),
             )
+            self.record_turn_activity(
+                params.get("threadId") or active_thread,
+                params.get("turnId") or active_turn,
+                ACTIVITY_APPROVAL_RESOLVED,
+                event_name="approval/responded",
+            )
         except Exception as exc:
             log.info(
                 "codex approval: respond failed id=%s (%s)",
@@ -683,7 +918,8 @@ class CodexInferenceService:
         text: str,
         *,
         on_event: Optional[EventCallback],
-        timeout_s: float,
+        idle_timeout_s: float,
+        max_duration_s: Optional[float],
     ) -> CodexTurnResult:
         ctrl = self._session.ensure_ready()
         self._ensure_notification_hook()
@@ -735,6 +971,11 @@ class CodexInferenceService:
             turn_id = started["turnId"]
             with self._state_lock:
                 self._active_turn_id = turn_id
+            self._reset_watchdog(
+                generation=generation,
+                idle_timeout_s=idle_timeout_s,
+                max_duration_s=max_duration_s,
+            )
             start_evt = CodexInferenceEvent(
                 type=CodexInferenceEventType.STARTED,
                 thread_id=thread_id,
@@ -743,9 +984,8 @@ class CodexInferenceService:
             )
             _collect(start_evt)
 
-            # Wait for terminal notification (do not hold busy/state locks).
-            deadline = time.time() + max(1.0, float(timeout_s))
-            while time.time() < deadline:
+            # Activity-based wait (do not hold busy/state locks across wait).
+            while True:
                 if self._session.process_state() != "ready":
                     self._decline_pending_approvals(reason="process_exit")
                     raise CodexInferenceError(
@@ -754,27 +994,45 @@ class CodexInferenceService:
                     )
                 if self._terminal_event.wait(timeout=0.2):
                     break
-            else:
+
+                now = time.monotonic()
                 with self._state_lock:
-                    had_pending_approvals = bool(self._pending_approvals)
-                    pending_count = len(self._pending_approvals)
-                log.info(
-                    "codex turn: wall-clock timeout after %.1fs "
-                    "(pending_approvals=%s count=%s) — classifying as TURN_TIMEOUT",
-                    float(timeout_s),
-                    had_pending_approvals,
-                    pending_count,
-                )
-                try:
-                    self.cancel_active_turn()
-                except Exception:
-                    pass
-                self._decline_pending_approvals(reason="turn_timeout")
-                # Always TURN_TIMEOUT — even if cleanup declined a pending approval.
-                raise CodexInferenceError(
-                    "Codex did not finish within the configured turn timeout.",
-                    event_type=CodexInferenceEventType.TURN_TIMEOUT,
-                )
+                    if self._active_generation != generation:
+                        break
+                    pending = bool(self._pending_approvals)
+                    last_act = self._last_activity_monotonic
+                    started_m = self._turn_started_monotonic
+                    idle_cfg = self._idle_timeout_s
+                    max_cfg = self._max_duration_s
+
+                if max_cfg is not None and (now - started_m) >= max_cfg:
+                    self._log_timeout_diagnostics(kind="max_task_duration")
+                    try:
+                        self.cancel_active_turn()
+                    except Exception:
+                        pass
+                    self._decline_pending_approvals(reason="max_task_duration")
+                    raise CodexInferenceError(
+                        "Codex reached the configured maximum task duration.",
+                        event_type=CodexInferenceEventType.MAX_TASK_DURATION,
+                    )
+
+                # While a real Approvals UI wait is open, idle watchdog yields —
+                # approval has its own 90s timeout and must win the race.
+                if pending:
+                    continue
+
+                if (now - last_act) >= idle_cfg:
+                    self._log_timeout_diagnostics(kind="idle_timeout")
+                    try:
+                        self.cancel_active_turn()
+                    except Exception:
+                        pass
+                    self._decline_pending_approvals(reason="idle_timeout")
+                    raise CodexInferenceError(
+                        "Codex stopped producing activity during the configured idle period.",
+                        event_type=CodexInferenceEventType.IDLE_TIMEOUT,
+                    )
 
             terminal = self._terminal
             with self._state_lock:
@@ -822,16 +1080,31 @@ class CodexInferenceService:
                     or "The approval request timed out before a decision was made.",
                     events=list(events),
                 )
-            if terminal.type == CodexInferenceEventType.TURN_TIMEOUT:
+            if terminal.type in {
+                CodexInferenceEventType.IDLE_TIMEOUT,
+                CodexInferenceEventType.TURN_TIMEOUT,
+            }:
                 return CodexTurnResult(
                     ok=False,
                     thread_id=thread_id,
                     turn_id=turn_id,
                     text=text_out,
                     status="failed",
-                    error_type=CodexInferenceEventType.TURN_TIMEOUT.value,
+                    error_type=CodexInferenceEventType.IDLE_TIMEOUT.value,
                     error_message=terminal.message
-                    or "Codex did not finish within the configured turn timeout.",
+                    or "Codex stopped producing activity during the configured idle period.",
+                    events=list(events),
+                )
+            if terminal.type == CodexInferenceEventType.MAX_TASK_DURATION:
+                return CodexTurnResult(
+                    ok=False,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    text=text_out,
+                    status="failed",
+                    error_type=CodexInferenceEventType.MAX_TASK_DURATION.value,
+                    error_message=terminal.message
+                    or "Codex reached the configured maximum task duration.",
                     events=list(events),
                 )
             return CodexTurnResult(
@@ -858,6 +1131,7 @@ class CodexInferenceService:
             ) from None
         finally:
             self._decline_pending_approvals(reason="turn_end")
+            self._clear_watchdog(generation=generation)
             with self._state_lock:
                 if self._active_generation == generation:
                     self._active_thread_id = None
@@ -865,6 +1139,7 @@ class CodexInferenceService:
                     self._event_sink = None
                     self._cancel_requested = False
                     self._file_change_items.clear()
+
 
 def get_codex_inference_service(session: Optional[CodexSession] = None) -> CodexInferenceService:
     return CodexInferenceService(session=session or get_codex_session())
