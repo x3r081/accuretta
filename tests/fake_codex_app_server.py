@@ -3,8 +3,11 @@
 
 Never contacts OpenAI. Controlled via environment variables:
 
-  FAKE_CODEX_MODE=ok|fail_init|crash_after_init|unauthenticated|authenticated
+  FAKE_CODEX_MODE=ok|fail_init|crash_after_init|unauthenticated|authenticated|crash_on_turn
   FAKE_CODEX_SECRET_MARKER=sk-fake-SECRET-marker-do-not-leak
+  FAKE_CODEX_AUTO_COMPLETE=0|1
+  FAKE_CODEX_TURN_DELAY_MS=50
+  FAKE_CODEX_EMIT_STALE_TURN=0|1
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ def _emit(obj: dict) -> None:
 def main() -> int:
     mode = (os.environ.get("FAKE_CODEX_MODE") or "ok").strip()
     secret = os.environ.get("FAKE_CODEX_SECRET_MARKER") or "sk-fake-SECRET-marker-do-not-leak"
-    # Version probe path — exit before entering RPC loop.
+    turn_delay = float(os.environ.get("FAKE_CODEX_TURN_DELAY_MS") or "50") / 1000.0
     if len(sys.argv) >= 2 and sys.argv[1] == "--version":
         sys.stdout.write("fake-codex 0.0.0-test\n")
         sys.stdout.flush()
@@ -35,7 +38,7 @@ def main() -> int:
         return 0
 
     account = None
-    if mode == "authenticated":
+    if mode in {"authenticated", "crash_on_turn"}:
         account = {
             "type": "chatgpt",
             "email": "user@example.com",
@@ -46,13 +49,13 @@ def main() -> int:
         }
     pending_login = None
     initialized = False
+    threads = {}
+    active_turns = {}
 
-    # Optional stderr poison (must be redacted by Accuretta readers)
     sys.stderr.write(f"fake-codex boot Authorization: Bearer {secret}\n")
     sys.stderr.flush()
 
     if len(sys.argv) < 2 or sys.argv[1] != "app-server":
-        # Ignore unknown modes; only app-server speaks JSONL.
         return 0
 
     for raw in sys.stdin:
@@ -95,9 +98,7 @@ def main() -> int:
             continue
 
         if method == "account/read":
-            # Never required — but include poison in raw for parser tests when authenticated
-            result = {"account": account, "requiresOpenaiAuth": True}
-            _emit({"id": req_id, "result": result})
+            _emit({"id": req_id, "result": {"account": account, "requiresOpenaiAuth": True}})
             continue
 
         if method == "account/login/start":
@@ -132,7 +133,7 @@ def main() -> int:
                 })
             else:
                 _emit({"id": req_id, "error": {"code": -32602, "message": "unsupported type"}})
-            # Auto-complete shortly unless cancelled.
+
             def _complete(lid=login_id):
                 time.sleep(0.15)
                 if pending_login and pending_login.get("loginId") == lid:
@@ -151,6 +152,7 @@ def main() -> int:
                         "method": "account/updated",
                         "params": {"authMode": "chatgpt", "planType": "pro"},
                     })
+
             if os.environ.get("FAKE_CODEX_AUTO_COMPLETE", "1") == "1":
                 threading.Thread(target=_complete, daemon=True).start()
             continue
@@ -174,6 +176,165 @@ def main() -> int:
                 "method": "account/updated",
                 "params": {"authMode": None, "planType": None},
             })
+            continue
+
+        if method == "thread/start":
+            if account is None:
+                _emit({"id": req_id, "error": {"code": -32001, "message": "Unauthorized"}})
+                continue
+            thread_id = str(uuid.uuid4())
+            model = params.get("model") or "fake-model"
+            cwd = params.get("cwd") or "/tmp"
+            thread = {
+                "id": thread_id,
+                "sessionId": thread_id,
+                "preview": "",
+                "modelProvider": "openai",
+                "createdAt": int(time.time()),
+                "updatedAt": int(time.time()),
+                "status": {"type": "idle"},
+                "cwd": cwd,
+                "cliVersion": "0.0.0-test",
+                "source": "appServer",
+                "ephemeral": False,
+                "turns": [],
+            }
+            threads[thread_id] = thread
+            _emit({
+                "id": req_id,
+                "result": {
+                    "thread": thread,
+                    "model": model,
+                    "modelProvider": "openai",
+                    "cwd": cwd,
+                    "approvalPolicy": params.get("approvalPolicy") or "on-request",
+                    "approvalsReviewer": "user",
+                    "sandbox": {"type": "readOnly"},
+                    "accessToken": secret,
+                },
+            })
+            _emit({"method": "thread/started", "params": {"thread": thread}})
+            continue
+
+        if method == "turn/start":
+            if mode == "crash_on_turn":
+                _emit({
+                    "id": req_id,
+                    "result": {
+                        "turn": {"id": str(uuid.uuid4()), "items": [], "status": "inProgress"},
+                    },
+                })
+                time.sleep(0.05)
+                return 3
+            thread_id = params.get("threadId")
+            if thread_id not in threads:
+                _emit({"id": req_id, "error": {"code": -32602, "message": "unknown thread"}})
+                continue
+            if account is None:
+                _emit({"id": req_id, "error": {"code": -32001, "message": "Unauthorized"}})
+                continue
+            turn_id = str(uuid.uuid4())
+            turn = {"id": turn_id, "items": [], "status": "inProgress"}
+            active_turns[turn_id] = {"threadId": thread_id, "cancelled": False}
+            _emit({"id": req_id, "result": {"turn": turn}})
+            _emit({"method": "turn/started", "params": {"threadId": thread_id, "turn": turn}})
+
+            def _stream(tid=turn_id, thid=thread_id):
+                time.sleep(turn_delay)
+                if active_turns.get(tid, {}).get("cancelled"):
+                    _emit({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thid,
+                            "turn": {"id": tid, "items": [], "status": "interrupted"},
+                        },
+                    })
+                    return
+                item_id = str(uuid.uuid4())
+                _emit({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": thid,
+                        "turnId": tid,
+                        "startedAtMs": int(time.time() * 1000),
+                        "item": {"type": "agentMessage", "id": item_id, "text": ""},
+                    },
+                })
+                for piece in ("Hello", " from", " Codex"):
+                    if active_turns.get(tid, {}).get("cancelled"):
+                        break
+                    time.sleep(max(turn_delay / 3, 0.01))
+                    _emit({
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": thid,
+                            "turnId": tid,
+                            "itemId": item_id,
+                            "delta": piece,
+                            "accessToken": secret,
+                        },
+                    })
+                if os.environ.get("FAKE_CODEX_EMIT_STALE_TURN") == "1":
+                    stale = str(uuid.uuid4())
+                    _emit({
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": thid,
+                            "turnId": stale,
+                            "itemId": "stale-item",
+                            "delta": " STALE",
+                        },
+                    })
+                    _emit({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thid,
+                            "turn": {"id": stale, "items": [], "status": "completed"},
+                        },
+                    })
+                if active_turns.get(tid, {}).get("cancelled"):
+                    status = "interrupted"
+                else:
+                    status = "completed"
+                    _emit({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": thid,
+                            "turnId": tid,
+                            "completedAtMs": int(time.time() * 1000),
+                            "item": {
+                                "type": "agentMessage",
+                                "id": item_id,
+                                "text": "Hello from Codex",
+                            },
+                        },
+                    })
+                _emit({"method": "item/agentMessage/delta", "params": "not-a-dict"})
+                _emit({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thid,
+                        "turn": {"id": tid, "items": [], "status": status},
+                    },
+                })
+
+            threading.Thread(target=_stream, daemon=True).start()
+            continue
+
+        if method == "turn/interrupt":
+            turn_id = params.get("turnId")
+            thread_id = params.get("threadId")
+            if turn_id in active_turns:
+                active_turns[turn_id]["cancelled"] = True
+            _emit({"id": req_id, "result": {}})
+            if turn_id and thread_id:
+                _emit({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {"id": turn_id, "items": [], "status": "interrupted"},
+                    },
+                })
             continue
 
         _emit({"id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})

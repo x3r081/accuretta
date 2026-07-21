@@ -7,15 +7,20 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional
+from typing import Callable, List, Optional
 
 from .account import CodexAccountController, CodexAccountError
 from .discover import CodexDiscovery, discover_codex, reset_discovery_cache
+from .flags import is_codex_inference_enabled
 from .process import CodexAppServerProcess, CodexProcessError
 from .protocol import sanitize_error_message
+from .rpc_client import CodexRpcClient
 from .status import build_codex_status_dto
 
 log = logging.getLogger("accuretta.codex.session")
+
+NotificationListener = Callable[[str, object], None]
+ServerRequestHandler = Callable[[dict], None]
 
 _SESSION: Optional["CodexSession"] = None
 _SESSION_LOCK = threading.Lock()
@@ -51,6 +56,26 @@ class CodexSession:
         self._explicit_executable = executable
         self._process_factory = process_factory
         self._login_pending_blocks_restart = False
+        self._extra_listeners: List[NotificationListener] = []
+        self._server_request_handler: Optional[ServerRequestHandler] = None
+
+    @property
+    def rpc(self) -> CodexRpcClient:
+        with self._lock:
+            if self._process is None or not self._process.ready:
+                raise CodexProcessError("Codex app-server is not running")
+            return self._process.rpc
+
+    def add_notification_listener(self, listener: NotificationListener) -> None:
+        with self._lock:
+            if listener not in self._extra_listeners:
+                self._extra_listeners.append(listener)
+
+    def set_server_request_handler(self, handler: Optional[ServerRequestHandler]) -> None:
+        with self._lock:
+            self._server_request_handler = handler
+            if self._process is not None and self._process._rpc is not None:
+                self._process._rpc._on_server_request = handler
 
     def refresh_discovery(self) -> CodexDiscovery:
         reset_discovery_cache()
@@ -101,11 +126,29 @@ class CodexSession:
             factory = self._process_factory or CodexAppServerProcess
             proc = factory(d.executable)
             account_box: dict = {}
+            listeners_box: dict = {"list": list(self._extra_listeners)}
+            server_handler_box: dict = {"handler": self._server_request_handler}
 
             def on_notify(method, params):
                 ctrl = account_box.get("ctrl")
                 if ctrl is not None:
                     ctrl.handle_notification(method, params)
+                for listener in list(listeners_box.get("list") or []):
+                    try:
+                        listener(method, params)
+                    except Exception as exc:
+                        log.warning(
+                            "codex session listener failed: %s",
+                            type(exc).__name__,
+                        )
+
+            def on_server_request(msg: dict):
+                handler = server_handler_box.get("handler")
+                if handler is not None:
+                    try:
+                        handler(msg)
+                    except Exception:
+                        pass
 
             proc.set_notification_handler(on_notify)
             try:
@@ -113,11 +156,15 @@ class CodexSession:
             except Exception as exc:
                 self._last_error = sanitize_error_message(str(exc))
                 raise
+            if proc._rpc is not None:
+                proc._rpc._on_server_request = on_server_request
             ctrl = CodexAccountController(proc.rpc)
             account_box["ctrl"] = ctrl
             self._process = proc
             self._account = ctrl
             self._last_error = None
+            listeners_box["list"] = self._extra_listeners
+            server_handler_box["handler"] = self._server_request_handler
             try:
                 ctrl.account_read(refresh_token=False)
             except Exception as exc:
@@ -144,7 +191,6 @@ class CodexSession:
                 available = False
                 process_state = "error"
         elif not live:
-            # Discovery-only view — do not start the child process.
             available = bool(d.available)
             if self._account is not None and process_state == "ready":
                 account = self._account.account
@@ -161,6 +207,7 @@ class CodexSession:
             provider_available=available and d.available,
             disabled_reason=None if (available and d.available) else (error or d.disabled_reason),
             error=error,
+            inference_flag_enabled=is_codex_inference_enabled(),
         )
 
     def start_browser_login(self) -> dict:
@@ -189,7 +236,6 @@ class CodexSession:
 
     def login_status(self) -> dict:
         dto = self.status_dto(live=False)
-        # If pending terminal, allow restart again.
         pending = self._account.pending if self._account else None
         if pending is None or pending.status != "pending":
             with self._lock:
@@ -241,3 +287,5 @@ class CodexSession:
             self._process = None
             self._account = None
             self._last_error = None
+            self._extra_listeners.clear()
+            self._server_request_handler = None

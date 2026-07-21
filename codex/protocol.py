@@ -239,6 +239,147 @@ def parse_account_updated(params: Any) -> Dict[str, Any]:
     }
 
 
+def _safe_id(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip() and len(value.strip()) < 200:
+        return value.strip()
+    return None
+
+
+def parse_thread_start_result(payload: Any) -> Dict[str, Any]:
+    """Extract allowlisted fields from thread/start or thread/resume results."""
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid thread response")
+    thread = payload.get("thread")
+    if not isinstance(thread, dict):
+        raise ValueError("thread missing")
+    thread_id = _safe_id(thread.get("id"))
+    if not thread_id:
+        raise ValueError("thread.id missing")
+    model = payload.get("model")
+    if not isinstance(model, str):
+        model = thread.get("model") if isinstance(thread.get("model"), str) else None
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str):
+        cwd = thread.get("cwd") if isinstance(thread.get("cwd"), str) else None
+    return {
+        "threadId": thread_id,
+        "model": model,
+        "cwd": cwd,
+        "modelProvider": payload.get("modelProvider")
+        if isinstance(payload.get("modelProvider"), str)
+        else None,
+    }
+
+
+def parse_turn_start_result(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid turn/start response")
+    turn = payload.get("turn")
+    if not isinstance(turn, dict):
+        raise ValueError("turn missing")
+    turn_id = _safe_id(turn.get("id"))
+    if not turn_id:
+        raise ValueError("turn.id missing")
+    status = turn.get("status")
+    if not isinstance(status, str):
+        status = "inProgress"
+    return {"turnId": turn_id, "status": status}
+
+
+def parse_turn_notification(params: Any) -> Dict[str, Any]:
+    """Parse turn/started or turn/completed notification params."""
+    if not isinstance(params, dict):
+        return {}
+    thread_id = _safe_id(params.get("threadId") or params.get("thread_id"))
+    turn = params.get("turn")
+    turn_id = None
+    status = None
+    error_message = None
+    if isinstance(turn, dict):
+        turn_id = _safe_id(turn.get("id"))
+        status = turn.get("status") if isinstance(turn.get("status"), str) else None
+        err = turn.get("error")
+        if isinstance(err, dict):
+            error_message = sanitize_error_message(err.get("message") or "turn failed")
+        elif isinstance(err, str):
+            error_message = sanitize_error_message(err)
+    return {
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "status": status,
+        "errorMessage": error_message,
+    }
+
+
+def parse_agent_message_delta(params: Any) -> Dict[str, Any]:
+    if not isinstance(params, dict):
+        return {}
+    delta = params.get("delta")
+    if not isinstance(delta, str):
+        return {}
+    return {
+        "threadId": _safe_id(params.get("threadId") or params.get("thread_id")),
+        "turnId": _safe_id(params.get("turnId") or params.get("turn_id")),
+        "itemId": _safe_id(params.get("itemId") or params.get("item_id")),
+        "delta": delta,
+    }
+
+
+def parse_error_notification(params: Any) -> Dict[str, Any]:
+    if not isinstance(params, dict):
+        return {}
+    err = params.get("error")
+    message = "Codex turn error"
+    if isinstance(err, dict):
+        message = sanitize_error_message(err.get("message") or message)
+    elif isinstance(err, str):
+        message = sanitize_error_message(err)
+    return {
+        "threadId": _safe_id(params.get("threadId") or params.get("thread_id")),
+        "turnId": _safe_id(params.get("turnId") or params.get("turn_id")),
+        "message": message,
+        "willRetry": bool(params.get("willRetry")),
+    }
+
+
+def build_thread_start_params(
+    *,
+    model: Optional[str] = None,
+    cwd: Optional[str] = None,
+    sandbox: str = "read-only",
+    approval_policy: str = "on-request",
+) -> dict:
+    """Build allowlisted thread/start params (stable surface only)."""
+    params: Dict[str, Any] = {
+        "sandbox": sandbox,
+        "approvalPolicy": approval_policy,
+    }
+    if isinstance(model, str) and model.strip():
+        params["model"] = model.strip()
+    if isinstance(cwd, str) and cwd.strip():
+        params["cwd"] = cwd.strip()
+    return params
+
+
+def build_turn_start_params(*, thread_id: str, text: str) -> dict:
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        raise ValueError("threadId required")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text required")
+    return {
+        "threadId": thread_id.strip(),
+        "input": [{"type": "text", "text": text}],
+    }
+
+
+def build_turn_interrupt_params(*, thread_id: str, turn_id: str) -> dict:
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        raise ValueError("threadId required")
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("turnId required")
+    return {"threadId": thread_id.strip(), "turnId": turn_id.strip()}
+
+
 def contains_forbidden_keys(obj: Any) -> bool:
     if isinstance(obj, dict):
         for key, value in obj.items():

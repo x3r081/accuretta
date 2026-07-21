@@ -23,6 +23,7 @@ def build_codex_status_dto(
     disabled_reason: Optional[str] = None,
     error: Optional[str] = None,
     capabilities: Optional[dict] = None,
+    inference_flag_enabled: bool = False,
 ) -> dict:
     acct = account or SafeAccountView()
     reason = disabled_reason or discovery.disabled_reason
@@ -32,10 +33,13 @@ def build_codex_status_dto(
         "authType": "codex_managed_chatgpt",
         "apiMode": "codex_app_server",
         "experimental": True,
+        # UI chat selection stays off until a later milestone wires inference.
         "supportsInference": False,
         "supportsModelListing": False,
         "supportsAccountAuthentication": True,
         "selectable": False,
+        # Distinct from auth: backend inference gate (default off).
+        "inferenceFlagEnabled": bool(inference_flag_enabled),
         "installed": bool(discovery.executable),
         "available": bool(provider_available),
         "processState": process_state,
@@ -56,6 +60,7 @@ def build_codex_status_dto(
                 ("account_authentication", True),
                 ("browser_login", bool((capabilities or {}).get("browser_login", True))),
                 ("device_login", bool((capabilities or {}).get("device_login", True))),
+                ("inference_backend", bool(inference_flag_enabled)),
             )
             if on
         ],

@@ -75,6 +75,16 @@ class CodexRpcClient:
         payload = {"method": method, "params": params if params is not None else {}}
         self._send(payload)
 
+    def respond(self, req_id: Any, result: Any) -> None:
+        """Reply to a server-initiated JSON-RPC request."""
+        self._send({"id": req_id, "result": result})
+
+    def respond_error(self, req_id: Any, *, code: int, message: str) -> None:
+        self._send({
+            "id": req_id,
+            "error": {"code": int(code), "message": sanitize_error_message(message)},
+        })
+
     def _send(self, payload: dict) -> None:
         line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         with self._write_lock:
