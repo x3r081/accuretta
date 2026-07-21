@@ -6834,9 +6834,332 @@
       btnSelect.disabled = !canSelect;
     }
     populateGitHubAuthForm();
+    populateCodexAuthForm();
   }
 
   let _githubDevicePollTimer = null;
+  let _codexLoginPollTimer = null;
+  let _codexLoginPollCount = 0;
+  const _CODEX_LOGIN_POLL_MAX = 90;
+
+  function _clearCodexLoginUi() {
+    if (_codexLoginPollTimer) {
+      clearTimeout(_codexLoginPollTimer);
+      _codexLoginPollTimer = null;
+    }
+    _codexLoginPollCount = 0;
+    state.codexLogin = null;
+    const browserRow = $("#codex-browser-row");
+    if (browserRow) browserRow.style.display = "none";
+    const deviceRow = $("#codex-device-row");
+    if (deviceRow) deviceRow.style.display = "none";
+    const codeEl = $("#codex-user-code");
+    if (codeEl) codeEl.textContent = "";
+    const uriEl = $("#codex-verify-uri");
+    if (uriEl) uriEl.textContent = "";
+    const openAuth = $("#btn-codex-open-auth");
+    if (openAuth) {
+      openAuth.removeAttribute("href");
+      openAuth.setAttribute("aria-disabled", "true");
+    }
+    const openVerify = $("#btn-codex-open-verify");
+    if (openVerify) {
+      openVerify.removeAttribute("href");
+      openVerify.setAttribute("aria-disabled", "true");
+    }
+  }
+
+  function _codexStatusFromProviders() {
+    return (state.providers || []).find((p) => p.providerId === "codex_chatgpt") || null;
+  }
+
+  function _applyCodexStatus(cx) {
+    if (!cx || typeof cx !== "object") return;
+    const list = Array.isArray(state.providers) ? state.providers.slice() : [];
+    const idx = list.findIndex((p) => p.providerId === "codex_chatgpt");
+    if (idx >= 0) list[idx] = { ...list[idx], ...cx };
+    else list.push(cx);
+    state.providers = list;
+  }
+
+  async function populateCodexAuthForm({ live = true } = {}) {
+    const status = $("#codex-status-line");
+    const meta = $("#codex-meta-line");
+    const btnBrowser = $("#btn-codex-browser");
+    const btnDevice = $("#btn-codex-device");
+    const btnDisconnect = $("#btn-codex-disconnect");
+    const btnRetry = $("#btn-codex-retry");
+    let cx = _codexStatusFromProviders();
+    if (live) {
+      try {
+        const res = await api("/api/providers/codex_chatgpt/status");
+        if (res && !res.error) {
+          _applyCodexStatus(res);
+          cx = res;
+        }
+      } catch (_) { /* keep list snapshot */ }
+    }
+    if (!cx) {
+      if (status) status.textContent = "ChatGPT / Codex provider not registered.";
+      if (btnBrowser) btnBrowser.disabled = true;
+      if (btnDevice) btnDevice.disabled = true;
+      if (btnDisconnect) btnDisconnect.disabled = true;
+      if (btnRetry) btnRetry.style.display = "none";
+      return;
+    }
+    const pending = !!(state.codexLogin && state.codexLogin.loginStatus === "pending");
+    const version = cx.codexVersion ? `Codex ${cx.codexVersion}` : "Codex version unknown";
+    const proc = cx.processState ? `process: ${cx.processState}` : "";
+    if (meta) {
+      meta.textContent = [
+        cx.installed ? "CLI detected" : "CLI not detected",
+        version,
+        cx.available ? "provider available" : "provider unavailable",
+        proc,
+      ].filter(Boolean).join(" · ");
+    }
+    if (status) {
+      if (!cx.installed) {
+        status.textContent = cx.disabledReason || "Codex CLI not installed.";
+      } else if (!cx.available && !cx.authenticated) {
+        status.textContent = cx.error || cx.disabledReason || "Codex app-server unavailable.";
+      } else if (cx.authenticated) {
+        const plan = cx.planType ? ` Plan: ${cx.planType}.` : "";
+        const label = cx.accountLabel ? ` Signed in as ${cx.accountLabel}.` : " Signed in.";
+        status.textContent = `ChatGPT / Codex connected.${label}${plan} Inference is not enabled yet.`;
+      } else if (pending) {
+        status.textContent = state.codexLogin?.loginMethod === "device"
+          ? "Waiting for device-code authorization…"
+          : "Waiting for browser sign-in…";
+      } else {
+        status.textContent = "Not signed in. Authentication only — Codex chat is not enabled yet.";
+      }
+      if (cx.error && cx.authenticated === false && !pending) {
+        status.textContent = (status.textContent ? status.textContent + " " : "") + cx.error;
+      }
+    }
+    const canStart = !!(cx.installed && cx.available && !cx.authenticated && !pending);
+    if (btnBrowser) btnBrowser.disabled = !canStart;
+    if (btnDevice) btnDevice.disabled = !canStart;
+    if (btnDisconnect) btnDisconnect.disabled = !cx.authenticated;
+    if (btnRetry) {
+      const showRetry = !!(cx.installed && (cx.processState === "error" || (!cx.available && !pending)));
+      btnRetry.style.display = showRetry ? "" : "none";
+      btnRetry.disabled = pending;
+    }
+    if (pending && state.codexLogin) {
+      if (state.codexLogin.loginMethod === "device") _showCodexDevicePending(state.codexLogin);
+      else _showCodexBrowserPending(state.codexLogin);
+    }
+  }
+
+  function _showCodexBrowserPending(payload) {
+    const row = $("#codex-browser-row");
+    if (row) row.style.display = "";
+    const deviceRow = $("#codex-device-row");
+    if (deviceRow) deviceRow.style.display = "none";
+    const openBtn = $("#btn-codex-open-auth");
+    const url = payload.authUrl || "";
+    if (openBtn && url && /^https:\/\//i.test(url)) {
+      openBtn.href = url;
+      openBtn.removeAttribute("aria-disabled");
+    }
+  }
+
+  function _showCodexDevicePending(payload) {
+    const row = $("#codex-device-row");
+    if (row) row.style.display = "";
+    const browserRow = $("#codex-browser-row");
+    if (browserRow) browserRow.style.display = "none";
+    const codeEl = $("#codex-user-code");
+    if (codeEl) codeEl.textContent = payload.userCode || "";
+    const uri = payload.verificationUrl || "";
+    const uriEl = $("#codex-verify-uri");
+    if (uriEl) uriEl.textContent = uri;
+    const openBtn = $("#btn-codex-open-verify");
+    if (openBtn && uri && /^https:\/\//i.test(uri)) {
+      openBtn.href = uri;
+      openBtn.removeAttribute("aria-disabled");
+    }
+  }
+
+  function _scheduleCodexLoginPoll() {
+    if (_codexLoginPollTimer) clearTimeout(_codexLoginPollTimer);
+    if (_codexLoginPollCount >= _CODEX_LOGIN_POLL_MAX) {
+      toast("ChatGPT login timed out in the UI — check Codex status", "warn");
+      _clearCodexLoginUi();
+      populateCodexAuthForm({ live: true });
+      return;
+    }
+    _codexLoginPollTimer = setTimeout(_pollCodexLoginStatus, 2000);
+  }
+
+  async function _pollCodexLoginStatus() {
+    _codexLoginPollTimer = null;
+    _codexLoginPollCount += 1;
+    try {
+      const res = await api("/api/providers/codex_chatgpt/login/status");
+      if (!res || res.error) {
+        _scheduleCodexLoginPoll();
+        return;
+      }
+      _applyCodexStatus(res);
+      const st = res.loginStatus || "idle";
+      if (st === "pending") {
+        state.codexLogin = {
+          loginId: res.loginId,
+          loginMethod: res.loginMethod,
+          loginStatus: "pending",
+          authUrl: res.authUrl,
+          verificationUrl: res.verificationUrl,
+          userCode: res.userCode,
+        };
+        if (res.loginMethod === "device") _showCodexDevicePending(state.codexLogin);
+        else _showCodexBrowserPending(state.codexLogin);
+        populateCodexAuthForm({ live: false });
+        _scheduleCodexLoginPoll();
+        return;
+      }
+      _clearCodexLoginUi();
+      await loadProviders();
+      populateCodexAuthForm({ live: true });
+      if (st === "completed" || res.authenticated) toast("ChatGPT / Codex signed in", "ok", 2200);
+      else if (st === "failed") toast(res.error || "ChatGPT login failed", "error");
+      else if (st === "cancelled") toast("ChatGPT login cancelled", "warn");
+    } catch (_) {
+      _scheduleCodexLoginPoll();
+    }
+  }
+
+  async function startCodexBrowserFromUi() {
+    if (state.codexLogin && state.codexLogin.loginStatus === "pending") {
+      toast("A ChatGPT login is already in progress", "warn");
+      return;
+    }
+    _clearCodexLoginUi();
+    try {
+      const res = await api("/api/providers/codex_chatgpt/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method: "browser" }),
+      });
+      if (res.error) {
+        toast(res.message || res.error || "Could not start ChatGPT login", "error");
+        return;
+      }
+      // Keep pending login in memory only — do not persist in the browser.
+      state.codexLogin = {
+        loginId: res.loginId,
+        loginMethod: "browser",
+        loginStatus: "pending",
+        authUrl: res.authUrl,
+      };
+      _showCodexBrowserPending(state.codexLogin);
+      populateCodexAuthForm({ live: false });
+      if (res.authUrl && /^https:\/\//i.test(res.authUrl)) {
+        try { window.open(res.authUrl, "_blank", "noopener,noreferrer"); } catch (_) { /* user can click link */ }
+      }
+      _scheduleCodexLoginPoll();
+    } catch (_) {
+      toast("ChatGPT browser login failed to start", "error");
+    }
+  }
+
+  async function startCodexDeviceFromUi() {
+    if (state.codexLogin && state.codexLogin.loginStatus === "pending") {
+      toast("A ChatGPT login is already in progress", "warn");
+      return;
+    }
+    _clearCodexLoginUi();
+    try {
+      const res = await api("/api/providers/codex_chatgpt/device/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.error) {
+        toast(res.message || res.error || "Could not start device login", "error");
+        return;
+      }
+      state.codexLogin = {
+        loginId: res.loginId,
+        loginMethod: "device",
+        loginStatus: "pending",
+        verificationUrl: res.verificationUrl,
+        userCode: res.userCode,
+      };
+      _showCodexDevicePending(state.codexLogin);
+      populateCodexAuthForm({ live: false });
+      _scheduleCodexLoginPoll();
+    } catch (_) {
+      toast("ChatGPT device login failed to start", "error");
+    }
+  }
+
+  async function cancelCodexLoginFromUi() {
+    const loginId = state.codexLogin?.loginId;
+    try {
+      await api("/api/providers/codex_chatgpt/login/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(loginId ? { loginId } : {}),
+      });
+    } catch (_) { /* still clear UI */ }
+    _clearCodexLoginUi();
+    await loadProviders();
+    populateCodexAuthForm({ live: true });
+  }
+
+  async function disconnectCodexFromUi() {
+    _clearCodexLoginUi();
+    try {
+      const res = await api("/api/providers/codex_chatgpt/disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.error) {
+        toast(res.message || "Disconnect failed", "error");
+        return;
+      }
+      await loadProviders();
+      populateCodexAuthForm({ live: true });
+      toast("ChatGPT / Codex signed out", "ok", 1800);
+    } catch (_) {
+      toast("ChatGPT disconnect failed", "error");
+    }
+  }
+
+  async function retryCodexProcessFromUi() {
+    try {
+      const res = await api("/api/providers/codex_chatgpt/process/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.error) {
+        toast(res.message || "Codex retry failed", "error");
+        return;
+      }
+      if (res.status) _applyCodexStatus(res.status);
+      await loadProviders();
+      populateCodexAuthForm({ live: true });
+      toast("Codex app-server restarted", "ok", 1800);
+    } catch (_) {
+      toast("Codex retry failed", "error");
+    }
+  }
+
+  async function copyCodexUserCode() {
+    const text = ($("#codex-user-code")?.textContent || "").trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("Code copied", "ok", 1200);
+    } catch (_) {
+      toast("Could not copy code", "warn");
+    }
+  }
 
   function _clearGitHubDeviceUi() {
     if (_githubDevicePollTimer) {
@@ -9124,6 +9447,21 @@
     $("#btn-github-copy-code")?.addEventListener("click", copyGitHubUserCode);
     $("#btn-github-open-verify")?.addEventListener("click", (ev) => {
       const href = $("#btn-github-open-verify")?.getAttribute("href");
+      if (!href || href === "#") ev.preventDefault();
+    });
+    $("#btn-codex-browser")?.addEventListener("click", startCodexBrowserFromUi);
+    $("#btn-codex-device")?.addEventListener("click", startCodexDeviceFromUi);
+    $("#btn-codex-disconnect")?.addEventListener("click", disconnectCodexFromUi);
+    $("#btn-codex-retry")?.addEventListener("click", retryCodexProcessFromUi);
+    $("#btn-codex-cancel-browser")?.addEventListener("click", cancelCodexLoginFromUi);
+    $("#btn-codex-cancel-device")?.addEventListener("click", cancelCodexLoginFromUi);
+    $("#btn-codex-copy-code")?.addEventListener("click", copyCodexUserCode);
+    $("#btn-codex-open-auth")?.addEventListener("click", (ev) => {
+      const href = $("#btn-codex-open-auth")?.getAttribute("href");
+      if (!href || href === "#") ev.preventDefault();
+    });
+    $("#btn-codex-open-verify")?.addEventListener("click", (ev) => {
+      const href = $("#btn-codex-open-verify")?.getAttribute("href");
       if (!href || href === "#") ev.preventDefault();
     });
     $("#set-provider")?.addEventListener("change", populateProviderForm);

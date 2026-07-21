@@ -582,6 +582,34 @@
           <button type="button" class="btn sm" id="btn-github-disconnect" title="Disconnect GitHub account" disabled>Disconnect</button>
         </div>
       </div>
+      <div id="codex-auth-section" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border, #333);">
+        <label>ChatGPT / Codex</label>
+        <span class="hint" id="codex-auth-hint">Uses the official OpenAI Codex client and an eligible ChatGPT plan. Codex inference is not enabled in this milestone. OpenAI API-key access remains separate. ChatGPT history and memory are not imported into Accuretta. Usage is subject to the user's Codex/ChatGPT plan limits. Accuretta is not an official OpenAI product. Experimental.</span>
+        <div id="codex-status-line" class="hint" style="margin-top:6px;" role="status" aria-live="polite"></div>
+        <div id="codex-meta-line" class="hint" style="margin-top:4px;"></div>
+        <div id="codex-browser-row" style="display:none;margin-top:10px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <a class="btn sm" id="btn-codex-open-auth" href="#" target="_blank" rel="noopener noreferrer" title="Open ChatGPT sign-in page">Open sign-in page</a>
+            <button type="button" class="btn sm" id="btn-codex-cancel-browser" title="Cancel pending ChatGPT login">Cancel</button>
+          </div>
+          <span class="hint" id="codex-auth-url-hint" style="display:block;margin-top:6px;">Waiting for browser sign-in…</span>
+        </div>
+        <div id="codex-device-row" style="display:none;margin-top:10px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <code id="codex-user-code" aria-label="ChatGPT device user code"></code>
+            <button type="button" class="btn sm" id="btn-codex-copy-code" title="Copy user code">Copy code</button>
+            <a class="btn sm" id="btn-codex-open-verify" href="#" target="_blank" rel="noopener noreferrer" title="Open verification page">Open verification page</a>
+            <button type="button" class="btn sm" id="btn-codex-cancel-device" title="Cancel device-code login">Cancel</button>
+          </div>
+          <span class="hint" id="codex-verify-uri" style="display:block;margin-top:6px;word-break:break-all;"></span>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+          <button type="button" class="btn sm" id="btn-codex-browser" title="Sign in with ChatGPT in the browser">Sign in with ChatGPT</button>
+          <button type="button" class="btn sm" id="btn-codex-device" title="Sign in with a device code">Use device code</button>
+          <button type="button" class="btn sm" id="btn-codex-disconnect" title="Log out of Codex ChatGPT" disabled>Disconnect</button>
+          <button type="button" class="btn sm" id="btn-codex-retry" title="Retry Codex app-server" style="display:none;">Retry</button>
+        </div>
+      </div>
     </div>
 
     <div class="form-group">Model</div>
