@@ -114,12 +114,28 @@ def assess_codex_inference_readiness(*, live: bool = True) -> dict:
             avail = svc.check_available(live=live)
             process_ready = bool(avail.process_ready)
             authenticated = bool(avail.authenticated)
-            if not authenticated:
+            # Process/protocol failures must not be reported as "not signed in"
+            # unless account state was actually observed as signed out.
+            auth_reason = (avail.reason or "").lower()
+            auth_confirmed_signed_out = (
+                (not authenticated)
+                and process_ready
+                and "authentication required" in auth_reason
+            )
+            auth_unknown = (not authenticated) and (not process_ready) and not auth_confirmed_signed_out
+            if auth_confirmed_signed_out:
                 status = CodexInferenceStatus.NOT_SIGNED_IN
                 reason = UI_REASON_NOT_SIGNED_IN
+            elif auth_unknown:
+                # Do not instruct the user to sign in while we cannot confirm.
+                status = CodexInferenceStatus.PROCESS_UNAVAILABLE if live else CodexInferenceStatus.ERROR
+                reason = UI_REASON_PROCESS if live else UI_REASON_UNAVAILABLE
             elif live and not process_ready:
                 status = CodexInferenceStatus.PROCESS_UNAVAILABLE
                 reason = UI_REASON_PROCESS
+            elif not authenticated:
+                status = CodexInferenceStatus.NOT_SIGNED_IN
+                reason = UI_REASON_NOT_SIGNED_IN
             else:
                 status = CodexInferenceStatus.READY
                 reason = None
@@ -127,7 +143,13 @@ def assess_codex_inference_readiness(*, live: bool = True) -> dict:
             status = CodexInferenceStatus.ERROR
             reason = sanitize_error_message(str(exc)) or UI_REASON_UNAVAILABLE
             process_ready = get_codex_session().process_state() == "ready"
-
+            # Preserve last-known auth across unexpected readiness failures.
+            try:
+                acct = getattr(get_codex_session(), "_account", None)
+                if acct is not None and getattr(acct, "account", None) is not None:
+                    authenticated = bool(acct.account.authenticated)
+            except Exception:
+                pass
     indicator = ui_indicator_for_readiness({"status": status.value})
     out = {
         "status": status.value,

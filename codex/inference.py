@@ -39,6 +39,7 @@ from .inference_types import (
     CodexInferenceEventType,
     CodexTurnResult,
 )
+from .timeouts import DEFAULT_CODEX_TURN_TIMEOUT_S
 from .process import CodexProcessError
 from .protocol import (
     build_thread_start_params,
@@ -91,7 +92,18 @@ class CodexInferenceService:
         cli_ok = bool(discovery.available and discovery.executable)
         process_ready = False
         authenticated = False
+        auth_known = False
         reason = None
+
+        def _cached_auth() -> tuple[bool, bool]:
+            """Return (authenticated, known) from the last in-memory account view."""
+            try:
+                acct_ctrl = getattr(self._session, "_account", None)
+                if acct_ctrl is not None and getattr(acct_ctrl, "account", None) is not None:
+                    return bool(acct_ctrl.account.authenticated), True
+            except Exception:
+                pass
+            return False, False
 
         if not flag:
             reason = "Codex inference is disabled (ACCURETTA_CODEX_INFERENCE_ENABLED)"
@@ -103,24 +115,36 @@ class CodexInferenceService:
                     ctrl = self._session.ensure_ready()
                     process_ready = self._session.process_state() == "ready"
                     authenticated = bool(ctrl.account.authenticated)
+                    auth_known = True
                     if not authenticated:
                         # Refresh account state from source of truth.
                         try:
                             view = ctrl.account_read(refresh_token=False)
                             authenticated = bool(view.authenticated)
+                            auth_known = True
                         except Exception:
-                            authenticated = False
+                            # Keep last known auth — a read glitch is not logout.
+                            cached_auth, cached_known = _cached_auth()
+                            if cached_known:
+                                authenticated = cached_auth
+                                auth_known = True
+                            else:
+                                authenticated = False
+                                auth_known = False
                 except CodexProcessError as exc:
                     reason = sanitize_error_message(str(exc))
                     process_ready = False
+                    # Process failure must not clear signed-in state.
+                    authenticated, auth_known = _cached_auth()
                 except Exception as exc:
                     reason = sanitize_error_message(str(exc))
+                    process_ready = False
+                    authenticated, auth_known = _cached_auth()
             else:
                 process_ready = self._session.process_state() == "ready"
-                if self._session._account is not None:
-                    authenticated = bool(self._session._account.account.authenticated)
+                authenticated, auth_known = _cached_auth()
 
-            if flag and cli_ok and reason is None and not authenticated:
+            if flag and cli_ok and reason is None and auth_known and not authenticated:
                 reason = "ChatGPT authentication required for Codex inference"
             elif flag and cli_ok and reason is None and live and not process_ready:
                 reason = "Codex app-server is not ready"
@@ -203,7 +227,7 @@ class CodexInferenceService:
         text: str,
         *,
         on_event: Optional[EventCallback] = None,
-        timeout_s: float = 300.0,
+        timeout_s: float = float(DEFAULT_CODEX_TURN_TIMEOUT_S),
     ) -> CodexTurnResult:
         self._assert_can_infer()
         if not isinstance(thread_id, str) or not thread_id.strip():
@@ -501,7 +525,14 @@ class CodexInferenceService:
                     message="Codex is waiting for file-write approval.",
                 )
             )
-            return bridge.request_approval(title, command, details, timeout_s)
+            result = bridge.request_approval(title, command, details, timeout_s)
+            # Only a real Approvals-UI wait that expired is APPROVAL_TIMEOUT.
+            if isinstance(result, dict) and result.get("status") == "timeout":
+                self._signal_approval_timeout(
+                    thread_id=active_thread,
+                    turn_id=active_turn,
+                )
+            return result
 
         decision: dict = {"decision": "decline"}
         try:
@@ -621,6 +652,31 @@ class CodexInferenceService:
                 )
             except Exception:
                 pass
+
+    def _signal_approval_timeout(
+        self,
+        *,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> None:
+        """Mark the active turn failed due to a real Approvals-UI timeout.
+
+        Does not force-decline here — the approval handler still responds
+        ``decline`` to the open JSON-RPC request, then this terminal ends the turn.
+        """
+        evt = CodexInferenceEvent(
+            type=CodexInferenceEventType.APPROVAL_TIMEOUT,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            status="approval_timeout",
+            message="The approval request timed out before a decision was made.",
+        )
+        with self._state_lock:
+            # Do not overwrite a terminal already set (e.g. user cancelled).
+            if self._terminal is None:
+                self._terminal = evt
+                self._terminal_event.set()
+        self._emit(evt)
     def _run_turn_locked(
         self,
         thread_id: str,
@@ -699,14 +755,25 @@ class CodexInferenceService:
                 if self._terminal_event.wait(timeout=0.2):
                     break
             else:
+                with self._state_lock:
+                    had_pending_approvals = bool(self._pending_approvals)
+                    pending_count = len(self._pending_approvals)
+                log.info(
+                    "codex turn: wall-clock timeout after %.1fs "
+                    "(pending_approvals=%s count=%s) — classifying as TURN_TIMEOUT",
+                    float(timeout_s),
+                    had_pending_approvals,
+                    pending_count,
+                )
                 try:
                     self.cancel_active_turn()
                 except Exception:
                     pass
                 self._decline_pending_approvals(reason="turn_timeout")
+                # Always TURN_TIMEOUT — even if cleanup declined a pending approval.
                 raise CodexInferenceError(
-                    "Codex turn timed out while waiting for approval or a reply",
-                    event_type=CodexInferenceEventType.PROTOCOL_ERROR,
+                    "Codex did not finish within the configured turn timeout.",
+                    event_type=CodexInferenceEventType.TURN_TIMEOUT,
                 )
 
             terminal = self._terminal
@@ -743,6 +810,30 @@ class CodexInferenceService:
                     error_message=terminal.message or "Turn cancelled",
                     events=list(events),
                 )
+            if terminal.type == CodexInferenceEventType.APPROVAL_TIMEOUT:
+                return CodexTurnResult(
+                    ok=False,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    text=text_out,
+                    status="failed",
+                    error_type=CodexInferenceEventType.APPROVAL_TIMEOUT.value,
+                    error_message=terminal.message
+                    or "The approval request timed out before a decision was made.",
+                    events=list(events),
+                )
+            if terminal.type == CodexInferenceEventType.TURN_TIMEOUT:
+                return CodexTurnResult(
+                    ok=False,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    text=text_out,
+                    status="failed",
+                    error_type=CodexInferenceEventType.TURN_TIMEOUT.value,
+                    error_message=terminal.message
+                    or "Codex did not finish within the configured turn timeout.",
+                    events=list(events),
+                )
             return CodexTurnResult(
                 ok=False,
                 thread_id=thread_id,
@@ -766,13 +857,14 @@ class CodexInferenceService:
                 event_type=CodexInferenceEventType.AUTHENTICATION_REQUIRED,
             ) from None
         finally:
+            self._decline_pending_approvals(reason="turn_end")
             with self._state_lock:
                 if self._active_generation == generation:
                     self._active_thread_id = None
                     self._active_turn_id = None
                     self._event_sink = None
                     self._cancel_requested = False
-
+                    self._file_change_items.clear()
 
 def get_codex_inference_service(session: Optional[CodexSession] = None) -> CodexInferenceService:
     return CodexInferenceService(session=session or get_codex_session())

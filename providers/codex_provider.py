@@ -24,6 +24,7 @@ from codex.inference_types import (
 from codex.process import CodexProcessError
 from codex.protocol import sanitize_error_message
 from codex.session import get_codex_session
+from codex.timeouts import get_codex_turn_timeout_seconds
 
 from .base import (
     ApiMode,
@@ -56,7 +57,6 @@ from .errors import (
 )
 from .registry import ProviderRegistry, get_default_registry
 from .status import assert_safe_provider_payload
-
 CODEX_PROVIDER_ID = "codex_chatgpt"
 CODEX_DISPLAY_NAME = "Codex via ChatGPT"
 LOCAL_DISPLAY_NAME = "Local llama.cpp"
@@ -479,6 +479,8 @@ class CodexProvider:
                     CodexInferenceEventType.PROCESS_ERROR,
                     CodexInferenceEventType.AUTHENTICATION_REQUIRED,
                     CodexInferenceEventType.UNAVAILABLE,
+                    CodexInferenceEventType.TURN_TIMEOUT,
+                    CodexInferenceEventType.APPROVAL_TIMEOUT,
                 }:
                     msg = user_message_for_codex_error(
                         CodexInferenceError(
@@ -499,8 +501,12 @@ class CodexProvider:
 
                 def _worker():
                     try:
+                        timeout_s = float(get_codex_turn_timeout_seconds())
                         result_box["r"] = svc.run_turn(
-                            active_thread, text, on_event=on_event, timeout_s=300.0
+                            active_thread,
+                            text,
+                            on_event=on_event,
+                            timeout_s=timeout_s,
                         )
                     except Exception as exc:
                         error_box["e"] = exc
@@ -597,10 +603,16 @@ class CodexProvider:
                 )
                 return
             if not result.ok:
+                et = CodexInferenceEventType.PROTOCOL_ERROR
+                if result.error_type:
+                    try:
+                        et = CodexInferenceEventType(result.error_type)
+                    except ValueError:
+                        et = CodexInferenceEventType.PROTOCOL_ERROR
                 msg = user_message_for_codex_error(
                     CodexInferenceError(
                         result.error_message or "Codex turn failed",
-                        event_type=CodexInferenceEventType.PROTOCOL_ERROR,
+                        event_type=et,
                     )
                 )
                 yield InferenceEvent(event_type=InferenceEventType.ERROR, error=msg)

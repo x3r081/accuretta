@@ -3373,12 +3373,65 @@
     return null;
   }
 
+  /**
+   * Codex account auth for UI CTAs — independent of turn errors / process blips.
+   * Returns: "signed_in" | "signed_out" | "unknown"
+   */
+  function _codexAuthState() {
+    const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
+    if (!cx) return "unknown";
+    const ia = cx.inferenceAvailability || {};
+    const status = ia.status || null;
+    // Explicit signed-out from readiness / account.
+    if (status === "not_signed_in") return "signed_out";
+    if (cx.authenticated === true || ia.authenticated === true) return "signed_in";
+    if (cx.authenticated === false && status && status !== "not_signed_in") {
+      // authenticated:false with process/error status → unknown, not signed-out CTA
+      return "unknown";
+    }
+    if (cx.authenticated === false && ia.authenticated === false && status === "not_signed_in") {
+      return "signed_out";
+    }
+    if (typeof cx.authenticated === "boolean") {
+      return cx.authenticated ? "signed_in" : "signed_out";
+    }
+    if (typeof ia.authenticated === "boolean") {
+      return ia.authenticated ? "signed_in" : "unknown";
+    }
+    return "unknown";
+  }
+
+  /** Sign-in CTA copy — only when Codex session + explicitly signed out. */
+  function _codexSignInCtaReason() {
+    if (_sessionInferenceProviderId() !== "codex_chatgpt") return null;
+    if (_codexAuthState() !== "signed_out") return null;
+    return "Sign in with ChatGPT first";
+  }
+
+  /**
+   * Session unavailable banner text. Never shows sign-in copy unless auth is
+   * explicitly signed out. Timeouts / process errors stay neutral.
+   */
   function _codexSessionUnavailableReason() {
     if (_sessionInferenceProviderId() !== "codex_chatgpt") return null;
     const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
+    const auth = _codexAuthState();
+    if (auth === "signed_out") return _codexSignInCtaReason();
+    if (auth === "unknown") return "Checking ChatGPT sign-in…";
+    // signed_in — only surface non-auth readiness problems
     if (cx && cx.selectable) return null;
-    return (cx && (cx.selectionDisabledReason || cx.disabledReason))
-      || "Codex is unavailable. Reconnect in Settings — this session stays Codex and will not fall back to local.";
+    const ia = cx && cx.inferenceAvailability;
+    const status = ia && ia.status;
+    if (status === "process_unavailable" || status === "error") {
+      return "Codex is temporarily unavailable. You can retry — this session stays Codex.";
+    }
+    if (status === "cli_missing") return "Codex CLI unavailable. Reconnect in Settings.";
+    if (status === "protocol_unsupported") return "Codex protocol unsupported.";
+    if (status === "inference_disabled") return "Codex inference disabled in this build.";
+    // Signed in but not selectable for another reason — no sign-in CTA.
+    const raw = (cx && (cx.selectionDisabledReason || cx.disabledReason)) || "";
+    if (/sign in with chatgpt/i.test(String(raw))) return null;
+    return raw || null;
   }
 
   function assistantResponseLabel(m) {
@@ -3434,16 +3487,28 @@
   function updateProviderSessionUnavailable() {
     const bar = $("#provider-session-unavailable");
     const textEl = $("#provider-session-unavailable-text");
+    const btn = $("#btn-provider-reconnect");
     if (!bar || !textEl) return;
-    const reason = _codexSessionUnavailableReason();
+    const signIn = _codexSignInCtaReason();
+    const reason = signIn || _codexSessionUnavailableReason();
     if (!reason) {
       bar.hidden = true;
       textEl.textContent = "";
+      if (btn) btn.hidden = true;
       return;
     }
-    // Keep session labelled Codex — never relabel as Local.
     textEl.textContent = reason;
     bar.hidden = false;
+    // "Open Settings" only for explicit sign-in CTA; hide for transient checks.
+    if (btn) {
+      btn.hidden = !signIn && /checking chatgpt sign-in/i.test(reason);
+      if (signIn) {
+        btn.hidden = false;
+        btn.textContent = "Open Settings";
+      } else if (!btn.hidden) {
+        btn.textContent = "Open Settings";
+      }
+    }
   }
 
   function updateProviderSessionBanner() {
@@ -3493,13 +3558,21 @@
   async function startNewSessionForSettingsProvider() {
     const settingsPid = _activeInferenceProviderId();
     if (settingsPid === "codex_chatgpt") {
-      const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
-      if (!cx || !cx.selectable) {
-        const why = (cx && (cx.selectionDisabledReason || cx.disabledReason))
-          || "Codex is not ready. Open Settings to sign in or check status.";
-        toast(why, "warn", 4200, "codex-not-ready");
+      const auth = _codexAuthState();
+      if (auth === "signed_out") {
+        toast("Sign in with ChatGPT first", "warn", 4200, "codex-not-ready");
         openSettings();
         return;
+      }
+      if (auth === "unknown") {
+        toast("Checking ChatGPT sign-in…", "info", 2800, "codex-auth-check");
+        try { await loadProviders({ live: true }); } catch (_) {}
+        refreshSessionProviderUI();
+        if (_codexAuthState() === "signed_out") {
+          toast("Sign in with ChatGPT first", "warn", 4200, "codex-not-ready");
+          openSettings();
+          return;
+        }
       }
     }
     await newChat();
@@ -3531,14 +3604,20 @@
     renderPlanPanel([]);
     const providerId = _sessionInferenceProviderId();
     if (providerId === "codex_chatgpt") {
-      const cx = (state.providers || []).find((p) => p.providerId === "codex_chatgpt");
-      if (!cx || !cx.selectable) {
-        const why = (cx && (cx.selectionDisabledReason || cx.disabledReason))
-          || "Codex is not ready. Open Settings to sign in or check status.";
-        toast(why, "warn", 4200, "codex-not-ready");
+      // Gate only on confirmed auth — not on process readiness / last turn error.
+      let auth = _codexAuthState();
+      if (auth === "unknown") {
+        try { await loadProviders({ live: true }); } catch (_) {}
+        refreshSessionProviderUI();
+        auth = _codexAuthState();
+      }
+      if (auth === "signed_out") {
+        toast("Sign in with ChatGPT first", "warn", 4200, "codex-not-ready");
         openSettings();
         return;
       }
+      // signed_in (or still unknown after refresh): allow retry; run_turn will
+      // ensure the app-server is ready. Never block on TURN_TIMEOUT leftovers.
     } else if (providerId !== "openai" && !state.settings.model) {
       toast("Pick a model in Settings first.", "warn", 3200, "no-model");
       openSettings();
@@ -3617,6 +3696,12 @@
       setStreamingUI(false);
       await loadChats();
       renderChatList();
+      // Re-render composer CTA from current Codex account state (not last error).
+      try {
+        await loadProviders({ live: true });
+      } catch (_) {
+        refreshSessionProviderUI();
+      }
       notifyCompletion();
     }
   }
@@ -4900,6 +4985,7 @@
         }
         toast(evt.note || "Waiting for approval…", "info", 4200, "codex-waiting-approval");
         // Jump to Approvals so the card is visible immediately.
+        // Only for a real waiting_for_approval notice — never for turn timeouts.
         try {
           state.mobileTab = "approvals";
           applyMobileTab?.();
@@ -4933,6 +5019,12 @@
         thinkLine.classList.add("done");
         const span = thinkLine.querySelector(".think-title, span.shimmer, span");
         if (span) { span.classList.remove("shimmer"); span.textContent = "Stopped"; }
+      }
+      // Overall turn timeout must not jump to Approvals (approval timeouts already
+      // opened that tab when waiting_for_approval was emitted).
+      const errText = String(evt.error || "");
+      if (/configured task timeout/i.test(errText) || (/did not finish/i.test(errText) && !/approval/i.test(errText))) {
+        // leave current tab alone
       }
       renderStatus(0, "idle");
     }
@@ -7032,12 +7124,29 @@
     );
   }
 
-  async function loadProviders() {
+  async function loadProviders(opts = {}) {
     const gen = _providerSelectGen;
     try {
+      // Prefer a live Codex status refresh after turn errors so auth CTAs
+      // re-render from account state rather than a stale signed-out DOM.
+      const path = opts && opts.live
+        ? "/api/providers/codex_chatgpt/status"
+        : null;
       const data = await api("/api/providers");
       if (gen !== _providerSelectGen) return; // stale
       state.providers = Array.isArray(data.providers) ? data.providers : [];
+      if (path) {
+        try {
+          const liveStatus = await api(path);
+          if (liveStatus && liveStatus.providerId === "codex_chatgpt") {
+            const list = state.providers.slice();
+            const idx = list.findIndex((p) => p.providerId === "codex_chatgpt");
+            if (idx >= 0) list[idx] = { ...list[idx], ...liveStatus };
+            else list.push(liveStatus);
+            state.providers = list;
+          }
+        } catch (_) { /* keep list snapshot */ }
+      }
       // selectedProviderId is the Settings default for new sessions only.
       const fromApi = data.selectedProviderId || null;
       if (!_pendingDefaultProviderId) {
@@ -7053,6 +7162,7 @@
         state.selectedProviderId = state.settings.provider_id || "local_llama";
       }
     }
+    refreshSessionProviderUI();
   }
 
   function _providerSafeLabel(p) {
@@ -7085,9 +7195,16 @@
         return ind.detail ? `${ind.label} — ${ind.detail}` : ind.label;
       }
       if (codex.selectable) return "Codex ready";
-      if (codex.selectionDisabledReason === "Sign in with ChatGPT first"
-          || (codex.inferenceAvailability && codex.inferenceAvailability.status === "not_signed_in")) {
+      const auth = _codexAuthState();
+      if (auth === "signed_out") {
         return "Codex sign-in required — Sign in with ChatGPT first";
+      }
+      if (auth === "unknown") {
+        return "Checking ChatGPT sign-in…";
+      }
+      if (auth === "signed_in" && (codex.selectionDisabledReason === "Sign in with ChatGPT first"
+          || (codex.inferenceAvailability && codex.inferenceAvailability.status === "not_signed_in"))) {
+        return "Codex temporarily unavailable — retry in Settings";
       }
       if (codex.selectionDisabledReason === "Codex inference disabled in this build"
           || (codex.inferenceAvailability && codex.inferenceAvailability.status === "inference_disabled")) {
@@ -8546,6 +8663,13 @@
       const mode = s.codex_write_mode || "ask";
       codexWriteSel.value = ["chat_only", "ask", "workspace_auto"].includes(mode) ? mode : "ask";
     }
+    const codexTimeoutSel = $("#set-codex-turn-timeout");
+    if (codexTimeoutSel) {
+      const allowed = ["300", "600", "900", "1800", "3600"];
+      let t = String(s.codex_turn_timeout_seconds ?? 900);
+      if (!allowed.includes(t)) t = "900";
+      codexTimeoutSel.value = t;
+    }
   }
 
   async function refreshDesktopStatus() {
@@ -8629,6 +8753,11 @@
       use_tailwind_cdn: !!state.settings.use_tailwind_cdn,
       ide_multifile: !!state.settings.ide_multifile,
       codex_write_mode: ($("#set-codex-write-mode")?.value || state.settings.codex_write_mode || "ask"),
+      codex_turn_timeout_seconds: Number(
+        $("#set-codex-turn-timeout")?.value
+        || state.settings.codex_turn_timeout_seconds
+        || 900
+      ),
     };
 
     // Detect which load-time keys actually changed → triggers a llama-server
@@ -10106,6 +10235,17 @@
         populateCodexAuthForm({ live: false });
       } catch (err) {
         toast("Could not save Codex write mode: " + (err.message || err), "error");
+      }
+    });
+    $("#set-codex-turn-timeout")?.addEventListener("change", async () => {
+      const sel = $("#set-codex-turn-timeout");
+      const raw = Number(sel?.value || 900);
+      try {
+        await saveSettings({ codex_turn_timeout_seconds: raw });
+        const mins = Math.round(raw / 60);
+        toast(`Codex task timeout: ${mins} minutes`, "ok", 2200);
+      } catch (err) {
+        toast("Could not save Codex task timeout: " + (err.message || err), "error");
       }
     });
     $("#set-provider")?.addEventListener("change", () => {

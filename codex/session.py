@@ -221,16 +221,20 @@ class CodexSession:
             except Exception as exc:
                 error = sanitize_error_message(str(exc))
                 available = False
-                process_state = "error"
+                process_state = self.process_state() or "error"
+                # Preserve last-known account — process errors are not logout.
+                if self._account is not None:
+                    account = self._account.account
+                    pending = self._account.pending
         elif not live:
             available = bool(d.available)
-            if self._account is not None and process_state == "ready":
+            if self._account is not None:
                 account = self._account.account
                 pending = self._account.pending
-        elif self._account is not None and process_state == "ready":
+        elif self._account is not None:
             account = self._account.account
             pending = self._account.pending
-            available = True
+            available = process_state == "ready"
         return build_codex_status_dto(
             discovery=d,
             process_state=process_state,

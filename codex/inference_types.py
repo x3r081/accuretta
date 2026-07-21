@@ -20,6 +20,11 @@ class CodexInferenceEventType(str, Enum):
     UNAVAILABLE = "unavailable"
     PROTOCOL_ERROR = "protocol_error"
     PROCESS_ERROR = "process_error"
+    # Explicit timeouts — never classify these via ambiguous human strings.
+    TURN_TIMEOUT = "turn_timeout"
+    APPROVAL_TIMEOUT = "approval_timeout"
+    # Alias name used in docs / audits (same wire value as PROCESS_ERROR).
+    PROCESS_EXIT = "process_error"
 
 
 @dataclass(frozen=True)

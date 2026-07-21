@@ -294,12 +294,23 @@ class CodexErrorMessageTest(unittest.TestCase):
     def test_timeout_does_not_blame_cli_version(self):
         msg = user_message_for_codex_error(
             CodexInferenceError(
+                "Codex did not finish within the configured turn timeout.",
+                event_type=CodexInferenceEventType.TURN_TIMEOUT,
+            )
+        )
+        self.assertEqual(msg, MSG_TIMEOUT)
+        self.assertNotIn("CLI version", msg)
+        self.assertNotIn("approval", msg.lower())
+
+    def test_legacy_ambiguous_maps_to_general_timeout(self):
+        msg = user_message_for_codex_error(
+            CodexInferenceError(
                 "Codex turn timed out while waiting for approval or a reply",
                 event_type=CodexInferenceEventType.PROTOCOL_ERROR,
             )
         )
-        self.assertEqual(msg, MSG_APPROVAL_TIMEOUT)
-        self.assertNotIn("CLI version", msg)
+        self.assertEqual(msg, MSG_TIMEOUT)
+        self.assertNotEqual(msg, MSG_APPROVAL_TIMEOUT)
 
     def test_generic_timeout_message(self):
         msg = user_message_for_codex_error(
@@ -308,8 +319,17 @@ class CodexErrorMessageTest(unittest.TestCase):
                 event_type=CodexInferenceEventType.PROTOCOL_ERROR,
             )
         )
-        self.assertIn(msg, {MSG_TIMEOUT, MSG_APPROVAL_TIMEOUT})
+        self.assertEqual(msg, MSG_TIMEOUT)
         self.assertNotEqual(msg, MSG_PROTOCOL_FAILURE)
+
+    def test_approval_timeout_type(self):
+        msg = user_message_for_codex_error(
+            CodexInferenceError(
+                "The approval request timed out before a decision was made.",
+                event_type=CodexInferenceEventType.APPROVAL_TIMEOUT,
+            )
+        )
+        self.assertEqual(msg, MSG_APPROVAL_TIMEOUT)
 
     def test_process_exit_message(self):
         msg = user_message_for_codex_error(

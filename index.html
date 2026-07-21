@@ -607,6 +607,17 @@
           </select>
           <span class="hint">Applies to the active Accuretta workspace only. Paths outside it are always declined. Shell commands still require approval. Changing this starts a fresh Codex thread on the next turn.</span>
         </div>
+        <div class="form-row" style="margin-top:10px;">
+          <label for="set-codex-turn-timeout">Codex task timeout</label>
+          <select id="set-codex-turn-timeout" title="Maximum time for one Codex task before Accuretta stops waiting">
+            <option value="300">5 minutes</option>
+            <option value="600">10 minutes</option>
+            <option value="900">15 minutes (recommended)</option>
+            <option value="1800">30 minutes</option>
+            <option value="3600">60 minutes</option>
+          </select>
+          <span class="hint">Limits the total time for one Codex task. Complex coding tasks can take several minutes. Approval dialogs have their own separate timeout.</span>
+        </div>
         <div id="codex-browser-row" style="display:none;margin-top:10px;">
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
             <a class="btn sm" id="btn-codex-open-auth" href="#" target="_blank" rel="noopener noreferrer" title="Open ChatGPT sign-in page">Open sign-in page</a>
