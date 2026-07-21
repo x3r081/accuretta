@@ -151,14 +151,25 @@ def log_chat_dispatch(
     dispatched_provider_id: str,
     turn_id: Optional[str] = None,
 ) -> None:
-    """Dev-safe structured log — no prompts, tokens, or account payloads."""
-    log.info(
-        "chat_dispatch session=%s settings_provider=%s dispatched=%s turn=%s",
-        (session_id or "")[:64],
-        (settings_provider_id or "")[:64],
-        (dispatched_provider_id or "")[:64],
-        (turn_id or "")[:64],
+    """Dev-safe structured log — no prompts, tokens, or account payloads.
+
+    Emits via the module logger *and* stderr so operator bridge logs always
+    capture dispatch evidence (the root logger is often unconfigured).
+    """
+    line = (
+        "chat_dispatch "
+        f"session={(session_id or '')[:64]} "
+        f"settings_provider={(settings_provider_id or '')[:64]} "
+        f"dispatched={(dispatched_provider_id or '')[:64]} "
+        f"turn={(turn_id or '')[:64]}"
     )
+    log.info("%s", line)
+    try:
+        import sys
+
+        print(f"[provider] {line}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 def safe_session_provider_dto(chat: Optional[dict], settings: Optional[dict] = None) -> dict[str, Any]:

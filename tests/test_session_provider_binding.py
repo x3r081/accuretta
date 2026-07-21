@@ -148,6 +148,27 @@ class SessionBindingUnitTest(unittest.TestCase):
         for bad in ("Authorization", "Bearer", "sk-", "password"):
             self.assertNotIn(bad.lower(), msg.lower())
 
+    def test_dispatch_log_emits_to_stderr_for_bridge_operators(self):
+        """Regression: unconfigured root logger must not hide dispatch evidence."""
+        from io import StringIO
+        from contextlib import redirect_stderr
+
+        buf = StringIO()
+        with redirect_stderr(buf):
+            log_chat_dispatch(
+                session_id="sess-stderr",
+                settings_provider_id=LOCAL,
+                dispatched_provider_id=CODEX,
+                turn_id="turn-stderr",
+            )
+        out = buf.getvalue()
+        self.assertIn("[provider] chat_dispatch", out)
+        self.assertIn("session=sess-stderr", out)
+        self.assertIn("dispatched=codex_chatgpt", out)
+        self.assertIn("settings_provider=local_llama", out)
+        self.assertNotIn("Authorization", out)
+        self.assertNotIn("Bearer", out)
+
 
 class SessionDispatchBoundaryTest(unittest.TestCase):
     def setUp(self):
