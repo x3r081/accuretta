@@ -12,10 +12,11 @@ from typing import Any, Iterator, Optional, Protocol, Sequence, runtime_checkabl
 
 
 class ApiMode(str, Enum):
-    """Wire protocol used for inference."""
+    """Wire protocol used for inference / account backends."""
 
     OPENAI_CHAT = "openai_chat"
     LOCAL_LLAMA = "local_llama"
+    CODEX_APP_SERVER = "codex_app_server"
 
 
 class AuthType(str, Enum):
@@ -25,6 +26,7 @@ class AuthType(str, Enum):
     API_KEY = "api_key"
     OAUTH_PKCE = "oauth_pkce"
     OAUTH_DEVICE = "oauth_device"
+    CODEX_MANAGED_CHATGPT = "codex_managed_chatgpt"
 
 
 class InferenceEventType(str, Enum):
