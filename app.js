@@ -8839,7 +8839,11 @@
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ title: "Pick models folder" }),
         });
-        if (!r.path) return;
+        if (r.error || r.code) {
+          toast(r.message || "Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
+          return;
+        }
+        if (!r.path) return; // user cancelled
         $("#set-models-dir").value = r.path;
         await api("/api/models/scan-dir", {
           method: "POST", headers: {"Content-Type": "application/json"},
@@ -8848,7 +8852,7 @@
         await refreshModels();
         toast("models folder set", "ok", 2000);
       } catch (e) {
-        toast("browse failed: " + (e.message || e), "error");
+        toast("Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
       } finally { btn.disabled = false; }
     });
     $("#set-models-dir")?.addEventListener("change", async (e) => {
@@ -9195,10 +9199,16 @@
       btn.disabled = true;
       try {
         const r = await api("/api/browse-folder", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+        if (r.error || r.code) {
+          toast(r.message || "Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
+          return;
+        }
         if (r.path) {
           $("#ws-input").value = r.path;
           await addWorkspaceFolder();
         }
+      } catch (e) {
+        toast("Folder picker unavailable. Paste the folder path into the text field instead.", "error", 6000);
       } finally { btn.disabled = false; }
     });
     $("#ws-input").addEventListener("keydown", e => {

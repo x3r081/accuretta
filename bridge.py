@@ -15019,6 +15019,156 @@ STATIC_WHITELIST = {
 }
 
 
+# /api/browse-folder must never abort the bridge process. On macOS, in-process
+# Tk/AppKit dialogs can raise ObjC exceptions that tear down the interpreter.
+# Darwin therefore uses `osascript` in a subprocess; Windows/Linux keep the
+# existing Tkinter dialog. Override via `_pick_folder_impl` in tests.
+_PICKER_PASTE_HINT = "Paste the folder path into the text field instead."
+
+# Test seam — when set, pick_folder() calls this instead of a native dialog.
+_pick_folder_impl = None
+
+
+def _gui_picker_disabled() -> bool:
+    return os.environ.get("ACCURETTA_NO_GUI", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _picker_error(code: str, detail: str) -> dict:
+    """Structured picker failure for the API (no traceback in the body)."""
+    return {
+        "path": "",
+        "cancelled": False,
+        "error": detail,
+        "code": code,
+        "message": f"{detail} {_PICKER_PASTE_HINT}",
+    }
+
+
+def _picker_cancel() -> dict:
+    return {
+        "path": "",
+        "cancelled": True,
+        "error": None,
+        "code": None,
+        "message": None,
+    }
+
+
+def _picker_ok(path: str) -> dict:
+    return {
+        "path": path,
+        "cancelled": False,
+        "error": None,
+        "code": None,
+        "message": None,
+    }
+
+
+def _pick_folder_osascript(title: str) -> dict:
+    """macOS folder dialog via osascript (separate process — AppKit-safe).
+
+    Prompt is passed as an argv item (not interpolated into -e source) so
+    user-controlled titles cannot break out of the AppleScript string.
+    """
+    script_lines = [
+        "on run argv",
+        "  set prompt to item 1 of argv",
+        "  return POSIX path of (choose folder with prompt prompt)",
+        "end run",
+    ]
+    cmd: list[str] = ["osascript"]
+    for line in script_lines:
+        cmd.extend(["-e", line])
+    cmd.append(title)
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except FileNotFoundError:
+        print("[browse-folder] osascript not found", flush=True)
+        return _picker_error("unavailable", "Folder picker unavailable.")
+    except subprocess.TimeoutExpired:
+        print("[browse-folder] osascript timed out", flush=True)
+        return _picker_error("unavailable", "Folder picker timed out.")
+    except Exception as e:
+        print(f"[browse-folder] osascript spawn failed: {type(e).__name__}", flush=True)
+        traceback.print_exc()
+        return _picker_error("picker_failed", "Folder picker failed.")
+
+    stdout = (r.stdout or "").strip()
+    stderr = (r.stderr or "").strip()
+    if r.returncode != 0:
+        combined = f"{stderr}\n{stdout}".strip()
+        low = combined.lower()
+        # AppleScript: "User canceled." (US spelling); also accept "cancelled".
+        if ("cancel" in low) or (r.returncode == 1 and not combined):
+            print("[browse-folder] user cancelled (osascript)", flush=True)
+            return _picker_cancel()
+        print(
+            f"[browse-folder] osascript failed rc={r.returncode}",
+            flush=True,
+        )
+        return _picker_error("unavailable", "Folder picker unavailable.")
+
+    path = stdout.rstrip("\r\n")
+    # choose folder returns a trailing slash; normalize for Path consumers.
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    if not path:
+        return _picker_cancel()
+    # Do not log absolute paths (may include home / private folder names).
+    print("[browse-folder] selected path ok", flush=True)
+    return _picker_ok(path)
+
+
+def _pick_folder_tk(title: str) -> dict:
+    """Windows/Linux folder dialog (unchanged Tkinter behavior)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askdirectory(title=title)
+        root.destroy()
+        path = (path or "").strip()
+        if not path:
+            return _picker_cancel()
+        return _picker_ok(path)
+    except Exception as e:
+        print(f"[browse-folder] tkinter picker failed: {type(e).__name__}", flush=True)
+        traceback.print_exc()
+        return _picker_error("picker_failed", "Folder picker failed.")
+
+
+def pick_folder(title: str = "Pick a folder") -> dict:
+    """Open a native folder picker. Always returns a structured dict; never raises
+    an ObjC/AppKit exception into the HTTP worker (Darwin uses a subprocess)."""
+    title = (title or "Pick a folder").strip() or "Pick a folder"
+    try:
+        if _pick_folder_impl is not None:
+            return _pick_folder_impl(title)
+        if _gui_picker_disabled():
+            print("[browse-folder] ACCURETTA_NO_GUI set — native picker skipped", flush=True)
+            return _picker_error(
+                "no_gui",
+                "Folder picker disabled in this environment.",
+            )
+        if sys.platform == "darwin":
+            return _pick_folder_osascript(title)
+        return _pick_folder_tk(title)
+    except Exception as e:
+        # Last-resort guard: keep the bridge alive for any unexpected failure.
+        print(f"[browse-folder] unexpected error: {type(e).__name__}", flush=True)
+        traceback.print_exc()
+        return _picker_error("picker_failed", "Folder picker failed.")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Accuretta/1.0"
 
@@ -15056,6 +15206,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _peer_ip(self):
+        import ipaddress
+        try:
+            addr = getattr(self, "client_address", None) or ("",)
+            return ipaddress.ip_address(addr[0])
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    def _peer_is_loopback(self) -> bool:
+        ip = self._peer_ip()
+        return bool(ip is not None and ip.is_loopback)
+
     def _peer_ok(self) -> bool:
         # Only THIS machine (loopback) or YOUR Tailnet (Tailscale's
         # 100.64.0.0/10 and fd7a:115c:a1e0::/48 ranges) may connect. Everyone
@@ -15063,9 +15225,8 @@ class Handler(BaseHTTPRequestHandler):
         # Tailscale already proves the remote device is yours, so no password is
         # needed. client_address is the real TCP peer; it can't be forged.
         import ipaddress
-        try:
-            ip = ipaddress.ip_address((self.client_address or ("",))[0])
-        except (ValueError, IndexError, TypeError):
+        ip = self._peer_ip()
+        if ip is None:
             return False
         if ip.is_loopback:
             return True
@@ -15727,19 +15888,20 @@ class Handler(BaseHTTPRequestHandler):
                 "suggested": suggested,
             })
         if p == "/api/browse-folder":
-            # native OS folder picker, only on the machine running the bridge.
+            # Native OS folder picker on the machine running the bridge.
+            # Loopback-only: Tailscale/remote peers must paste a path instead.
+            if not self._peer_is_loopback():
+                return self._send_json(403, {
+                    "error": "Native folder picker is only available from this machine.",
+                    "code": "picker_local_only",
+                    "message": (
+                        "Paste the folder path into the text field instead. "
+                        "Remote clients cannot open a host folder dialog."
+                    ),
+                })
             title = (body.get("title") or "Pick a folder").strip()
-            try:
-                import tkinter as tk
-                from tkinter import filedialog
-                root = tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = filedialog.askdirectory(title=title)
-                root.destroy()
-                return self._send_json(200, {"path": path or ""})
-            except Exception as e:
-                return self._send_json(200, {"path": "", "error": str(e)})
+            result = pick_folder(title)
+            return self._send_json(200, result)
         if p == "/api/models/scan-dir":
             # Save settings.models_dir and immediately return the scan.
             new_dir = (body.get("path") or "").strip()
