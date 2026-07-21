@@ -29,12 +29,12 @@ def build_codex_status_dto(
     reason = disabled_reason or discovery.disabled_reason
     out: dict[str, Any] = {
         "providerId": "codex_chatgpt",
-        "displayName": "ChatGPT / Codex",
+        "displayName": "Codex via ChatGPT",
         "authType": "codex_managed_chatgpt",
         "apiMode": "codex_app_server",
         "experimental": True,
-        # UI chat selection stays off until a later milestone wires inference.
-        "supportsInference": False,
+        # Listed in Settings inference dropdown; selectable gated by readiness.
+        "supportsInference": True,
         "supportsModelListing": False,
         "supportsAccountAuthentication": True,
         "selectable": False,

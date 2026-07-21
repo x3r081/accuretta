@@ -3,8 +3,8 @@
 Newly written for Accuretta. Uses the official Codex app-server JSON-RPC.
 Codex owns OAuth credentials. Accuretta never stores ChatGPT tokens.
 
-Inference is behind ACCURETTA_CODEX_INFERENCE_ENABLED and is not shown in the
-Settings provider dropdown yet (supportsInference stays false for UI).
+Inference is behind ACCURETTA_CODEX_INFERENCE_ENABLED. The Settings dropdown
+lists Codex when supportsInference is true; selection requires readiness.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def build_codex_definition() -> ProviderDefinition:
     reason = None if enabled else (discovery.disabled_reason or "Codex CLI not installed")
     return ProviderDefinition(
         id=CODEX_PROVIDER_ID,
-        display_name="ChatGPT / Codex",
+        display_name="Codex via ChatGPT",
         api_mode=ApiMode.CODEX_APP_SERVER,
         auth_type=AuthType.CODEX_MANAGED_CHATGPT,
         capabilities=ProviderCapabilities(
@@ -76,13 +76,12 @@ def build_codex_definition() -> ProviderDefinition:
             model_listing=False,
             account_authentication=True,
             device_authorization=True,
-            # Backend capability when flag is on; UI still hides via supports_inference=False.
             inference=bool(flag),
         ),
         default_base_url=None,
         supports_model_listing=False,
-        # Keep False so Settings dropdown does not list Codex yet.
-        supports_inference=False,
+        # Listed in Settings; option enabled only when readiness.ready.
+        supports_inference=True,
         experimental=True,
         enabled=enabled,
         disabled_reason=reason,
@@ -111,11 +110,19 @@ def get_codex_provider_status(*, live: bool = True) -> dict:
             error=sanitize_error_message(str(exc)),
             inference_flag_enabled=is_codex_inference_enabled(),
         )
-    readiness = assess_codex_inference_readiness(live=False if not live else live)
+    readiness = assess_codex_inference_readiness(live=live)
     dto["inferenceAvailability"] = readiness
-    # UI contract: still not selectable / not listed for chat.
-    dto["supportsInference"] = False
-    dto["selectable"] = False
+    dto["supportsInference"] = True
+    dto["displayName"] = "Codex via ChatGPT"
+    ready = bool(readiness.get("ready"))
+    dto["selectable"] = ready
+    # Keep auth availability distinct from inference selection readiness.
+    dto["inferenceReady"] = ready
+    dto["selectionDisabledReason"] = readiness.get("selectionDisabledReason")
+    dto["indicator"] = readiness.get("indicator")
+    if not ready and readiness.get("selectionDisabledReason"):
+        # Prefer precise selection copy when the option is shown disabled.
+        dto["disabledReason"] = readiness.get("selectionDisabledReason")
     assert_safe_provider_payload(dto)
     return dto
 
@@ -128,7 +135,7 @@ def safe_codex_response_metadata(
     """Safe provider metadata for responses / tests (never tokens)."""
     out = {
         "providerId": CODEX_PROVIDER_ID,
-        "providerDisplayName": "ChatGPT / Codex",
+        "providerDisplayName": "Codex via ChatGPT",
     }
     if isinstance(model_label, str) and model_label.strip():
         out["modelLabel"] = model_label.strip()[:120]

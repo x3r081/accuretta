@@ -545,9 +545,10 @@
     <div class="form-group">Provider</div>
     <div class="form-row" id="provider-section">
       <label for="set-provider">Inference provider</label>
-      <select id="set-provider" aria-describedby="set-provider-hint"></select>
-      <span class="hint" id="set-provider-hint">Local llama.cpp is the default. OpenAI API is experimental and billed separately by OpenAI — a ChatGPT subscription is not reused.</span>
-      <div id="provider-status-line" class="hint" style="margin-top:6px;" role="status" aria-live="polite"></div>
+      <select id="set-provider" aria-describedby="set-provider-hint provider-status-line provider-readiness"></select>
+      <span class="hint" id="set-provider-hint">Choose Local llama.cpp or Codex via ChatGPT. Signing in with ChatGPT does not change this selection. OpenAI API keys remain a separate experimental option.</span>
+      <div id="provider-readiness" class="hint" style="margin-top:6px;" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="provider-status-line" class="hint" style="margin-top:4px;" role="status" aria-live="polite"></div>
       <div id="openai-key-row" style="display:none;margin-top:10px;">
         <label for="set-openai-key">OpenAI API key</label>
         <input type="password" id="set-openai-key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="sk-…" style="width:100%;" />
@@ -584,7 +585,7 @@
       </div>
       <div id="codex-auth-section" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border, #333);">
         <label>ChatGPT / Codex</label>
-        <span class="hint" id="codex-auth-hint">Uses the official OpenAI Codex client and an eligible ChatGPT plan. Codex inference is not enabled in this milestone. OpenAI API-key access remains separate. ChatGPT history and memory are not imported into Accuretta. Usage is subject to the user's Codex/ChatGPT plan limits. Accuretta is not an official OpenAI product. Experimental.</span>
+        <span class="hint" id="codex-auth-hint">Authentication is connected here separately from the inference provider above. Codex inference is a separate capability — select “Codex via ChatGPT” only after you are signed in and ready. Usage is subject to your eligible ChatGPT/Codex plan. Accuretta never receives or stores ChatGPT OAuth tokens. OpenAI API-key access remains separate. ChatGPT history and memory are not imported. Accuretta is not an official OpenAI product. Experimental.</span>
         <div id="codex-status-line" class="hint" style="margin-top:6px;" role="status" aria-live="polite"></div>
         <div id="codex-meta-line" class="hint" style="margin-top:4px;"></div>
         <div id="codex-browser-row" style="display:none;margin-top:10px;">

@@ -184,9 +184,16 @@ class CodexProviderRoutingTest(unittest.TestCase):
         chat = resolve_chat_provider({"provider_id": DEFAULT_PROVIDER_ID})
         self.assertEqual(chat.provider_id, DEFAULT_PROVIDER_ID)
 
-    def test_settings_select_still_blocked(self):
-        with self.assertRaises(ProviderUnavailable):
-            select_provider(CODEX_PROVIDER_ID, {}, save=lambda s: None)
+    def test_settings_select_allowed_when_ready(self):
+        saves = []
+        out = select_provider(CODEX_PROVIDER_ID, {}, save=lambda s: saves.append(dict(s)))
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(saves[-1]["provider_id"], CODEX_PROVIDER_ID)
+
+    def test_settings_select_blocked_when_flag_off(self):
+        with mock.patch.dict(os.environ, {ENV_CODEX_INFERENCE_ENABLED: "0"}):
+            with self.assertRaises(ProviderUnavailable):
+                select_provider(CODEX_PROVIDER_ID, {}, save=lambda s: None)
 
     def test_codex_ready_usable_for_chat_without_settings_select(self):
         sel = resolve_provider_selection({"provider_id": CODEX_PROVIDER_ID})
@@ -370,7 +377,7 @@ class CodexProviderRoutingTest(unittest.TestCase):
         self.assertEqual("".join(texts), "Hello from Codex")
         safe = safe_codex_response_metadata(model_label="fake-model")
         self.assertEqual(safe["providerId"], CODEX_PROVIDER_ID)
-        self.assertEqual(safe["providerDisplayName"], "ChatGPT / Codex")
+        self.assertEqual(safe["providerDisplayName"], "Codex via ChatGPT")
         self.assertEqual(safe.get("modelLabel"), "fake-model")
         blob = json.dumps(safe)
         self.assertNotIn(SECRET, blob)
@@ -380,8 +387,8 @@ class CodexProviderRoutingTest(unittest.TestCase):
 
     def test_status_exposes_inference_availability_not_selectable(self):
         st = get_codex_provider_status(live=True)
-        self.assertFalse(st["supportsInference"])
-        self.assertFalse(st["selectable"])
+        self.assertTrue(st["supportsInference"])
+        self.assertTrue(st["selectable"])
         avail = st.get("inferenceAvailability") or {}
         self.assertIn("status", avail)
         self.assertIn("ready", avail)

@@ -23,6 +23,8 @@ EXAMPLE_CLOUD_DEFINITION = ProviderDefinition(
     ),
     default_base_url=None,
     supports_model_listing=False,
+    # Replaced in the Settings inference dropdown by Codex via ChatGPT.
+    supports_inference=False,
     experimental=True,
     enabled=False,
     disabled_reason="No provider registration configured",

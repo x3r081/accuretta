@@ -295,11 +295,14 @@ def select_provider(provider_id: str, settings: dict, *, save: Callable[[dict], 
             provider_id=provider_id,
         )
     elif definition.id == CODEX_PROVIDER_ID:
-        raise ProviderUnavailable(
-            "ChatGPT / Codex authentication is available, but Codex inference "
-            "is not enabled in this milestone.",
-            provider_id=provider_id,
+        from providers.codex_readiness import (
+            assess_codex_inference_readiness,
+            readiness_to_provider_error,
         )
+
+        readiness = assess_codex_inference_readiness(live=True)
+        if not readiness.get("ready"):
+            raise readiness_to_provider_error(readiness, provider_id=provider_id)
     elif definition.id != DEFAULT_PROVIDER_ID:
         raise ProviderUnavailable(
             "This provider cannot be selected yet",
@@ -387,6 +390,7 @@ def disconnect_provider(provider_id: str, settings: dict) -> dict:
 
     if provider_id == CODEX_PROVIDER_ID:
         from providers.codex_provider import codex_logout
+        # Auth disconnect only — never rewrite settings.provider_id.
         return codex_logout()
 
     info = get_auth_store_info()

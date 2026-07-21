@@ -39,7 +39,7 @@ from providers.management import (
     select_provider,
     shutdown_provider_background,
 )
-from providers.errors import ProviderUnavailable
+from providers.errors import AuthenticationRequired, ProviderUnavailable
 from providers.openai_provider import FAKE_KEY_MARKER, api_key_credential
 from providers.registry import reset_default_registry
 from providers.status import assert_safe_provider_payload
@@ -287,14 +287,15 @@ class CodexApiBoundaryTest(unittest.TestCase):
     def test_status_safe(self):
         st = get_codex_provider_status(live=True)
         assert_safe_provider_payload(st)
-        self.assertFalse(st["supportsInference"])
-        self.assertFalse(st["selectable"])
+        self.assertTrue(st["supportsInference"])
+        # Without inference flag / auth this suite uses mode=ok → not selectable.
+        self.assertIn("selectable", st)
         blob = json.dumps(st)
         self.assertNotIn(SECRET, blob)
         self.assertNotIn("access_token", blob)
 
-    def test_not_selectable(self):
-        with self.assertRaises(ProviderUnavailable):
+    def test_not_selectable_when_unauthenticated(self):
+        with self.assertRaises((ProviderUnavailable, AuthenticationRequired)):
             select_provider(CODEX_PROVIDER_ID, {}, save=lambda s: None)
 
     def test_authstore_untouched_by_login(self):
@@ -356,8 +357,10 @@ class CodexApiBoundaryTest(unittest.TestCase):
         self.assertNotIn("localStorage", js[js.find("populateCodexAuthForm"):js.find("function _clearGitHubDeviceUi")])
         self.assertNotIn("sessionStorage", js[js.find("populateCodexAuthForm"):js.find("function _clearGitHubDeviceUi")])
         self.assertNotIn("access_token", js)
-        # Inference selector still skips supportsInference === false
+        # Inference selector still skips account-only providers
         self.assertIn("supportsInference === false", js)
+        self.assertIn("Codex via ChatGPT — uses your connected ChatGPT plan", js)
+        self.assertIn("provider-readiness", html)
 
     def test_shutdown_terminates_process(self):
         session = CodexSession(executable=str(self.bin))

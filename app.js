@@ -6744,6 +6744,40 @@
     return bits.length ? ` — ${bits.join(", ")}` : "";
   }
 
+  function _codexDropdownLabel(p) {
+    const base = "Codex via ChatGPT — uses your connected ChatGPT plan";
+    const reason = p.selectionDisabledReason
+      || (p.inferenceAvailability && p.inferenceAvailability.selectionDisabledReason)
+      || p.disabledReason;
+    if (p.selectable) return base;
+    return reason ? `${base} (${reason})` : `${base} (unavailable)`;
+  }
+
+  function _providerReadinessText(selectedId, list) {
+    const local = (list || []).find((p) => p.providerId === "local_llama");
+    const codex = (list || []).find((p) => p.providerId === "codex_chatgpt");
+    if (selectedId === "codex_chatgpt" && codex) {
+      const ind = codex.indicator
+        || (codex.inferenceAvailability && codex.inferenceAvailability.indicator);
+      if (ind && ind.label) {
+        return ind.detail ? `${ind.label} — ${ind.detail}` : ind.label;
+      }
+      if (codex.selectable) return "Codex ready";
+      if (codex.selectionDisabledReason === "Sign in with ChatGPT first"
+          || (codex.inferenceAvailability && codex.inferenceAvailability.status === "not_signed_in")) {
+        return "Codex sign-in required — Sign in with ChatGPT first";
+      }
+      if (codex.selectionDisabledReason === "Codex inference disabled in this build"
+          || (codex.inferenceAvailability && codex.inferenceAvailability.status === "inference_disabled")) {
+        return "Codex disabled — Codex inference disabled in this build";
+      }
+      const why = codex.selectionDisabledReason || codex.disabledReason || "unavailable";
+      return `Codex unavailable — ${why}`;
+    }
+    if (local && (local.available !== false)) return "Local ready";
+    return "Local ready";
+  }
+
   function populateProviderForm() {
     const sel = $("#set-provider");
     if (!sel) return;
@@ -6753,28 +6787,78 @@
     if (!list.length) {
       const o = document.createElement("option");
       o.value = "local_llama";
-      o.textContent = "Local llama.cpp — default";
+      o.textContent = "Local llama.cpp — default, local";
       sel.appendChild(o);
     } else {
       for (const p of list) {
-        // Account-only providers (e.g. GitHub) are managed below — not for chat.
+        // Account-only / placeholder providers are managed below — not for chat.
         if (p.supportsInference === false) continue;
+        if (p.providerId === "example_cloud") continue;
         const o = document.createElement("option");
         o.value = p.providerId;
-        o.textContent = `${p.displayName}${_providerSafeLabel(p)}`;
-        // Allow selecting openai in the dropdown even when unauthenticated —
-        // Connect / Use provider enforce auth.
-        o.disabled = !p.available && p.providerId !== "openai";
+        if (p.providerId === "local_llama") {
+          o.textContent = "Local llama.cpp — default, local";
+        } else if (p.providerId === "codex_chatgpt") {
+          o.textContent = _codexDropdownLabel(p);
+          o.disabled = !p.selectable;
+          const reason = p.selectionDisabledReason
+            || (p.inferenceAvailability && p.inferenceAvailability.selectionDisabledReason)
+            || p.disabledReason
+            || "Codex unavailable";
+          if (o.disabled) {
+            o.title = reason;
+            o.setAttribute("aria-label", `Codex via ChatGPT, unavailable: ${reason}`);
+          } else {
+            o.title = "Uses your connected ChatGPT plan";
+            o.setAttribute("aria-label", "Codex via ChatGPT — uses your connected ChatGPT plan");
+          }
+        } else {
+          o.textContent = `${p.displayName}${_providerSafeLabel(p)}`;
+          // Allow selecting openai in the dropdown even when unauthenticated —
+          // Connect / Use provider enforce auth.
+          o.disabled = !p.available && p.providerId !== "openai";
+          if (o.disabled && p.disabledReason) {
+            o.title = p.disabledReason;
+            o.setAttribute("aria-label", `${p.displayName}, unavailable: ${p.disabledReason}`);
+          }
+        }
+        // Preserve a persisted Codex selection even when the option is disabled.
         if (p.providerId === selected) o.selected = true;
         sel.appendChild(o);
       }
     }
+    // If persisted selection is Codex but missing from options, keep a disabled stub.
+    if (selected === "codex_chatgpt" && ![...sel.options].some((o) => o.value === selected)) {
+      const o = document.createElement("option");
+      o.value = "codex_chatgpt";
+      o.textContent = "Codex via ChatGPT — unavailable";
+      o.disabled = true;
+      o.selected = true;
+      o.title = "Codex unavailable";
+      o.setAttribute("aria-label", "Codex via ChatGPT, unavailable");
+      sel.appendChild(o);
+    }
     const current = list.find((p) => p.providerId === (sel.value || selected))
+      || list.find((p) => p.providerId === selected)
       || list.find((p) => p.providerId === "local_llama");
+    const readinessEl = $("#provider-readiness");
+    if (readinessEl) {
+      readinessEl.textContent = "Provider status: " + _providerReadinessText(selected, list);
+    }
     const status = $("#provider-status-line");
     if (status) {
       if (!current) {
         status.textContent = "Using Local llama.cpp.";
+      } else if (current.providerId === "codex_chatgpt") {
+        if (current.selectable) {
+          status.textContent = "Codex via ChatGPT is selected. Chat uses your connected ChatGPT plan — not the local model.";
+        } else {
+          const why = current.selectionDisabledReason
+            || (current.inferenceAvailability && current.inferenceAvailability.selectionDisabledReason)
+            || current.disabledReason
+            || "unavailable";
+          status.textContent = `Codex is selected but unavailable (${why}). Choose Local llama.cpp to chat locally, or fix Codex readiness above.`;
+        }
       } else if (!current.available) {
         status.textContent = current.disabledReason || "This provider is unavailable.";
       } else if (current.providerId === "local_llama") {
@@ -6793,6 +6877,7 @@
       }
     }
     const isOpenAI = !!(current && current.providerId === "openai");
+    const isCodex = !!(current && current.providerId === "codex_chatgpt");
     const keyRow = $("#openai-key-row");
     const modelRow = $("#openai-model-row");
     const btnModels = $("#btn-openai-models");
@@ -6808,6 +6893,10 @@
         btnConnect.disabled = false;
         btnConnect.title = "Save OpenAI API key";
         btnConnect.textContent = current && current.credentialStored ? "Update key" : "Connect";
+      } else if (isCodex) {
+        btnConnect.disabled = true;
+        btnConnect.title = "Use Sign in with ChatGPT in the ChatGPT / Codex section below";
+        btnConnect.textContent = "Connect";
       } else if (current && current.authType && current.authType !== "none" && current.available) {
         btnConnect.disabled = true;
         btnConnect.title = "Connect is not available for this provider yet";
@@ -6819,7 +6908,8 @@
       }
     }
     if (btnDisconnect) {
-      const showDisconnect = !!(current && current.authType && current.authType !== "none");
+      // Codex auth disconnect lives in the dedicated ChatGPT / Codex section.
+      const showDisconnect = !!(!isCodex && current && current.authType && current.authType !== "none");
       btnDisconnect.disabled = !(showDisconnect && current && (current.credentialStored || current.authenticated));
       btnDisconnect.hidden = !showDisconnect;
       btnDisconnect.title = showDisconnect
@@ -6827,11 +6917,17 @@
         : "Disconnect is not applicable for Local llama.cpp";
     }
     if (btnSelect) {
-      const canSelect = !!(current && current.available && (
+      const canSelect = !!(current && (
         current.providerId === "local_llama"
         || (current.providerId === "openai" && current.credentialStored)
+        || (current.providerId === "codex_chatgpt" && current.selectable)
       ));
       btnSelect.disabled = !canSelect;
+      if (isCodex && current && !current.selectable) {
+        btnSelect.title = current.selectionDisabledReason || "Codex is not ready to select";
+      } else {
+        btnSelect.title = "Use the selected provider";
+      }
     }
     populateGitHubAuthForm();
     populateCodexAuthForm();
@@ -6926,13 +7022,18 @@
       } else if (cx.authenticated) {
         const plan = cx.planType ? ` Plan: ${cx.planType}.` : "";
         const label = cx.accountLabel ? ` Signed in as ${cx.accountLabel}.` : " Signed in.";
-        status.textContent = `ChatGPT / Codex connected.${label}${plan} Inference is not enabled yet.`;
+        const infer = cx.selectable
+          ? " Codex inference is ready — select it above if you want to use it."
+          : (cx.selectionDisabledReason
+            ? ` Authentication connected; inference: ${cx.selectionDisabledReason}.`
+            : " Authentication connected; Codex inference is a separate capability.");
+        status.textContent = `ChatGPT / Codex connected.${label}${plan}${infer}`;
       } else if (pending) {
         status.textContent = state.codexLogin?.loginMethod === "device"
           ? "Waiting for device-code authorization…"
           : "Waiting for browser sign-in…";
       } else {
-        status.textContent = "Not signed in. Authentication only — Codex chat is not enabled yet.";
+        status.textContent = "Not signed in. Sign in here first; then select Codex via ChatGPT above when ready.";
       }
       if (cx.error && cx.authenticated === false && !pending) {
         status.textContent = (status.textContent ? status.textContent + " " : "") + cx.error;
@@ -7022,7 +7123,7 @@
       }
       _clearCodexLoginUi();
       await loadProviders();
-      populateCodexAuthForm({ live: true });
+      populateProviderForm();
       if (st === "completed" || res.authenticated) toast("ChatGPT / Codex signed in", "ok", 2200);
       else if (st === "failed") toast(res.error || "ChatGPT login failed", "error");
       else if (st === "cancelled") toast("ChatGPT login cancelled", "warn");
@@ -7123,7 +7224,7 @@
         return;
       }
       await loadProviders();
-      populateCodexAuthForm({ live: true });
+      populateProviderForm();
       toast("ChatGPT / Codex signed out", "ok", 1800);
     } catch (_) {
       toast("ChatGPT disconnect failed", "error");
