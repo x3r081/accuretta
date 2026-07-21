@@ -1,9 +1,11 @@
 # Authentication and credential storage
 
 Accuretta keeps cloud credentials off the frontend. Local llama.cpp needs no
-account. This milestone supports an **experimental OpenAI API-key** provider and
+account. This milestone supports an **experimental OpenAI API-key** provider,
 optional **experimental GitHub account login** (device flow, identity only —
-not Copilot inference). ChatGPT / Codex OAuth is not implemented here.
+not Copilot inference), and **experimental ChatGPT / Codex account login**
+through the official Codex app-server (authentication only — Accuretta does not
+store Codex tokens).
 
 ## Storage backends
 
@@ -92,23 +94,43 @@ secret POST — prefer HTTPS when exposing Accuretta beyond localhost.
 - **OpenAI API:** password input + Connect/Update key; Disconnect removes the key.
 - **GitHub account:** device-flow Connect GitHub (user code + verification URL);
   Disconnect removes the GitHub credential only. Cannot be selected for chat.
+- **ChatGPT / Codex:** browser or device-code login via Codex app-server;
+  Disconnect calls Codex `account/logout`. Tokens stay in Codex — never AuthStore.
+  Cannot be selected for chat. Inference is not enabled in this milestone.
 - **Example cloud (demo):** Connect disabled; Disconnect clears fake credentials if present.
+
+## ChatGPT / Codex (Codex-managed)
+
+Accuretta communicates only with `codex app-server` JSON-RPC. Codex owns OAuth
+registration, callbacks, device authorization, access/refresh tokens, persistence,
+refresh, and logout. Accuretta:
+
+- never reads or writes Codex credential files
+- never copies Codex tokens into AuthStore or settings
+- never reuses Hermes / VS Code / GitHub CLI / other third-party OAuth client IDs
+- never calls undocumented private OpenAI endpoints for this flow
+
+See [codex-chatgpt-auth-smoke-test.md](codex-chatgpt-auth-smoke-test.md) and
+[providers.md](providers.md).
 
 ## Fake-provider tests
 
 ```bash
-python3 -m unittest tests.test_oauth_flow tests.test_auth_store tests.test_providers_api tests.test_openai_provider tests.test_refresh_classification tests.test_device_flow tests.test_github_provider -v
+python3 -m unittest discover -s tests -v
 ```
 
-These use in-process fakes and temporary credential files. No test contacts a
-real external provider.
+Codex tests use `tests/fake_codex_app_server.py` (stdio JSONL). No test contacts
+OpenAI or performs a real ChatGPT login.
 
 ## Attribution
 
 Generic OAuth/persistence patterns were adapted from Nous Research Hermes Agent
 (MIT). See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). Accuretta does
-not reuse Hermes OAuth client IDs or registrations.
+not reuse Hermes OAuth client IDs or registrations. The Codex client in this
+repository is independently written against the documented app-server protocol;
+it does not vendor the Codex source tree.
 
 ## Related
 
 - [providers.md](providers.md)
+- [codex-chatgpt-auth-smoke-test.md](codex-chatgpt-auth-smoke-test.md)

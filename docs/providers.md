@@ -2,8 +2,10 @@
 
 Accuretta routes inference through a small provider layer. **Local llama.cpp
 remains the default.** This release also includes an **experimental OpenAI API
-key** provider and **experimental GitHub account login** (authentication only —
-not Copilot inference). No other cloud inference providers are supported.
+key** provider, **experimental GitHub account login** (authentication only —
+not Copilot inference), and **experimental ChatGPT / Codex account login**
+(authentication only via the official Codex app-server — not Codex inference).
+No other cloud inference providers are supported.
 
 ## Architecture
 
@@ -121,6 +123,73 @@ pending device session. OpenAI / local credentials are untouched.
 `account_authentication`, `device_authorization` only — never `inference`,
 `streaming`, `models`, or Copilot.
 
+## ChatGPT / Codex authentication (experimental)
+
+- **id:** `codex_chatgpt`
+- **display name:** ChatGPT / Codex
+- **auth:** Codex-managed ChatGPT (`auth_type: codex_managed_chatgpt`)
+- **API mode:** `codex_app_server` (stdio JSON-RPC)
+- **purpose:** sign in with ChatGPT through the official Codex CLI app-server
+- **does not** enable Codex inference, threads, turns, tools, approvals, or model listing
+- **supports_inference:** `false` (not shown in the chat provider selector)
+- **selectable:** `false`
+
+Accuretta never implements ChatGPT OAuth itself. Codex owns client registration,
+browser callback / device authorization, tokens, refresh, logout, and
+persistence. Accuretta never reads Codex credential files and never stores Codex
+tokens in AuthStore.
+
+### Dependency
+
+Requires the official OpenAI Codex CLI (`codex`). Tested with **Codex CLI
+0.144.6**. Discovery order:
+
+1. `ACCURETTA_CODEX_BIN` (absolute executable)
+2. `shutil.which("codex")`
+3. `/opt/homebrew/bin/codex`
+4. `/usr/local/bin/codex`
+
+If Codex is missing or unsupported, the provider stays visible in account
+settings with a sanitized reason; local llama and OpenAI keep working.
+
+### Protocol (auth only)
+
+Transport: `codex app-server` (default stdio, newline-delimited JSON-RPC).
+
+Methods / notifications used:
+
+- `initialize` / `initialized`
+- `account/read`
+- `account/login/start` (`chatgpt`, `chatgptDeviceCode`)
+- `account/login/completed`, `account/updated`
+- `account/login/cancel`
+- `account/logout`
+
+Not used: `chatgptAuthTokens`, API-key login via Codex, `thread/*`, `turn/*`,
+`model/list`, approvals, WebSocket transport.
+
+### HTTP API
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/providers/codex_chatgpt/status` | Safe account / process DTO |
+| POST | `/api/providers/codex_chatgpt/connect` | Browser ChatGPT login start |
+| POST | `/api/providers/codex_chatgpt/device/start` | Device-code login start |
+| GET | `/api/providers/codex_chatgpt/login/status` | Pending / terminal login state |
+| POST | `/api/providers/codex_chatgpt/login/cancel` | Cancel active loginId |
+| POST | `/api/providers/codex_chatgpt/disconnect` | `account/logout` |
+| POST | `/api/providers/codex_chatgpt/process/retry` | Restart app-server after failure |
+
+Responses never include tokens. `authUrl` / `userCode` / `verificationUrl` are
+cleared after completion, cancel, or failure and are not persisted in the browser.
+
+### Process lifecycle
+
+One app-server child per Accuretta runtime, started lazily for live status or
+login. Shutdown is wired through provider background shutdown (`/api/shutdown`,
+atexit, interrupt handlers). Ordinary shutdown does **not** delete Codex
+credentials.
+
 ## Demonstration provider
 
 `example_cloud` remains registered as unavailable for API/UI exercises only.
@@ -164,4 +233,5 @@ submit, never written to localStorage/sessionStorage.
 
 - [authentication.md](authentication.md)
 - [provider-smoke-test.md](provider-smoke-test.md) — manual milestone checklist
+- [codex-chatgpt-auth-smoke-test.md](codex-chatgpt-auth-smoke-test.md) — ChatGPT / Codex auth checklist
 - [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)
