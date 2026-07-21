@@ -1,8 +1,8 @@
 # Inference providers
 
-Accuretta routes inference through a small provider layer. **Local llama.cpp is
-the only inference-capable provider in this release.** Cloud providers are not
-supported yet.
+Accuretta routes inference through a small provider layer. **Local llama.cpp
+remains the default.** This release also includes an **experimental OpenAI API
+key** provider. No other cloud providers are supported.
 
 ## Architecture
 
@@ -17,95 +17,85 @@ supported yet.
 
 Package layout:
 
-- `providers/` — definitions, registry, status DTOs, `LocalLlamaProvider`
-- `auth/` — credential storage and generic OAuth primitives (unused by UI until a real provider ships)
+- `providers/` — definitions, registry, status DTOs, `LocalLlamaProvider`, `OpenAIProvider`
+- `providers/inference_stream.py` — narrow stream adapter used by `run_chat_turn`
+- `auth/` — credential storage and generic OAuth primitives
 
 ## Local provider
 
 - **id:** `local_llama`
 - **auth:** none
 - **default:** yes
-- Uses existing llama-server lifecycle, GGUF discovery, streaming, tools, and cancellation in `bridge.py`.
 
-Chat orchestration (`run_chat_turn`) still owns the agent loop. Phase 5 adds a
-**compatibility gate**: HTTP chat resolves the selected provider and only
-continues when it is usable local llama. The SSE stream protocol is unchanged.
+## OpenAI API provider (experimental)
 
-## Provider selection
+- **id:** `openai`
+- **auth:** user-supplied API key (`auth_type: api_key`)
+- **API mode:** OpenAI Chat Completions (`/v1/chat/completions` streaming)
+- **Not** ChatGPT subscription / OAuth / Codex
+- **Billing:** API usage is billed separately by OpenAI
+- Selected model stored in settings as `openai_model` (never overwrites local `model` / `model_path`)
 
-Settings key: `provider_id` (default `"local_llama"`).
+### Setup
 
-| Stored value | Behavior |
+1. Create an API key in the OpenAI dashboard.
+2. Settings → Provider → OpenAI API → paste key → Connect.
+3. Key is stored via AuthStore (macOS Keychain when available, else owner-only file).
+4. Optionally Refresh models, pick a model, then Use provider.
+
+### Credential validation
+
+`POST /api/providers/openai/connect` validates with a lightweight `GET /v1/models`:
+
+| Outcome | Behavior |
 |---|---|
-| missing / empty | Local llama.cpp |
-| `local_llama` | Local llama.cpp |
-| unknown id | Fall back to local llama; sanitized warning on `/api/providers` |
-| disabled / unavailable | Kept in settings only if forced by hand; **chat is blocked** with HTTP 409 — Accuretta will not silently send chat to an external backend |
+| Success | Key stored; `credentialValidated=true` |
+| 401/403 | Key **not** stored; authentication error |
+| 429 / network / 5xx | Key may be stored as unvalidated; retry later |
 
-Credentials are **never** stored in `settings.json`.
+Status distinguishes `credentialStored` vs `credentialValidated`. Never returns the key.
+
+### Chat routing
+
+`run_chat_turn` still owns tools, approvals, iteration limits, and SSE events.
+It opens the model stream through `open_provider_chat_stream`:
+
+- local → existing llama-server SSE
+- openai → official Chat Completions SSE (same OpenAI framing)
+
+Tool definitions use the existing Accuretta OpenAI-compatible tool schema.
+Cancellation closes the HTTP stream and uses the existing `/api/cancel` path.
+
+Disconnecting OpenAI while it is selected blocks new OpenAI chats (401) until
+you reconnect or select local llama — Accuretta does **not** silently fall back.
 
 ## Demonstration provider
 
-`example_cloud` is registered as **experimental and unavailable** so the API/UI
-can be exercised without network calls or OAuth registration.
-
-- Connect is rejected
-- Model listing returns 409
-- Selection returns 409
-- Disconnect removes any test credentials from AuthStore (no-op if none)
-
-Do not treat it as a usable cloud backend.
+`example_cloud` remains registered as unavailable for API/UI exercises only.
 
 ## HTTP API (safe fields only)
 
-### `GET /api/providers`
-
-```json
-{
-  "providers": [ /* safe status objects */ ],
-  "selectedProviderId": "local_llama",
-  "defaultProviderId": "local_llama",
-  "warning": null,
-  "authBackend": "keychain",
-  "secureCloudAuthAvailable": true,
-  "authDetail": null
-}
-```
-
-### Safe status object
-
-May include: `providerId`, `displayName`, `apiMode`, `authType`,
-`authenticated`, `available`, `selected`, `isDefault`, `experimental`,
-`enabled`, `expiresAt`, `accountLabel`, `supportsModelListing`,
-`capabilities`, `disabledReason`, `error`.
-
-Must never include: access/refresh tokens, client secrets, code verifiers,
-authorization headers, raw credential objects, or raw provider responses.
-
-### Other routes
+See earlier Phase 5 routes. OpenAI-specific:
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/providers/{id}/status` | One safe status |
-| GET | `/api/providers/{id}/models` | Local discovery only today |
-| POST | `/api/providers/{id}/select` | Persists `provider_id`; rejects unavailable |
-| POST | `/api/providers/{id}/disconnect` | No-op for local; deletes AuthStore entry otherwise |
-| POST | `/api/providers/{id}/connect` | Always 409 in this release |
-
-Error codes use sanitized `providers.errors` classes (404 unknown, 409 unavailable, …).
+| POST | `/api/providers/openai/connect` | Body `{ "apiKey": "..." }` |
+| POST | `/api/providers/openai/disconnect` | Deletes stored key |
+| GET | `/api/providers/openai/models` | Requires stored key |
+| POST | `/api/providers/openai/select` | Requires stored key; optional `{ "model": "..." }` |
 
 ## Frontend boundary
 
-`app.js` may call the provider endpoints and render safe status only. It must
-never receive or display tokens. Provider UI failures must not block local chat.
+`app.js` may only see safe status. API key input is password-style, cleared after
+submit, never written to localStorage/sessionStorage.
 
 ## Adding a future provider
 
-1. Register a `ProviderDefinition` (+ factory when inference-ready).
-2. Implement AuthStore-backed connect only with Accuretta’s own OAuth/API-key registration.
-3. Expose status only through `providers.status.build_safe_provider_status`.
-4. Do not reuse Hermes or third-party OAuth client IDs.
-5. Keep local llama as the default until the user explicitly selects another **available** provider.
+1. Register a `ProviderDefinition` (+ factory).
+2. Use Accuretta’s own OAuth/API-key registration — never Hermes client IDs.
+3. Expose status only through `build_safe_provider_status`.
+4. Plug streaming into `open_provider_chat_stream` (or extend it).
+5. Keep local llama as the default.
 
 ## Related
 

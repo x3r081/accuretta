@@ -6759,12 +6759,15 @@
         const o = document.createElement("option");
         o.value = p.providerId;
         o.textContent = `${p.displayName}${_providerSafeLabel(p)}`;
-        o.disabled = !p.available;
+        // Allow selecting openai in the dropdown even when unauthenticated —
+        // Connect / Use provider enforce auth.
+        o.disabled = !p.available && p.providerId !== "openai";
         if (p.providerId === selected) o.selected = true;
         sel.appendChild(o);
       }
     }
-    const current = list.find((p) => p.providerId === (sel.value || selected)) || list.find((p) => p.providerId === "local_llama");
+    const current = list.find((p) => p.providerId === (sel.value || selected))
+      || list.find((p) => p.providerId === "local_llama");
     const status = $("#provider-status-line");
     if (status) {
       if (!current) {
@@ -6773,6 +6776,12 @@
         status.textContent = current.disabledReason || "This provider is unavailable.";
       } else if (current.providerId === "local_llama") {
         status.textContent = "Local llama.cpp — runs on this machine. No cloud account required.";
+      } else if (current.providerId === "openai") {
+        const bits = [];
+        if (current.credentialStored) bits.push(current.credentialValidated ? "key validated" : "key stored");
+        else bits.push("not connected");
+        if (current.experimental) bits.push("experimental");
+        status.textContent = `OpenAI API — ${bits.join(", ")}. Billed separately by OpenAI.`;
       } else {
         status.textContent = current.authenticated ? "Connected." : "Not connected.";
       }
@@ -6780,43 +6789,130 @@
         status.textContent = (status.textContent ? status.textContent + " " : "") + state.providerWarning;
       }
     }
+    const isOpenAI = !!(current && current.providerId === "openai");
+    const keyRow = $("#openai-key-row");
+    const modelRow = $("#openai-model-row");
+    const btnModels = $("#btn-openai-models");
+    if (keyRow) keyRow.style.display = isOpenAI ? "" : "none";
+    if (modelRow) modelRow.style.display = isOpenAI && current.credentialStored ? "" : "none";
+    if (btnModels) btnModels.style.display = isOpenAI && current.credentialStored ? "" : "none";
+
     const btnConnect = $("#btn-provider-connect");
     const btnDisconnect = $("#btn-provider-disconnect");
     const btnSelect = $("#btn-provider-select");
     if (btnConnect) {
-      const canConnect = !!(current && current.available && current.authType && current.authType !== "none");
-      btnConnect.disabled = true; // Phase 5: connect not offered for any provider
-      btnConnect.title = canConnect
-        ? "Connect is not available in this release"
-        : "Connect is not applicable";
+      if (isOpenAI) {
+        btnConnect.disabled = false;
+        btnConnect.title = "Save OpenAI API key";
+        btnConnect.textContent = current && current.credentialStored ? "Update key" : "Connect";
+      } else if (current && current.authType && current.authType !== "none" && current.available) {
+        btnConnect.disabled = true;
+        btnConnect.title = "Connect is not available for this provider yet";
+        btnConnect.textContent = "Connect";
+      } else {
+        btnConnect.disabled = true;
+        btnConnect.title = "Connect is not applicable";
+        btnConnect.textContent = "Connect";
+      }
     }
     if (btnDisconnect) {
       const showDisconnect = !!(current && current.authType && current.authType !== "none");
-      btnDisconnect.disabled = !showDisconnect;
+      btnDisconnect.disabled = !(showDisconnect && current && (current.credentialStored || current.authenticated));
       btnDisconnect.hidden = !showDisconnect;
       btnDisconnect.title = showDisconnect
         ? "Remove stored credentials for this provider"
         : "Disconnect is not applicable for Local llama.cpp";
     }
     if (btnSelect) {
-      btnSelect.disabled = !(current && current.available);
+      const canSelect = !!(current && current.available && (
+        current.providerId === "local_llama"
+        || (current.providerId === "openai" && current.credentialStored)
+      ));
+      btnSelect.disabled = !canSelect;
+    }
+  }
+
+  async function connectProviderFromUi() {
+    const sel = $("#set-provider");
+    if (!sel || sel.value !== "openai") return;
+    const input = $("#set-openai-key");
+    const apiKey = (input && input.value) ? input.value.trim() : "";
+    if (!apiKey) {
+      toast("enter an OpenAI API key", "warn");
+      return;
+    }
+    try {
+      const res = await api("/api/providers/openai/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      });
+      if (input) input.value = "";
+      if (res.error) {
+        toast(res.message || "Connect failed", "error");
+        return;
+      }
+      await loadProviders();
+      populateProviderForm();
+      if (res.credentialStored) {
+        toast(res.message || "API key saved", "ok", 2200);
+        await refreshOpenAIModels();
+      }
+    } catch (e) {
+      if (input) input.value = "";
+      toast("connect failed", "error");
+    }
+  }
+
+  async function refreshOpenAIModels() {
+    const modelSel = $("#set-openai-model");
+    if (!modelSel) return;
+    try {
+      const data = await api("/api/providers/openai/models");
+      if (data.error) {
+        toast(data.message || "Could not list models", "warn");
+        return;
+      }
+      const selected = (data.selectedModel || state.settings.openai_model || "gpt-4o-mini");
+      modelSel.innerHTML = "";
+      for (const m of (data.models || [])) {
+        const o = document.createElement("option");
+        o.value = m.id;
+        o.textContent = m.name || m.id;
+        if (m.id === selected) o.selected = true;
+        modelSel.appendChild(o);
+      }
+      if (!modelSel.options.length) {
+        const o = document.createElement("option");
+        o.value = selected;
+        o.textContent = selected;
+        modelSel.appendChild(o);
+      }
+    } catch (e) {
+      toast("model list failed", "error");
     }
   }
 
   async function selectProviderFromUi() {
     const sel = $("#set-provider");
     if (!sel || !sel.value) return;
+    const body = {};
+    if (sel.value === "openai") {
+      const mid = $("#set-openai-model")?.value;
+      if (mid) body.model = mid;
+    }
     try {
       const res = await api(`/api/providers/${encodeURIComponent(sel.value)}/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify(body),
       });
       if (res.error) {
         toast(res.message || "Could not select provider", "error");
         return;
       }
       state.settings.provider_id = res.providerId || sel.value;
+      if (body.model) state.settings.openai_model = body.model;
       state.selectedProviderId = state.settings.provider_id;
       await loadProviders();
       populateProviderForm();
@@ -8827,6 +8923,8 @@
     $("#drawer-scrim").addEventListener("click", closeSettings);
     $("#btn-provider-select")?.addEventListener("click", selectProviderFromUi);
     $("#btn-provider-disconnect")?.addEventListener("click", disconnectProviderFromUi);
+    $("#btn-provider-connect")?.addEventListener("click", connectProviderFromUi);
+    $("#btn-openai-models")?.addEventListener("click", refreshOpenAIModels);
     $("#set-provider")?.addEventListener("change", populateProviderForm);
     $("#btn-cmd-history")?.addEventListener("click", openCmdHistory);
     $("#btn-close-cmd-history")?.addEventListener("click", closeCmdHistory);

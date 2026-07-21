@@ -593,6 +593,8 @@ DEFAULT_SETTINGS = {
     # Inference provider selection. Missing/empty always resolves to local_llama.
     # Credentials are NEVER stored in settings — only the provider id.
     "provider_id": "local_llama",
+    # Selected OpenAI model id (separate from local GGUF model / model_path).
+    "openai_model": "gpt-4o-mini",
 }
 
 
@@ -13733,7 +13735,23 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     parse ourselves, since llama.cpp can't parse Gemma's dialect.
     """
     settings = get_settings()
-    model = settings.get("model") or ""
+    from providers.management import get_auth_store_info, resolve_chat_provider
+    from providers.openai_provider import OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID
+    from providers.selection import DEFAULT_PROVIDER_ID
+
+    try:
+        _selection = resolve_chat_provider(settings)
+        provider_id = _selection.provider_id
+    except Exception as exc:
+        from providers.errors import ProviderError
+        msg = getattr(exc, "message", None) or str(exc)
+        emit({"type": "error", "error": msg, "code": getattr(exc, "code", "provider_error")})
+        return None
+
+    if provider_id == OPENAI_PROVIDER_ID:
+        model = (settings.get("openai_model") or OPENAI_DEFAULT_MODEL).strip()
+    else:
+        model = settings.get("model") or ""
     if not model:
         emit({"type": "error", "error": "no model selected. Pick one in Settings."})
         return None
@@ -13802,7 +13820,10 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # this, a settings default of 8K would make the trimmer chop a
             # conversation the server happily holds at 32K — and tool results
             # the model discovered earlier in the turn vanish from history.
-            ctx_limit = _llama_props_ctx() or int(settings.get("num_ctx") or 32768)
+            if provider_id == DEFAULT_PROVIDER_ID:
+                ctx_limit = _llama_props_ctx() or int(settings.get("num_ctx") or 32768)
+            else:
+                ctx_limit = int(settings.get("openai_ctx") or settings.get("num_ctx") or 128000)
             # Reserve headroom for the response + thinking, but CAP it: 25% of a
             # 262K window is ~65K wasted on headroom no answer needs. Capping at
             # ~16K hands that context back to the conversation on large windows
@@ -13816,11 +13837,14 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             # what actually gets sent.
             tools_overhead = 0
             if use_tools and native_tools:
-                try:
-                    _tools_json = json.dumps(tools_for_llama(), ensure_ascii=False)
-                    tools_overhead = _tools_spec_overhead_tokens(_tools_json)
-                except Exception:
-                    tools_overhead = 4096  # conservative fallback
+                if provider_id == DEFAULT_PROVIDER_ID:
+                    try:
+                        _tools_json = json.dumps(tools_for_llama(), ensure_ascii=False)
+                        tools_overhead = _tools_spec_overhead_tokens(_tools_json)
+                    except Exception:
+                        tools_overhead = 4096  # conservative fallback
+                else:
+                    tools_overhead = 2048
             # Floor the messages budget at 2048 tokens — even if tools overhead
             # is huge, we still need room for at least the system + last user.
             # +768 tokens of safety margin: the tools overhead is an estimate,
@@ -13855,8 +13879,20 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 "model": model or "local",
                 "messages": _sanitize_messages_for_openai(trimmed),
                 "stream": True,
-                **llama_options(settings),
+                **(llama_options(settings) if provider_id == DEFAULT_PROVIDER_ID else {}),
             }
+            if provider_id != DEFAULT_PROVIDER_ID:
+                # Cloud: attach shared sampling fields without llama-only keys.
+                opts = llama_options(settings)
+                for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+                    if key in opts:
+                        payload[key] = opts[key]
+                try:
+                    np = int(settings.get("num_predict") or 0)
+                except Exception:
+                    np = 0
+                if np > 0:
+                    payload["max_tokens"] = np
             # Agentic turns need a tighter, deterministic sampling profile than
             # IDE/creative turns. The user's global sliders may be tuned for
             # design work (high temp, presence_penalty for variety) — but those
@@ -13894,30 +13930,43 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 tb_int = 2048
             if tb_int >= 0:
                 tpl_kwargs["thinking_budget"] = tb_int
-            if tpl_kwargs:
+            if tpl_kwargs and provider_id == DEFAULT_PROVIDER_ID:
                 payload["chat_template_kwargs"] = tpl_kwargs
-            # Hard turn-boundary stops. Belt-and-suspenders for models (Qwen3.6
-            # Q4 seen doing this) that sail past their own end-of-turn token and
-            # re-answer forever — llama-server halts server-side the instant one
-            # of these literal markers appears, instead of running to n_ctx.
-            payload["stop"] = list(_TURN_BOUNDARY_STOPS)
+            # Hard turn-boundary stops — local llama only.
+            if provider_id == DEFAULT_PROVIDER_ID:
+                payload["stop"] = list(_TURN_BOUNDARY_STOPS)
             if use_tools and native_tools:
                 payload["tools"] = tools_for_llama()
                 payload["tool_choice"] = "auto"
 
-            # Open the stream. If the prompt overflows n_ctx (--no-context-shift
-            # makes the server reject rather than slide the window), trim older
-            # turns harder and retry instead of failing the whole turn — the
-            # tools-overhead estimate above can undershoot the real inlined spec.
+            # Open the stream via the provider adapter (local llama or OpenAI).
             resp = None
+            stream_iter = None
             for _ctx_attempt in range(4):
                 try:
-                    emit({"type": "notice",
-                          "note": "waiting for llama-server to accept chat completion…"})
-                    resp = llama_post_stream("/v1/chat/completions", payload)
+                    waiting = (
+                        "waiting for llama-server to accept chat completion…"
+                        if provider_id == DEFAULT_PROVIDER_ID
+                        else "waiting for OpenAI chat completion…"
+                    )
+                    emit({"type": "notice", "note": waiting})
+                    from providers.inference_stream import open_provider_chat_stream
+                    from providers.management import get_auth_store_info
+                    resp, stream_iter = open_provider_chat_stream(
+                        provider_id=provider_id,
+                        payload=payload,
+                        cancel_ev=cancel_ev,
+                        auth_store=get_auth_store_info().store,
+                        bridge_module=sys.modules[__name__],
+                    )
                     break
                 except Exception as e:
-                    if _ctx_attempt < 3 and _is_ctx_overflow(e):
+                    from providers.errors import (
+                        AuthenticationRequired,
+                        ProviderError,
+                        RateLimited,
+                    )
+                    if provider_id == DEFAULT_PROVIDER_ID and _ctx_attempt < 3 and _is_ctx_overflow(e):
                         pad = max(2048, int(ctx_limit * 0.12)) * (_ctx_attempt + 1)
                         tighter = min(effective_reserve + pad, ctx_limit - 1024)
                         trimmed = truncate_messages(conversation, ctx_limit, reserve=tighter)
@@ -13925,28 +13974,36 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         emit({"type": "notice",
                               "note": "prompt exceeded the context window — trimmed older turns and retrying"})
                         continue
-                    if _is_ctx_overflow(e):
+                    if provider_id == DEFAULT_PROVIDER_ID and _is_ctx_overflow(e):
                         emit({"type": "error",
                               "error": ("prompt still exceeds the context window after trimming — the system "
                                         "prompt + tool specs alone are near your num_ctx. Raise num_ctx in "
                                         "Settings, or turn off some tools for this turn."),
                               "code": "generation_failed"})
+                    elif isinstance(e, (AuthenticationRequired, RateLimited, ProviderError)):
+                        emit({
+                            "type": "error",
+                            "error": getattr(e, "message", None) or str(e),
+                            "code": getattr(e, "code", "provider_error"),
+                        })
                     else:
-                        life = _llama.lifecycle_snapshot()
+                        life = _llama.lifecycle_snapshot() if provider_id == DEFAULT_PROVIDER_ID else {}
                         emit({"type": "error",
                               "error": (
-                                  f"llama-server request failed (state={life.get('state')}, "
-                                  f"waiting_for={life.get('waiting_for') or 'n/a'}): {e}. "
-                                  f"Is it running?"
+                                  f"inference request failed"
+                                  + (f" (state={life.get('state')})" if life else "")
+                                  + f": {type(e).__name__}"
                               ),
                               "code": "generation_failed",
-                              "lifecycle": life})
-                    _llama.end_generation(failed=True, reason=str(e))
+                              "lifecycle": life or None})
+                    if provider_id == DEFAULT_PROVIDER_ID:
+                        _llama.end_generation(failed=True, reason=str(type(e).__name__))
                     return None
-            if resp is None:
+            if resp is None or stream_iter is None:
                 return None
             _set_cancel_resp(chat_id, resp)
-            _llama.begin_generation()
+            if provider_id == DEFAULT_PROVIDER_ID:
+                _llama.begin_generation()
 
             content_buf: list[str] = []
             tool_calls_by_index: dict[int, dict] = {}
@@ -13969,22 +14026,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                 _think_cap = 2048
 
             try:
-                def _stream_child_alive() -> bool:
-                    # Only treat death of a *managed* child as a crash. Unit tests
-                    # and externally hosted LLAMA have _proc is None.
-                    with _llama._lock:
-                        p = _llama._proc
-                    if p is None:
-                        return True
-                    return p.poll() is None
-
-                for raw in iter_llama_sse(
-                    resp,
-                    idle_timeout=_llama_gen_idle_timeout_s(),
-                    wall_timeout=_llama_gen_wall_timeout_s(),
-                    cancel_ev=cancel_ev,
-                    proc_alive=_stream_child_alive,
-                ):
+                for raw in stream_iter:
                     if cancel_ev.is_set():
                         break
                     line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -14105,27 +14147,40 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                     if _last_prompt_tokens:
                         _last_prompt_tokens_by_chat[chat_id] = _last_prompt_tokens
                         _CTX_EST_CACHE.pop(chat_id, None)
-                _llama.end_generation()
+                if provider_id == DEFAULT_PROVIDER_ID:
+                    _llama.end_generation()
             except LlamaStreamTimeout as e:
-                _llama.end_generation(timed_out=True, reason=str(e))
+                if provider_id == DEFAULT_PROVIDER_ID:
+                    _llama.end_generation(timed_out=True, reason=str(e))
                 emit({
                     "type": "error",
                     "error": str(e),
                     "code": "timed_out",
                     "waiting_for": getattr(e, "waiting_for", "next SSE chunk"),
-                    "lifecycle": _llama.lifecycle_snapshot(),
+                    "lifecycle": _llama.lifecycle_snapshot() if provider_id == DEFAULT_PROVIDER_ID else None,
                 })
                 partial = {"role": "assistant", "content": "".join(content_buf)}
                 partial["_appended_intermediate"] = list(conversation[_start_len:])
                 return partial
             except LlamaStreamError as e:
-                _llama.end_generation(failed=True, reason=str(e))
+                if provider_id == DEFAULT_PROVIDER_ID:
+                    _llama.end_generation(failed=True, reason=str(e))
                 emit({
                     "type": "error",
                     "error": str(e),
                     "code": getattr(e, "code", "generation_failed"),
-                    "lifecycle": _llama.lifecycle_snapshot(),
+                    "lifecycle": _llama.lifecycle_snapshot() if provider_id == DEFAULT_PROVIDER_ID else None,
                 })
+                partial = {"role": "assistant", "content": "".join(content_buf)}
+                partial["_appended_intermediate"] = list(conversation[_start_len:])
+                return partial
+            except Exception as e:
+                if provider_id == DEFAULT_PROVIDER_ID:
+                    _llama.end_generation(failed=True, reason=type(e).__name__)
+                from providers.errors import ProviderError
+                code = getattr(e, "code", "generation_failed") if isinstance(e, ProviderError) else "generation_failed"
+                msg = getattr(e, "message", None) if isinstance(e, ProviderError) else f"{type(e).__name__}"
+                emit({"type": "error", "error": msg or "generation failed", "code": code})
                 partial = {"role": "assistant", "content": "".join(content_buf)}
                 partial["_appended_intermediate"] = list(conversation[_start_len:])
                 return partial
@@ -16076,7 +16131,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and action == "status":
                 return self._send_json(200, get_provider_status(provider_id, settings))
             if len(parts) == 4 and action == "models":
-                return self._send_json(200, list_models_for_provider(provider_id))
+                return self._send_json(200, list_models_for_provider(provider_id, settings))
             return self._send_json(404, {"error": "not found"})
         except Exception as exc:
             from providers.management import provider_http_error
@@ -16084,9 +16139,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(status, body)
 
     def _handle_providers_post(self, p: str, body: dict):
-        """Select / disconnect providers. Connect is not offered in Phase 5."""
+        """Select / disconnect / connect providers."""
         try:
             from providers.management import (
+                connect_provider,
                 disconnect_provider,
                 select_provider,
             )
@@ -16098,11 +16154,22 @@ class Handler(BaseHTTPRequestHandler):
             settings = get_settings()
 
             def _save(updated: dict):
-                save_json(SETTINGS_FILE, updated)
+                # Only persist keys that belong in DEFAULT_SETTINGS.
+                cur = get_settings()
+                for k, v in updated.items():
+                    if k in DEFAULT_SETTINGS:
+                        cur[k] = v
+                save_json(SETTINGS_FILE, cur)
                 broadcast_event({"type": "settings:update"})
                 broadcast_event({"type": "providers:update"})
 
             if action == "select":
+                # Optional model selection for OpenAI in the same call.
+                if provider_id == "openai" and isinstance(body, dict):
+                    mid = (body.get("model") or body.get("openai_model") or "").strip()
+                    if mid:
+                        settings = dict(settings)
+                        settings["openai_model"] = mid
                 result = select_provider(provider_id, settings, save=_save)
                 return self._send_json(200, result)
             if action == "disconnect":
@@ -16110,11 +16177,9 @@ class Handler(BaseHTTPRequestHandler):
                 broadcast_event({"type": "providers:update"})
                 return self._send_json(200, result)
             if action == "connect":
-                return self._send_json(409, {
-                    "error": "provider_unavailable",
-                    "message": "Connect is not available in this release",
-                    "providerId": provider_id,
-                })
+                result = connect_provider(provider_id, body or {}, settings)
+                broadcast_event({"type": "providers:update"})
+                return self._send_json(200, result)
             return self._send_json(404, {"error": "not found"})
         except Exception as exc:
             from providers.management import provider_http_error

@@ -7,13 +7,26 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional, Tuple
 
-from auth.models import StoredCredential
 from auth.store import AuthStore, AuthStoreInfo, create_auth_store
 
 from .base import AuthType, ProviderDefinition
-from .errors import ProviderError, ProviderNotConfigured, ProviderUnavailable
+from .errors import (
+    AuthenticationRequired,
+    ProviderError,
+    ProviderNotConfigured,
+    ProviderUnavailable,
+    RateLimited,
+)
 from .example_cloud import ensure_example_cloud_registered
 from .local_llama import ensure_local_llama_registered
+from .openai_provider import (
+    OPENAI_DEFAULT_MODEL,
+    OPENAI_PROVIDER_ID,
+    OpenAIProvider,
+    connect_openai_api_key,
+    ensure_openai_registered,
+    openai_api_key_from_store,
+)
 from .registry import ProviderRegistry, get_default_registry
 from .selection import (
     DEFAULT_PROVIDER_ID,
@@ -34,6 +47,7 @@ def ensure_builtin_providers(registry: Optional[ProviderRegistry] = None) -> Pro
     reg = registry or get_default_registry()
     ensure_local_llama_registered(reg)
     ensure_example_cloud_registered(reg)
+    ensure_openai_registered(reg)
     return reg
 
 
@@ -44,7 +58,6 @@ def get_auth_store_info(*, force_file: bool = False) -> AuthStoreInfo:
         try:
             _auth_info = create_auth_store(force_file=force_file)
         except Exception as exc:
-            # Last-resort empty file store via create_auth_store(force_file=True)
             _auth_info = create_auth_store(force_file=True)
             _auth_info = AuthStoreInfo(
                 store=_auth_info.store,
@@ -89,24 +102,48 @@ def provider_status_for(
     expires_at = None
     account_label = None
     error = None
+    credential_stored = None
+    credential_validated = None
+    last_validated_at = None
+    model = None
 
     if definition.auth_type != AuthType.NONE and store is not None:
         authenticated, expires_at, account_label = _credential_public_bits(store, definition.id)
+        try:
+            cred = store.load(definition.id)
+        except Exception:
+            cred = None
+        if cred is not None:
+            credential_stored = True
+            meta = cred.metadata if isinstance(cred.metadata, dict) else {}
+            credential_validated = bool(meta.get("credential_validated"))
+            last_validated_at = meta.get("validated_at")
+            if definition.auth_type == AuthType.API_KEY:
+                authenticated = True
+                if not account_label:
+                    account_label = str(meta.get("account_label") or "API key stored")
+        else:
+            credential_stored = False
+            credential_validated = False
+            authenticated = False
 
-    available = bool(definition.enabled)
-    if not available:
-        error = None  # disabledReason covers this
+    if definition.id == OPENAI_PROVIDER_ID and isinstance(settings, dict):
+        model = settings.get("openai_model") or OPENAI_DEFAULT_MODEL
 
     status = build_safe_provider_status(
         definition,
         authenticated=authenticated,
-        available=available,
+        available=bool(definition.enabled),
         selected=(definition.id == effective_selected),
         is_default=(definition.id == DEFAULT_PROVIDER_ID),
         expires_at=expires_at,
         account_label=account_label,
         disabled_reason=definition.disabled_reason,
         error=error,
+        credential_stored=credential_stored,
+        credential_validated=credential_validated,
+        model=model,
+        last_validated_at=last_validated_at,
     )
     if selection.warning and definition.id == selection.provider_id:
         status["error"] = sanitize_provider_error_message(selection.warning)
@@ -167,18 +204,67 @@ def select_provider(provider_id: str, settings: dict, *, save: Callable[[dict], 
             definition.disabled_reason or "Provider is not available",
             provider_id=provider_id,
         )
-    if definition.id != DEFAULT_PROVIDER_ID:
+    info = get_auth_store_info()
+    if definition.id == OPENAI_PROVIDER_ID:
+        if not openai_api_key_from_store(info.store):
+            raise AuthenticationRequired(
+                "Connect an OpenAI API key before selecting OpenAI",
+                provider_id=provider_id,
+            )
+    elif definition.id != DEFAULT_PROVIDER_ID:
         raise ProviderUnavailable(
-            "Only Local llama.cpp can be selected in this release",
+            "This provider cannot be selected yet",
             provider_id=provider_id,
         )
     updated = persist_provider_id(settings, definition.id)
+    if definition.id == OPENAI_PROVIDER_ID and not (updated.get("openai_model") or "").strip():
+        updated["openai_model"] = OPENAI_DEFAULT_MODEL
     save(updated)
     return {
         "ok": True,
         "providerId": definition.id,
         "status": get_provider_status(definition.id, updated),
     }
+
+
+def connect_provider(provider_id: str, body: dict, settings: dict) -> dict:
+    ensure_builtin_providers()
+    if provider_id != OPENAI_PROVIDER_ID:
+        raise ProviderUnavailable(
+            "Connect is not available for this provider",
+            provider_id=provider_id,
+        )
+    api_key = body.get("apiKey") if isinstance(body, dict) else None
+    info = get_auth_store_info()
+    try:
+        result = connect_openai_api_key(info.store, api_key or "")
+    except RateLimited:
+        status = get_provider_status(OPENAI_PROVIDER_ID, settings)
+        payload = {
+            "ok": True,
+            "providerId": OPENAI_PROVIDER_ID,
+            "credentialStored": True,
+            "credentialValidated": False,
+            "status": status,
+            "message": "API key stored; validation rate-limited — try listing models later",
+        }
+        assert_safe_provider_payload(payload)
+        return payload
+    status = get_provider_status(OPENAI_PROVIDER_ID, settings)
+    payload = {
+        "ok": True,
+        "providerId": OPENAI_PROVIDER_ID,
+        "credentialStored": result.get("credentialStored", True),
+        "credentialValidated": result.get("credentialValidated", False),
+        "status": status,
+        "message": (
+            "API key saved and validated"
+            if result.get("credentialValidated")
+            else "API key saved"
+        ),
+    }
+    assert_safe_provider_payload(payload)
+    return payload
 
 
 def disconnect_provider(provider_id: str, settings: dict) -> dict:
@@ -217,7 +303,7 @@ def disconnect_provider(provider_id: str, settings: dict) -> dict:
     }
 
 
-def list_models_for_provider(provider_id: str) -> dict:
+def list_models_for_provider(provider_id: str, settings: Optional[dict] = None) -> dict:
     reg = ensure_builtin_providers()
     try:
         definition = reg.get_definition(provider_id)
@@ -226,15 +312,32 @@ def list_models_for_provider(provider_id: str) -> dict:
             f"Unknown provider: {provider_id}",
             provider_id=provider_id,
         ) from exc
-    if not definition.enabled or provider_id != DEFAULT_PROVIDER_ID:
+    if not definition.enabled:
         raise ProviderUnavailable(
             definition.disabled_reason
             or "Model listing is not available for this provider",
             provider_id=provider_id,
         )
-    provider = reg.get_provider(provider_id)
-    models = list(provider.list_models())
-    # Strip any accidental secret-looking keys from model rows.
+
+    if provider_id == DEFAULT_PROVIDER_ID:
+        provider = reg.get_provider(provider_id)
+        models = list(provider.list_models())
+    elif provider_id == OPENAI_PROVIDER_ID:
+        info = get_auth_store_info()
+        api_key = openai_api_key_from_store(info.store)
+        if not api_key:
+            raise AuthenticationRequired(
+                "OpenAI API key required to list models",
+                provider_id=provider_id,
+            )
+        provider = OpenAIProvider()
+        models = list(provider.list_models(api_key=api_key))
+    else:
+        raise ProviderUnavailable(
+            "Model listing is not available for this provider",
+            provider_id=provider_id,
+        )
+
     safe_models: List[dict] = []
     for row in models:
         if not isinstance(row, dict):
@@ -242,26 +345,44 @@ def list_models_for_provider(provider_id: str) -> dict:
         safe_models.append({
             k: v for k, v in row.items()
             if str(k).lower() not in {
-                "access_token", "refresh_token", "authorization", "client_secret",
+                "access_token", "refresh_token", "authorization", "client_secret", "api_key",
             }
         })
-    payload = {"providerId": provider_id, "models": safe_models}
+    selected_model = None
+    if isinstance(settings, dict) and provider_id == OPENAI_PROVIDER_ID:
+        selected_model = settings.get("openai_model") or OPENAI_DEFAULT_MODEL
+    payload = {
+        "providerId": provider_id,
+        "models": safe_models,
+        "selectedModel": selected_model,
+    }
     assert_safe_provider_payload(payload)
     return payload
 
 
 def resolve_chat_provider(settings: dict):
-    """Resolve + validate provider for an incoming chat request."""
     ensure_builtin_providers()
     selection = resolve_provider_selection(settings)
-    assert_provider_usable_for_chat(selection)
+    info = get_auth_store_info()
+    assert_provider_usable_for_chat(selection, auth_store=info.store)
     return selection
 
 
 def provider_http_error(exc: BaseException) -> Tuple[int, dict]:
-    """Map provider errors to (status, safe JSON body)."""
     if isinstance(exc, ProviderNotConfigured):
         return 404, {
+            "error": exc.code,
+            "message": sanitize_provider_error_message(exc.message),
+            "providerId": exc.provider_id,
+        }
+    if isinstance(exc, AuthenticationRequired):
+        return 401, {
+            "error": exc.code,
+            "message": sanitize_provider_error_message(exc.message),
+            "providerId": exc.provider_id,
+        }
+    if isinstance(exc, RateLimited):
+        return 429, {
             "error": exc.code,
             "message": sanitize_provider_error_message(exc.message),
             "providerId": exc.provider_id,
@@ -277,6 +398,8 @@ def provider_http_error(exc: BaseException) -> Tuple[int, dict]:
         status = 401 if "authentication" in code else 400
         if code == "provider_unavailable":
             status = 409
+        if code == "rate_limited":
+            status = 429
         return status, {
             "error": code,
             "message": sanitize_provider_error_message(str(exc)),

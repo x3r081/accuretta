@@ -26,6 +26,21 @@ class StoredCredential:
     # Runtime-only; set by the store backend that loaded the credential.
     source: str = "unknown"
 
+    def __repr__(self) -> str:
+        # Never include token material in repr / tracebacks.
+        meta_keys = sorted(self.metadata.keys()) if isinstance(self.metadata, dict) else []
+        return (
+            f"StoredCredential(provider_id={self.provider_id!r}, "
+            f"token_type={self.token_type!r}, "
+            f"has_access_token={bool(self.access_token)}, "
+            f"has_refresh_token={bool(self.refresh_token)}, "
+            f"expires_at={self.expires_at!r}, "
+            f"scopes={list(self.scopes)!r}, "
+            f"metadata_keys={meta_keys!r}, "
+            f"schema_version={self.schema_version}, "
+            f"source={self.source!r})"
+        )
+
     def to_storage_dict(self) -> Dict[str, Any]:
         """Serialize for persistence. Does not include the runtime `source`."""
         return {

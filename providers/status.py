@@ -60,13 +60,17 @@ def build_safe_provider_status(
     account_label: Optional[str] = None,
     disabled_reason: Optional[str] = None,
     error: Optional[str] = None,
+    credential_stored: Optional[bool] = None,
+    credential_validated: Optional[bool] = None,
+    model: Optional[str] = None,
+    last_validated_at: Any = None,
 ) -> dict:
     """Safe provider status for HTTP responses / UI."""
     caps = definition.capabilities
     reason = disabled_reason
     if reason is None and not definition.enabled:
         reason = definition.disabled_reason
-    return {
+    out = {
         "providerId": definition.id,
         "displayName": definition.display_name,
         "apiMode": definition.api_mode.value,
@@ -94,6 +98,15 @@ def build_safe_provider_status(
         "disabledReason": reason,
         "error": error,
     }
+    if credential_stored is not None:
+        out["credentialStored"] = bool(credential_stored)
+    if credential_validated is not None:
+        out["credentialValidated"] = bool(credential_validated)
+    if model is not None:
+        out["model"] = model
+    if last_validated_at is not None:
+        out["lastValidatedAt"] = _expires_at_iso(last_validated_at)
+    return out
 
 
 def collect_keys(obj: Any, *, out: Optional[Set[str]] = None) -> Set[str]:

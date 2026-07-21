@@ -66,8 +66,12 @@ def resolve_provider_selection(
     return ProviderSelection(provider_id=pid, definition=definition)
 
 
-def assert_provider_usable_for_chat(selection: ProviderSelection) -> None:
-    """Raise if the selected provider cannot serve chat in this phase."""
+def assert_provider_usable_for_chat(
+    selection: ProviderSelection,
+    *,
+    auth_store=None,
+) -> None:
+    """Raise if the selected provider cannot serve chat."""
     d = selection.definition
     if not d.enabled:
         raise ProviderUnavailable(
@@ -75,11 +79,22 @@ def assert_provider_usable_for_chat(selection: ProviderSelection) -> None:
             or f"Provider {d.display_name} is not available",
             provider_id=d.id,
         )
-    if d.id != DEFAULT_PROVIDER_ID:
-        raise ProviderUnavailable(
-            f"Provider {d.display_name} is not available for chat yet",
-            provider_id=d.id,
-        )
+    if d.id == DEFAULT_PROVIDER_ID:
+        return
+    if d.id == "openai":
+        from providers.errors import AuthenticationRequired
+        from providers.openai_provider import openai_api_key_from_store
+
+        if auth_store is None or not openai_api_key_from_store(auth_store):
+            raise AuthenticationRequired(
+                "Connect an OpenAI API key before chatting with OpenAI",
+                provider_id=d.id,
+            )
+        return
+    raise ProviderUnavailable(
+        f"Provider {d.display_name} is not available for chat yet",
+        provider_id=d.id,
+    )
 
 
 def persist_provider_id(settings: dict, provider_id: str) -> dict:

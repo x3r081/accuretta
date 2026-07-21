@@ -292,7 +292,7 @@ class ProviderUiContractTest(unittest.TestCase):
         html = (Path(__file__).resolve().parent.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="set-provider"', html)
         self.assertIn('id="btn-provider-connect"', html)
-        self.assertIn("disabled", html[html.index("btn-provider-connect"): html.index("btn-provider-connect") + 120])
+        self.assertIn('id="set-openai-key"', html)
 
     def test_app_js_loads_providers_api(self):
         js = (Path(__file__).resolve().parent.parent / "app.js").read_text(encoding="utf-8")

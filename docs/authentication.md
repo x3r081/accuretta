@@ -52,20 +52,34 @@ and asserted free of forbidden keys before return.
 - localStorage / sessionStorage
 - test snapshots
 
+## OpenAI API keys
+
+OpenAI uses a user-supplied **API key** (not OAuth). Keys are stored as
+`StoredCredential` with `token_type="api_key"` and
+`metadata.credential_type="api_key"` in the `access_token` field for secure
+storage reuse — **not** as a refresh token.
+
+Connect via `POST /api/providers/openai/connect` with `{ "apiKey": "..." }`.
+The key must never appear in settings JSON, provider status, logs, or
+`StoredCredential.__repr__`.
+
+Loopback / Tailscale deployments: treat API-key submission like any other
+secret POST — prefer HTTPS when exposing Accuretta beyond localhost.
+
 ## Connect / disconnect (current UI)
 
 - **Local llama.cpp:** disconnect is not applicable (button hidden/disabled).
+- **OpenAI API:** password input + Connect/Update key; Disconnect removes the key.
 - **Example cloud (demo):** Connect disabled; Disconnect clears fake credentials if present.
-- Live Connect for real providers is **not** offered in this phase.
 
 ## Fake-provider tests
 
 ```bash
-python3 -m unittest tests.test_oauth_flow tests.test_auth_store tests.test_providers_api -v
+python3 -m unittest tests.test_oauth_flow tests.test_auth_store tests.test_providers_api tests.test_openai_provider tests.test_refresh_classification -v
 ```
 
-These use an in-process fake OAuth server and temporary credential files. No
-test contacts a real external provider.
+These use in-process fakes and temporary credential files. No test contacts a
+real external provider.
 
 ## Attribution
 

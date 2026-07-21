@@ -99,6 +99,8 @@ def _register_builtins(registry: ProviderRegistry) -> None:
     # at module load of registry.py.
     from .example_cloud import ensure_example_cloud_registered
     from .local_llama import ensure_local_llama_registered
+    from .openai_provider import ensure_openai_registered
 
     ensure_local_llama_registered(registry)
     ensure_example_cloud_registered(registry)
+    ensure_openai_registered(registry)
