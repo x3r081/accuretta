@@ -71,7 +71,11 @@ def assert_provider_usable_for_chat(
     *,
     auth_store=None,
 ) -> None:
-    """Raise if the selected provider cannot serve chat."""
+    """Raise if the selected provider cannot serve chat.
+
+    Never silently remaps Codex → local (or vice versa). Callers must keep
+    the selected provider_id and surface that provider's error.
+    """
     d = selection.definition
     if not d.enabled:
         raise ProviderUnavailable(
@@ -90,6 +94,16 @@ def assert_provider_usable_for_chat(
                 "Connect an OpenAI API key before chatting with OpenAI",
                 provider_id=d.id,
             )
+        return
+    if d.id == "codex_chatgpt":
+        from providers.codex_readiness import (
+            assess_codex_inference_readiness,
+            readiness_to_provider_error,
+        )
+
+        readiness = assess_codex_inference_readiness(live=True)
+        if not readiness.get("ready"):
+            raise readiness_to_provider_error(readiness, provider_id=d.id)
         return
     raise ProviderUnavailable(
         f"Provider {d.display_name} is not available for chat yet",

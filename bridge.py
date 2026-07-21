@@ -332,12 +332,17 @@ def _unregister_cancel(chat_id: str) -> None:
 
 
 def cancel_chat(chat_id: str) -> bool:
-    """Flip the cancel flag and force-close the active llama-server response
+    """Flip the cancel flag and force-close the active provider response
     for this chat. Returns True if something was cancelled."""
     with _chat_cancels_lock:
         entry = _chat_cancels.get(chat_id)
         if not entry:
-            return False
+            # Still try Codex cancel in case the turn registered outside this map.
+            try:
+                from providers.codex_provider import cancel_codex_for_chat
+                return bool(cancel_codex_for_chat(chat_id))
+            except Exception:
+                return False
         entry["cancel"].set()
         resp = entry.get("resp")
     if resp is not None:
@@ -362,6 +367,11 @@ def cancel_chat(chat_id: str) -> bool:
                     pass
         except Exception:
             pass
+    try:
+        from providers.codex_provider import cancel_codex_for_chat
+        cancel_codex_for_chat(chat_id)
+    except Exception:
+        pass
     return True
 
 # thread pool for long-running tools so the HTTP worker stays responsive
@@ -13748,8 +13758,17 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
         emit({"type": "error", "error": msg, "code": getattr(exc, "code", "provider_error")})
         return None
 
+    from providers.codex_provider import CODEX_PROVIDER_ID
+
+    # Codex owns its model selection; Accuretta tools are not used on Codex turns.
+    if provider_id == CODEX_PROVIDER_ID:
+        use_tools = False
+        native_tools = False
+
     if provider_id == OPENAI_PROVIDER_ID:
         model = (settings.get("openai_model") or OPENAI_DEFAULT_MODEL).strip()
+    elif provider_id == CODEX_PROVIDER_ID:
+        model = (settings.get("codex_model") or settings.get("model") or "codex").strip()
     else:
         model = settings.get("model") or ""
     if not model:
@@ -13944,11 +13963,12 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
             stream_iter = None
             for _ctx_attempt in range(4):
                 try:
-                    waiting = (
-                        "waiting for llama-server to accept chat completion…"
-                        if provider_id == DEFAULT_PROVIDER_ID
-                        else "waiting for OpenAI chat completion…"
-                    )
+                    if provider_id == DEFAULT_PROVIDER_ID:
+                        waiting = "waiting for llama-server to accept chat completion…"
+                    elif provider_id == CODEX_PROVIDER_ID:
+                        waiting = "waiting for Codex chat completion…"
+                    else:
+                        waiting = "waiting for OpenAI chat completion…"
                     emit({"type": "notice", "note": waiting})
                     from providers.inference_stream import open_provider_chat_stream
                     from providers.management import get_auth_store_info
@@ -13958,6 +13978,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         cancel_ev=cancel_ev,
                         auth_store=get_auth_store_info().store,
                         bridge_module=sys.modules[__name__],
+                        chat_id=chat_id,
                     )
                     break
                 except Exception as e:

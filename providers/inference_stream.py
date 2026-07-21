@@ -2,12 +2,17 @@
 
 Newly written for Accuretta. Lets ``run_chat_turn`` keep orchestration while
 LocalLlamaProvider and OpenAIProvider supply OpenAI-compatible SSE bytes.
+Codex is adapted into the same SSE framing so the turn loop stays shared,
+without falling back to local llama on Codex failure.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Iterator, Optional, Tuple
 
+from .codex_provider import CODEX_PROVIDER_ID, CodexProvider, cancel_codex_for_chat
+from .codex_readiness import assess_codex_inference_readiness, readiness_to_provider_error
 from .errors import AuthenticationRequired, ProviderUnavailable
 from .openai_provider import OPENAI_PROVIDER_ID, OpenAIProvider, openai_api_key_from_store
 from .selection import DEFAULT_PROVIDER_ID
@@ -32,11 +37,9 @@ def build_provider_chat_payload(
         "messages": messages,
         "stream": True,
     }
-    # Sampling — shared OpenAI-compatible fields.
     for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
         if key in llama_options:
             payload[key] = llama_options[key]
-    # max tokens
     max_tokens = llama_options.get("max_tokens")
     if max_tokens is None:
         try:
@@ -48,12 +51,17 @@ def build_provider_chat_payload(
     if max_tokens is not None and int(max_tokens) > 0:
         payload["max_tokens"] = int(max_tokens)
 
+    if provider_id == CODEX_PROVIDER_ID:
+        # Codex does not use Accuretta's OpenAI tools payload.
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        return payload
+
     if use_tools and native_tools and tools_payload:
         payload["tools"] = tools_payload
         payload["tool_choice"] = "auto"
 
     if provider_id == DEFAULT_PROVIDER_ID:
-        # Local llama extras.
         for key, value in llama_options.items():
             payload.setdefault(key, value)
         if chat_template_kwargs:
@@ -61,11 +69,50 @@ def build_provider_chat_payload(
         if stop:
             payload["stop"] = list(stop)
     else:
-        # Cloud: strip llama-only keys if present.
         for k in list(payload.keys()):
             if k in {"chat_template_kwargs", "mirostat", "mirostat_tau", "mirostat_eta"}:
                 payload.pop(k, None)
     return payload
+
+
+class _CodexStreamHandle:
+    """Minimal response stand-in so cancel_chat can still call close()."""
+
+    def __init__(self, chat_id: Optional[str] = None):
+        self.chat_id = chat_id
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+        if self.chat_id:
+            cancel_codex_for_chat(self.chat_id)
+
+    def read(self, _n: int = 0) -> bytes:
+        return b""
+
+
+def _inference_events_to_openai_sse(events: Iterator) -> Iterator[bytes]:
+    from .base import InferenceEventType
+
+    for evt in events:
+        if evt.event_type == InferenceEventType.TEXT_DELTA and evt.text_delta:
+            chunk = {
+                "choices": [{"index": 0, "delta": {"content": evt.text_delta}, "finish_reason": None}],
+            }
+            yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
+        elif evt.event_type == InferenceEventType.ERROR:
+            err = {"error": {"message": evt.error or "Codex error"}}
+            yield ("data: " + json.dumps(err, ensure_ascii=False) + "\n\n").encode("utf-8")
+        elif evt.event_type == InferenceEventType.COMPLETED:
+            chunk = {
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": evt.completion_reason or "stop",
+                }],
+            }
+            yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
+    yield b"data: [DONE]\n\n"
 
 
 def open_provider_chat_stream(
@@ -75,12 +122,11 @@ def open_provider_chat_stream(
     cancel_ev,
     auth_store=None,
     bridge_module=None,
+    chat_id: Optional[str] = None,
 ) -> Tuple[Any, Iterator[bytes]]:
-    """Open a streaming completion.
+    """Open a streaming completion for exactly one provider.
 
-    Returns ``(response, raw_sse_byte_iterator)``. Caller must close ``response``.
-    The iterator yields the same OpenAI SSE framing both local llama-server and
-    OpenAI produce (``data: {...}\\n``), so ``run_chat_turn`` can share parsers.
+    Never falls back from Codex to local llama (or vice versa).
     """
     if provider_id == DEFAULT_PROVIDER_ID or not provider_id:
         bridge = bridge_module
@@ -127,10 +173,40 @@ def open_provider_chat_stream(
                         return
                     yield chunk
             finally:
-                # Caller also closes; belt-and-suspenders for early cancel.
                 pass
 
         return resp, _iter_openai()
+
+    if provider_id == CODEX_PROVIDER_ID:
+        readiness = assess_codex_inference_readiness(live=True)
+        if not readiness.get("ready"):
+            raise readiness_to_provider_error(readiness, provider_id=CODEX_PROVIDER_ID)
+
+        from .base import InferenceRequest
+
+        provider = CodexProvider()
+        request = InferenceRequest(
+            model=str(payload.get("model") or ""),
+            messages=list(payload.get("messages") or []),
+            cancellation_id=chat_id or "",
+            extra={"chat_id": chat_id} if chat_id else {},
+        )
+        handle = _CodexStreamHandle(chat_id=chat_id)
+
+        def _iter_codex():
+            try:
+                events = provider.stream_response(request)
+                for chunk in _inference_events_to_openai_sse(events):
+                    if cancel_ev is not None and cancel_ev.is_set():
+                        cancel_codex_for_chat(chat_id or "")
+                        return
+                    if handle._closed:
+                        return
+                    yield chunk
+            finally:
+                handle.close()
+
+        return handle, _iter_codex()
 
     raise ProviderUnavailable(
         f"Provider {provider_id} cannot stream chat yet",
