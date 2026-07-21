@@ -163,4 +163,5 @@ submit, never written to localStorage/sessionStorage.
 ## Related
 
 - [authentication.md](authentication.md)
+- [provider-smoke-test.md](provider-smoke-test.md) — manual milestone checklist
 - [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)

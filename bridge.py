@@ -17043,9 +17043,14 @@ class Handler(BaseHTTPRequestHandler):
             def hard_exit():
                 time.sleep(1)
                 try:
+                    from providers.management import shutdown_provider_background
+                    shutdown_provider_background()
+                except Exception:
+                    pass
+                try:
                     _llama.stop()
                     _vision_llama.stop()
-                except:
+                except Exception:
                     pass
                 os._exit(0)
             threading.Thread(target=hard_exit, daemon=True).start()
@@ -20534,6 +20539,15 @@ def main():
     atexit.register(_vision_llama.stop)
     atexit.register(_vision_llama.shutdown_watchdog)
 
+    def _shutdown_provider_background():
+        try:
+            from providers.management import shutdown_provider_background
+            shutdown_provider_background()
+        except Exception:
+            pass
+
+    atexit.register(_shutdown_provider_background)
+
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     httpd.daemon_threads = True
     url = f"http://localhost:{PORT}"
@@ -20635,6 +20649,11 @@ def main():
     finally:
         # Stop the watchdog FIRST so it doesn't observe the impending
         # subprocess death and try to "heal" it during shutdown.
+        try:
+            from providers.management import shutdown_provider_background
+            shutdown_provider_background()
+        except Exception:
+            pass
         try:
             _llama.shutdown_watchdog()
             _vision_llama.shutdown_watchdog()

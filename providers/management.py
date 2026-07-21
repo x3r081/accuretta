@@ -174,9 +174,64 @@ def list_provider_statuses(settings: dict) -> dict:
         "authBackend": info.backend,
         "secureCloudAuthAvailable": info.secure_cloud_auth_available,
         "authDetail": info.detail if not info.secure_cloud_auth_available else None,
+        "diagnostics": build_provider_diagnostics(settings, providers=providers, info=info),
     }
     assert_safe_provider_payload(payload)
     return payload
+
+
+def build_provider_diagnostics(
+    settings: dict,
+    *,
+    providers: Optional[List[dict]] = None,
+    info: Optional[AuthStoreInfo] = None,
+) -> dict:
+    """Safe milestone diagnostics for UI / smoke tests — never secrets."""
+    ensure_builtin_providers()
+    if info is None:
+        info = get_auth_store_info()
+    if providers is None:
+        # Avoid recursion through list_provider_statuses.
+        selection = resolve_provider_selection(settings)
+        providers = [
+            provider_status_for(
+                d,
+                settings=settings,
+                store=info.store,
+                selected_id=selection.provider_id,
+            )
+            for d in get_default_registry().list_definitions(include_disabled=True)
+        ]
+    by_id = {p.get("providerId"): p for p in providers if isinstance(p, dict)}
+    local = by_id.get(DEFAULT_PROVIDER_ID) or {}
+    openai = by_id.get(OPENAI_PROVIDER_ID) or {}
+    github = by_id.get(GITHUB_PROVIDER_ID) or {}
+    out = {
+        "localProviderAvailable": bool(local.get("available", True)),
+        "openaiAvailable": bool(openai.get("available")),
+        "openaiCredentialStored": bool(openai.get("credentialStored")),
+        "openaiCredentialValidated": openai.get("credentialValidated"),
+        "githubConfigured": bool(github.get("available")),
+        "githubAvailable": bool(github.get("available")),
+        "githubDisabledReason": github.get("disabledReason"),
+        "authBackend": info.backend,
+        "secureCloudAuthAvailable": bool(info.secure_cloud_auth_available),
+        "selectedProviderId": resolve_provider_selection(settings).provider_id,
+    }
+    assert_safe_provider_payload(out)
+    return out
+
+
+def shutdown_provider_background() -> None:
+    """Cancel device-flow pollers and drop the manager singleton.
+
+    Safe to call multiple times. Must run before ``os._exit`` (which skips atexit).
+    """
+    try:
+        from auth.device_flow import reset_device_flow_manager
+        reset_device_flow_manager()
+    except Exception:
+        pass
 
 
 def get_provider_status(provider_id: str, settings: dict) -> dict:

@@ -1,7 +1,9 @@
 # Authentication and credential storage
 
 Accuretta keeps cloud credentials off the frontend. Local llama.cpp needs no
-account. **No external OAuth provider is enabled in this release.**
+account. This milestone supports an **experimental OpenAI API-key** provider and
+optional **experimental GitHub account login** (device flow, identity only —
+not Copilot inference). ChatGPT / Codex OAuth is not implemented here.
 
 ## Storage backends
 
