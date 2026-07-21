@@ -5,9 +5,10 @@ Newly written for Accuretta. Uses only the official Codex ``thread/start``
 
 Security model (summary):
 - Codex conversational inference may run with or without a cwd.
-- Native Codex file/shell actions are **declined** (advisory / chat-only).
-- Accuretta's own tools + approval gates are unchanged and are not used
-  by the Codex provider path.
+- Native Codex file/shell actions follow ``codex_write_mode`` (chat_only /
+  ask / workspace_auto). Writes outside the validated workspace are never
+  approved. Shell still requires Accuretta approval unless explicitly enabled.
+- Accuretta's own tools + approval gates remain unchanged for local/OpenAI.
 - cwd is always an Accuretta-configured workspace folder (normalized,
   symlink-resolved). Home directory and filesystem root are rejected.
 """
@@ -19,6 +20,13 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
+
+from codex.approvals import (
+    DEFAULT_WRITE_MODE,
+    get_codex_write_mode,
+    mode_allows_coding_actions,
+    normalize_codex_write_mode,
+)
 
 from .status import assert_safe_provider_payload
 
@@ -43,9 +51,8 @@ class CodexWorkspaceBinding:
     ok: bool
     reason: Optional[str]
     source: str  # chat_bound | accuretta_active | none
-    # Coding via Codex native tools is never enabled in this build.
     coding_actions_allowed: bool = False
-    mode: str = "advisory_chat_only"
+    mode: str = DEFAULT_WRITE_MODE
 
     def to_safe_dict(self) -> dict:
         out = {
@@ -53,12 +60,18 @@ class CodexWorkspaceBinding:
             "ok": self.ok,
             "reason": self.reason,
             "source": self.source,
-            "codingActionsAllowed": False,
+            "codingActionsAllowed": bool(self.coding_actions_allowed),
             "mode": self.mode,
             "displayLabel": self.cwd or "No workspace (chat-only)",
         }
         assert_safe_provider_payload(out)
         return out
+
+
+def _binding_mode_flags(*, ok: bool, cwd: Optional[str]) -> tuple[bool, str]:
+    mode = normalize_codex_write_mode(get_codex_write_mode())
+    coding = bool(ok and cwd and mode_allows_coding_actions(mode))
+    return coding, mode
 
 
 def clear_codex_cwd_for_chat(chat_id: str) -> None:
@@ -243,8 +256,14 @@ def validate_codex_cwd(
             cwd=None, ok=False, reason=FORBIDDEN_REASON_INVALID, source="none"
         )
 
+    coding, mode = _binding_mode_flags(ok=True, cwd=normalized)
     return CodexWorkspaceBinding(
-        cwd=normalized, ok=True, reason=None, source="validated"
+        cwd=normalized,
+        ok=True,
+        reason=None,
+        source="validated",
+        coding_actions_allowed=coding,
+        mode=mode,
     )
 
 
@@ -262,8 +281,14 @@ def resolve_codex_workspace(
     """
     roots = _accuretta_workspace_folders()
     if not roots:
+        coding, mode = _binding_mode_flags(ok=False, cwd=None)
         return CodexWorkspaceBinding(
-            cwd=None, ok=False, reason=FORBIDDEN_REASON_MISSING, source="none"
+            cwd=None,
+            ok=False,
+            reason=FORBIDDEN_REASON_MISSING,
+            source="none",
+            coding_actions_allowed=False,
+            mode=mode,
         )
 
     candidates: list[tuple[str, str]] = []
@@ -284,22 +309,24 @@ def resolve_codex_workspace(
         seen.add(key)
         result = validate_codex_cwd(path, allowed_roots=roots)
         if result.ok and result.cwd:
+            coding, mode = _binding_mode_flags(ok=True, cwd=result.cwd)
             return CodexWorkspaceBinding(
                 cwd=result.cwd,
                 ok=True,
                 reason=None,
                 source=source,
-                coding_actions_allowed=False,
-                mode="advisory_chat_only",
+                coding_actions_allowed=coding,
+                mode=mode,
             )
 
+    coding, mode = _binding_mode_flags(ok=False, cwd=None)
     return CodexWorkspaceBinding(
         cwd=None,
         ok=False,
         reason=FORBIDDEN_REASON_MISSING,
         source="none",
         coding_actions_allowed=False,
-        mode="advisory_chat_only",
+        mode=mode,
     )
 
 

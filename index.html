@@ -598,6 +598,15 @@
         <span class="hint" id="codex-auth-hint">Authentication is connected here separately from the inference provider above. Codex inference is a separate capability — select “Codex via ChatGPT” only after you are signed in and ready. Usage is subject to your eligible ChatGPT/Codex plan. Accuretta never receives or stores ChatGPT OAuth tokens. OpenAI API-key access remains separate. ChatGPT history and memory are not imported. Accuretta is not an official OpenAI product. Experimental.</span>
         <div id="codex-status-line" class="hint" style="margin-top:6px;" role="status" aria-live="polite"></div>
         <div id="codex-meta-line" class="hint" style="margin-top:4px;"></div>
+        <div class="form-row" style="margin-top:10px;">
+          <label for="set-codex-write-mode">Codex write access</label>
+          <select id="set-codex-write-mode" title="Controls native Codex file writes inside the Accuretta workspace">
+            <option value="chat_only">Chat only — decline native writes</option>
+            <option value="ask">Ask before every write (recommended)</option>
+            <option value="workspace_auto">Always allow writes within workspace</option>
+          </select>
+          <span class="hint">Applies to the active Accuretta workspace only. Paths outside it are always declined. Shell commands still require approval. Changing this starts a fresh Codex thread on the next turn.</span>
+        </div>
         <div id="codex-browser-row" style="display:none;margin-top:10px;">
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
             <a class="btn sm" id="btn-codex-open-auth" href="#" target="_blank" rel="noopener noreferrer" title="Open ChatGPT sign-in page">Open sign-in page</a>

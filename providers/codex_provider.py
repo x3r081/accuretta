@@ -151,6 +151,39 @@ def clear_codex_thread_for_chat(chat_id: str) -> None:
     clear_codex_cwd_for_chat(chat_id)
 
 
+def clear_all_codex_threads(*, reason: str = "") -> int:
+    """Drop all chat→thread bindings so the next turn recreates with current sandbox.
+
+    Used when ``codex_write_mode`` changes (read-only ↔ workspace-write). Also
+    strips persisted ``codex_thread_id`` from chats.json. Does not touch OAuth.
+    """
+    with _THREAD_LOCK:
+        n = len(_THREAD_BY_CHAT)
+        _THREAD_BY_CHAT.clear()
+    with _META_LOCK:
+        _LAST_TURN_META.clear()
+    try:
+        import bridge
+        chats = bridge.get_chats()
+        changed = False
+        for _cid, rec in list((chats.get("chats") or {}).items()):
+            if not isinstance(rec, dict):
+                continue
+            if "codex_thread_id" in rec:
+                rec.pop("codex_thread_id", None)
+                changed = True
+        if changed:
+            bridge.save_json(bridge.CHATS_FILE, chats)
+    except Exception:
+        pass
+    if reason:
+        import logging
+        logging.getLogger("accuretta.codex").info(
+            "cleared Codex thread bindings (%s) count=%s", reason, n
+        )
+    return n
+
+
 def pop_codex_turn_meta(chat_id: str) -> Optional[dict]:
     if not chat_id:
         return None
@@ -374,6 +407,7 @@ class CodexProvider:
         cwd = workspace.cwd if workspace.ok else None
         if cwd and chat_key:
             bind_codex_cwd(chat_key, cwd)
+        svc.set_active_workspace(cwd)
 
         try:
             thread_id = None
@@ -536,7 +570,7 @@ class CodexProvider:
                 "createdThread": created_fresh,
                 "cwd": cwd,
                 "workspaceMode": workspace.mode,
-                "codingActionsAllowed": False,
+                "codingActionsAllowed": bool(workspace.coding_actions_allowed),
             }
             if model:
                 meta["modelLabel"] = str(model)[:120]

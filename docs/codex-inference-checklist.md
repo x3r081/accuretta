@@ -49,7 +49,7 @@ curl -sS http://127.0.0.1:8787/api/health | python3 -m json.tool
 ## Workspace / security
 
 - [ ] Thread `cwd` is Accuretta workspace (not `$HOME` / `/`)
-- [ ] Native Codex file/shell approvals declined (advisory)
+- [ ] Native Codex file/shell approvals follow `codex_write_mode` (chat_only declines; ask prompts; workspace_auto allows in-workspace writes only)
 - [ ] No tokens in `data/`, settings, chats, or bridge logs
 - [ ] Accuretta shutdown ends **owned** app-server only (not unrelated `codex`)
 

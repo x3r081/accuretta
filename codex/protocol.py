@@ -351,15 +351,21 @@ def build_thread_start_params(
 ) -> dict:
     """Build allowlisted thread/start params (stable surface only).
 
-    Defaults keep Codex in a restrictive posture: read-only sandbox and
-    on-request approvals. Accuretta still declines native approval RPCs
-    (advisory / chat-only for file and shell actions).
+    Sandbox rules:
+    - ``read-only`` — chat-only / no native writes
+    - ``workspace-write`` — writes confined to validated cwd (ask / auto modes)
+    - ``danger-full-access`` — **never** allowed; clamped to ``workspace-write``
+
+    Approval policy defaults to ``on-request`` so Accuretta can gate each
+    native file/shell action according to ``codex_write_mode``.
     """
     # Force safe defaults even if callers pass empty / unknown values.
     sandbox_val = sandbox if sandbox in {"read-only", "readOnly", "workspace-write", "danger-full-access"} else "read-only"
-    if sandbox_val in {"workspace-write", "danger-full-access"}:
-        # Accuretta does not enable write sandboxes for Codex in this build.
+    if sandbox_val in {"readOnly"}:
         sandbox_val = "read-only"
+    if sandbox_val == "danger-full-access":
+        # Never grant unrestricted FS access — clamp to workspace-write.
+        sandbox_val = "workspace-write"
     approval_val = approval_policy if approval_policy in {
         "untrusted", "on-failure", "on-request", "never",
     } else "on-request"

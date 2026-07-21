@@ -58,6 +58,9 @@ class CodexSession:
         self._login_pending_blocks_restart = False
         self._extra_listeners: List[NotificationListener] = []
         self._server_request_handler: Optional[ServerRequestHandler] = None
+        # Mutable box so set_server_request_handler can update without replacing
+        # the threaded stdout-reader-safe wrapper installed in ensure_ready.
+        self._server_req_box: dict = {"handler": None}
 
     @property
     def rpc(self) -> CodexRpcClient:
@@ -74,8 +77,28 @@ class CodexSession:
     def set_server_request_handler(self, handler: Optional[ServerRequestHandler]) -> None:
         with self._lock:
             self._server_request_handler = handler
+            self._server_req_box["handler"] = handler
+            # Prefer keeping the threaded wrapper from ensure_ready. Only install
+            # a fresh wrapper if the process is ready but somehow lacks one.
             if self._process is not None and self._process._rpc is not None:
-                self._process._rpc._on_server_request = handler
+                if self._process._rpc._on_server_request is None:
+                    box = self._server_req_box
+
+                    def on_server_request(msg: dict):
+                        def _run() -> None:
+                            h = box.get("handler")
+                            if h is None:
+                                return
+                            try:
+                                h(msg)
+                            except Exception:
+                                pass
+
+                        threading.Thread(
+                            target=_run, name="codex-server-req", daemon=True
+                        ).start()
+
+                    self._process._rpc._on_server_request = on_server_request
 
     def refresh_discovery(self) -> CodexDiscovery:
         reset_discovery_cache()
@@ -127,7 +150,8 @@ class CodexSession:
             proc = factory(d.executable)
             account_box: dict = {}
             listeners_box: dict = {"list": list(self._extra_listeners)}
-            server_handler_box: dict = {"handler": self._server_request_handler}
+            self._server_req_box["handler"] = self._server_request_handler
+            server_handler_box = self._server_req_box
 
             def on_notify(method, params):
                 ctrl = account_box.get("ctrl")
@@ -143,12 +167,20 @@ class CodexSession:
                         )
 
             def on_server_request(msg: dict):
-                handler = server_handler_box.get("handler")
-                if handler is not None:
+                # Off the stdout reader thread so approval handlers may block
+                # on Accuretta's UI without stalling Codex I/O.
+                def _run() -> None:
+                    handler = server_handler_box.get("handler")
+                    if handler is None:
+                        return
                     try:
                         handler(msg)
                     except Exception:
                         pass
+
+                threading.Thread(
+                    target=_run, name="codex-server-req", daemon=True
+                ).start()
 
             proc.set_notification_handler(on_notify)
             try:

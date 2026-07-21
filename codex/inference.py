@@ -20,6 +20,14 @@ import time
 from typing import Callable, List, Optional
 
 from .account import CodexAccountError
+from .approvals import (
+    cache_file_change_item,
+    decide_command_execution,
+    decide_file_change,
+    get_codex_write_mode,
+    map_legacy_decision,
+    sandbox_for_write_mode,
+)
 from .flags import is_codex_inference_enabled
 from .inference_types import (
     CodexInferenceAvailability,
@@ -65,6 +73,10 @@ class CodexInferenceService:
         self._terminal: Optional[CodexInferenceEvent] = None
         self._terminal_event = threading.Event()
         self._registered = False
+        # Validated workspace cwd for the active/latest Codex thread (approval gate).
+        self._active_workspace_cwd: Optional[str] = None
+        # itemId → fileChange metadata from item/started (paths for approval).
+        self._file_change_items: dict = {}
 
     # ---- availability -----------------------------------------------------
 
@@ -144,7 +156,7 @@ class CodexInferenceService:
         params = build_thread_start_params(
             model=model,
             cwd=cwd,
-            sandbox="read-only",
+            sandbox=sandbox_for_write_mode(get_codex_write_mode()),
             approval_policy="on-request",
         )
         try:
@@ -165,7 +177,19 @@ class CodexInferenceService:
                 sanitize_error_message(str(exc)),
                 event_type=CodexInferenceEventType.PROCESS_ERROR,
             ) from None
+        if isinstance(cwd, str) and cwd.strip():
+            with self._state_lock:
+                self._active_workspace_cwd = cwd.strip()
+                self._file_change_items.clear()
         return parsed["threadId"]
+
+    def set_active_workspace(self, cwd: Optional[str]) -> None:
+        """Bind the validated workspace used for approval path checks."""
+        with self._state_lock:
+            if isinstance(cwd, str) and cwd.strip():
+                self._active_workspace_cwd = cwd.strip()
+            else:
+                self._active_workspace_cwd = None
 
     def run_turn(
         self,
@@ -227,7 +251,7 @@ class CodexInferenceService:
         if self._registered:
             return
         self._session.add_notification_listener(self._on_notification)
-        self._session.set_server_request_handler(self._deny_server_request)
+        self._session.set_server_request_handler(self._handle_server_request)
         self._registered = True
 
     def _emit(self, event: CodexInferenceEvent) -> None:
@@ -373,6 +397,13 @@ class CodexInferenceService:
             return
 
         if method in {"item/started", "item/completed", "thread/started"}:
+            if method in {"item/started", "item/completed"} and isinstance(params, dict):
+                item = params.get("item")
+                cached = cache_file_change_item(item)
+                if cached:
+                    item_id, entry = cached
+                    with self._state_lock:
+                        self._file_change_items[item_id] = entry
             self._emit(
                 CodexInferenceEvent(
                     type=CodexInferenceEventType.STATUS,
@@ -383,14 +414,20 @@ class CodexInferenceService:
                 )
             )
 
-    def _deny_server_request(self, msg: dict) -> None:
-        """Fail-closed: decline approvals / ignore experimental host-token refresh."""
+    def _handle_server_request(self, msg: dict) -> None:
+        """Gate Codex native file/shell approvals per ``codex_write_mode``.
+
+        Runs on a worker thread (session dispatches off the stdout reader) so
+        Accuretta's blocking approval UI cannot stall Codex I/O.
+        """
         req_id = msg.get("id")
         method = str(msg.get("method") or "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         try:
             rpc = self._session.rpc
         except Exception:
             return
+
         # Never participate in external token refresh — Accuretta does not own tokens.
         if method == "account/chatgptAuthTokens/refresh":
             try:
@@ -402,21 +439,53 @@ class CodexInferenceService:
             except Exception:
                 pass
             return
+
+        with self._state_lock:
+            workspace_cwd = self._active_workspace_cwd
+            item_cache = dict(self._file_change_items)
+        mode = get_codex_write_mode()
+
+        def _request_approval(title, command, details=None, timeout_s=600):
+            import bridge
+            return bridge.request_approval(title, command, details, timeout_s)
+
+        if method in {
+            "item/fileChange/requestApproval",
+            "applyPatchApproval",
+        }:
+            decision = decide_file_change(
+                mode=mode,
+                params=params,
+                workspace_cwd=workspace_cwd,
+                item_cache=item_cache,
+                request_approval=_request_approval,
+            )
+            if method == "applyPatchApproval":
+                decision = map_legacy_decision(decision)
+            try:
+                rpc.respond(req_id, decision)
+            except Exception:
+                pass
+            return
+
         if method in {
             "item/commandExecution/requestApproval",
-            "item/fileChange/requestApproval",
+            "execCommandApproval",
         }:
+            decision = decide_command_execution(
+                mode=mode,
+                params=params,
+                workspace_cwd=workspace_cwd,
+                request_approval=_request_approval,
+            )
+            if method == "execCommandApproval":
+                decision = map_legacy_decision(decision)
             try:
-                rpc.respond(req_id, {"decision": "decline"})
+                rpc.respond(req_id, decision)
             except Exception:
                 pass
             return
-        if method in {"applyPatchApproval", "execCommandApproval"}:
-            try:
-                rpc.respond(req_id, {"decision": "denied"})
-            except Exception:
-                pass
-            return
+
         # Unknown / unsupported server requests: reject without hanging the turn.
         try:
             rpc.respond_error(
@@ -426,7 +495,6 @@ class CodexInferenceService:
             )
         except Exception:
             pass
-
     def _run_turn_locked(
         self,
         thread_id: str,

@@ -9,8 +9,25 @@ sends the workspace tree as prompt text.
 | Field | Value |
 |---|---|
 | `cwd` | Normalized, symlink-resolved Accuretta workspace root (first configured folder, or the path bound to that chat) |
-| `sandbox` | Always `read-only` |
+| `sandbox` | `read-only` when write mode is **Chat only**; otherwise `workspace-write` |
 | `approvalPolicy` | Always `on-request` |
+
+`danger-full-access` is **never** sent. If a caller requests it, Accuretta clamps
+to `workspace-write`.
+
+## Codex write modes (`codex_write_mode`)
+
+| Mode | Native file writes | Shell | Sandbox |
+|---|---|---|---|
+| **Chat only** (`chat_only`) | Always declined | Always declined | `read-only` |
+| **Ask before every write** (`ask`, default) | Accuretta approval UI; outside workspace declined | Accuretta approval UI; cwd outside workspace declined | `workspace-write` |
+| **Always allow within workspace** (`workspace_auto`) | Auto-accept paths inside workspace; outside declined | Still requires approval | `workspace-write` |
+
+Shell auto-approve is **not** enabled by any of these modes. OAuth / ChatGPT
+token handling is unchanged.
+
+Changing `codex_write_mode` clears bound Codex thread ids so the next turn
+starts a fresh thread with the matching sandbox.
 
 ## What Accuretta rejects as `cwd`
 
@@ -30,13 +47,13 @@ under an Accuretta workspace root.
 |---|---|---|
 | Conversational inference | Yes (ChatGPT / Codex) | Yes (local llama / OpenAI API) |
 | File inspection / edits via Accuretta tools | No | Yes, workspace-gated + approvals |
-| Native Codex file change / shell approvals | **Always declined** | n/a |
+| Native Codex file change / shell approvals | Per `codex_write_mode` (never outside workspace) | n/a |
 | Unrestricted writes because user is signed in | **No** | **No** |
 
 Codex server requests such as `item/fileChange/requestApproval` and
-`item/commandExecution/requestApproval` are answered with **decline**. Accuretta
-does not bridge those into Accuretta’s approval UI. Therefore Codex remains
-**advisory / chat-only** for tool and write actions in this build.
+`item/commandExecution/requestApproval` are handled by Accuretta’s policy in
+`codex/approvals.py` (and may surface as Accuretta approval cards in **ask**
+mode). Paths outside the validated workspace are always declined.
 
 ## Per-conversation isolation
 
@@ -50,6 +67,6 @@ workspace does not silently retarget an existing Codex thread to home/root.
 
 ## UI
 
-Settings → ChatGPT / Codex shows the resolved workspace path (or “no workspace”).
-Chat turns emit a `provider` event that includes the safe workspace DTO so the
-streaming bubble can display which project root Codex is using.
+Settings → ChatGPT / Codex shows the resolved workspace path and the write-mode
+control. Chat turns emit a `provider` event that includes the safe workspace DTO
+so the streaming bubble can display which project root Codex is using.

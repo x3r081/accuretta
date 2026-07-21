@@ -635,6 +635,9 @@ DEFAULT_SETTINGS = {
     "provider_id": "local_llama",
     # Selected OpenAI model id (separate from local GGUF model / model_path).
     "openai_model": "gpt-4o-mini",
+    # Codex native write policy for the active workspace (never outside it).
+    # chat_only | ask (recommended) | workspace_auto. Shell still requires approval.
+    "codex_write_mode": "ask",
 }
 
 
@@ -14545,7 +14548,7 @@ def run_chat_turn(chat_id: str, messages: list[dict], use_tools: bool, emit,
                         assistant_msg["_codex_thread_id"] = tid
                     if meta.get("cwd"):
                         assistant_msg["_codex_cwd"] = meta["cwd"]
-                    assistant_msg["_codex_workspace_mode"] = meta.get("workspaceMode") or "advisory_chat_only"
+                    assistant_msg["_codex_workspace_mode"] = meta.get("workspaceMode") or "ask"
                 elif provider_id == DEFAULT_PROVIDER_ID:
                     from providers.codex_provider import LOCAL_DISPLAY_NAME
                     assistant_msg["provider_id"] = DEFAULT_PROVIDER_ID
@@ -16906,9 +16909,19 @@ class Handler(BaseHTTPRequestHandler):
             broadcast_event({"type": "sandbox:update"})
             return self._send_json(200, {"removed": rc == 0, "output": (out or "").strip()[:400]})
         if p == "/api/settings":
+            from codex.approvals import normalize_codex_write_mode
             cur = get_settings()
+            prev_write_mode = normalize_codex_write_mode(cur.get("codex_write_mode"))
             cur.update({k: v for k, v in body.items() if k in DEFAULT_SETTINGS})
+            if "codex_write_mode" in body or "codex_write_mode" in cur:
+                cur["codex_write_mode"] = normalize_codex_write_mode(cur.get("codex_write_mode"))
             save_json(SETTINGS_FILE, cur)
+            if prev_write_mode != cur.get("codex_write_mode"):
+                try:
+                    from providers.codex_provider import clear_all_codex_threads
+                    clear_all_codex_threads(reason="codex_write_mode changed")
+                except Exception:
+                    pass
             broadcast_event({"type": "settings:update"})
             return self._send_json(200, cur)
         if p == "/api/providers" or p.startswith("/api/providers/"):

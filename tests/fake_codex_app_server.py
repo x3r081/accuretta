@@ -51,6 +51,8 @@ def main() -> int:
     initialized = False
     threads = {}
     active_turns = {}
+    # Server-initiated JSON-RPC requests awaiting client responses.
+    pending_server: dict = {}
 
     sys.stderr.write(f"fake-codex boot Authorization: Bearer {secret}\n")
     sys.stderr.flush()
@@ -68,6 +70,16 @@ def main() -> int:
             continue
         if not isinstance(msg, dict):
             continue
+
+        # Client response to a server-initiated request (approval decisions).
+        if "id" in msg and ("result" in msg or "error" in msg) and "method" not in msg:
+            entry = pending_server.get(msg.get("id"))
+            if entry is not None:
+                entry["result"] = msg.get("result")
+                entry["error"] = msg.get("error")
+                entry["event"].set()
+            continue
+
         method = msg.get("method")
         req_id = msg.get("id")
         params = msg.get("params") or {}
@@ -250,6 +262,93 @@ def main() -> int:
                         },
                     })
                     return
+
+                write_path = (os.environ.get("FAKE_CODEX_WRITE_PATH") or "").strip()
+                if os.environ.get("FAKE_CODEX_REQUEST_WRITE") == "1" and write_path:
+                    item_id = "file-change-" + str(uuid.uuid4())
+                    _emit({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": thid,
+                            "turnId": tid,
+                            "item": {
+                                "type": "fileChange",
+                                "id": item_id,
+                                "status": "inProgress",
+                                "changes": [{
+                                    "path": write_path,
+                                    "kind": "add",
+                                    "diff": "hello from approved Codex write\n",
+                                }],
+                            },
+                        },
+                    })
+                    srv_id = "srv-write-" + str(uuid.uuid4())
+                    ev = threading.Event()
+                    pending_server[srv_id] = {"event": ev, "result": None, "error": None}
+                    _emit({
+                        "id": srv_id,
+                        "method": "item/fileChange/requestApproval",
+                        "params": {
+                            "threadId": thid,
+                            "turnId": tid,
+                            "itemId": item_id,
+                            "reason": "create demo file",
+                        },
+                    })
+                    ev.wait(timeout=30.0)
+                    entry = pending_server.pop(srv_id, {}) or {}
+                    decision = None
+                    if isinstance(entry.get("result"), dict):
+                        decision = entry["result"].get("decision")
+                    if decision == "accept":
+                        try:
+                            with open(write_path, "w", encoding="utf-8") as fh:
+                                fh.write("hello from approved Codex write\n")
+                        except Exception as exc:
+                            sys.stderr.write(f"fake-codex write failed: {exc}\n")
+                            sys.stderr.flush()
+                        status_fc = "completed"
+                        text = f"Created {write_path}"
+                    else:
+                        status_fc = "declined"
+                        text = "write access was declined again."
+                    _emit({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": thid,
+                            "turnId": tid,
+                            "item": {
+                                "type": "fileChange",
+                                "id": item_id,
+                                "status": status_fc,
+                                "changes": [{
+                                    "path": write_path,
+                                    "kind": "add",
+                                    "diff": "hello from approved Codex write\n",
+                                }],
+                            },
+                        },
+                    })
+                    msg_id = str(uuid.uuid4())
+                    _emit({
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": thid,
+                            "turnId": tid,
+                            "itemId": msg_id,
+                            "delta": text,
+                        },
+                    })
+                    _emit({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thid,
+                            "turn": {"id": tid, "items": [], "status": "completed"},
+                        },
+                    })
+                    return
+
                 item_id = str(uuid.uuid4())
                 _emit({
                     "method": "item/started",

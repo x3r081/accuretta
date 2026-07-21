@@ -6313,6 +6313,8 @@
   const APPR_KIND_META = {
     write_file:        { sub: "The model wants to write to a file on your system.",        info: "This will create or update the file at the specified location with the provided content." },
     edit_file:         { sub: "The model wants to edit a file on your system.",            info: "This will apply the listed search-and-replace edits in place. The previous content is captured in version history." },
+    codex_file_change: { sub: "Codex wants to write files in your Accuretta workspace.",   info: "Native Codex file change. Accuretta only allows paths inside the active workspace. Outside paths are declined automatically." },
+    codex_shell:       { sub: "Codex wants to run a shell command in your workspace.",     info: "Native Codex shell. Commands whose working directory is outside the Accuretta workspace are declined. Shell is never auto-approved by write mode." },
     delete:            { sub: "The model wants to delete something from your filesystem.", info: "This is permanent — once approved, the file or folder cannot be restored from inside Accuretta." },
     powershell:        { sub: "The model wants to run a shell command on your machine.", info: "Shell commands run with your current user privileges. Read the command below carefully before approving." },
     launch:            { sub: "The model wants to launch a program.",                       info: "This starts the program with your user privileges. Once running, it can do anything you can do." },
@@ -6361,6 +6363,19 @@
       return buildCall("write_file", [
         ["path", q(d.path || "")],
         ["content", `<${(d.bytes || 0).toLocaleString()} bytes>`],
+      ]);
+    }
+    if (kind === "codex_file_change") {
+      const paths = Array.isArray(d.paths) && d.paths.length ? d.paths : [d.path || ""];
+      return buildCall("codex_write", [
+        ["paths", q(paths.join(", "))],
+        ["workspace", q(d.workspace || "")],
+      ]);
+    }
+    if (kind === "codex_shell") {
+      return buildCall("codex_shell", [
+        ["command", q(d.command || a.command || "")],
+        ["cwd", q(d.cwd || "")],
       ]);
     }
     if (kind === "edit_file") {
@@ -7298,13 +7313,19 @@
       const wsBit = ws.cwd
         ? `workspace: ${ws.cwd}`
         : (ws.displayLabel || "no workspace bound");
+      const mode = (state.settings && state.settings.codex_write_mode) || "ask";
+      const modeBit = mode === "chat_only"
+        ? "Codex writes: chat only (native writes declined)"
+        : mode === "workspace_auto"
+          ? "Codex writes: auto-allow inside workspace"
+          : "Codex writes: ask before every write";
       meta.textContent = [
         cx.installed ? "CLI detected" : "CLI not detected",
         version,
         cx.available ? "provider available" : "provider unavailable",
         proc,
         wsBit,
-        "Codex actions: advisory chat-only (native writes/shell declined)",
+        modeBit,
       ].filter(Boolean).join(" · ");
     }
     if (status) {
@@ -8492,6 +8513,12 @@
     refreshDesktopStatus();
     // memories panel
     loadMemories();
+
+    const codexWriteSel = $("#set-codex-write-mode");
+    if (codexWriteSel) {
+      const mode = s.codex_write_mode || "ask";
+      codexWriteSel.value = ["chat_only", "ask", "workspace_auto"].includes(mode) ? mode : "ask";
+    }
   }
 
   async function refreshDesktopStatus() {
@@ -8574,6 +8601,7 @@
       desktop_max_actions_per_minute: Math.max(1, Math.min(300, n("#set-desktop-rate") || 30)),
       use_tailwind_cdn: !!state.settings.use_tailwind_cdn,
       ide_multifile: !!state.settings.ide_multifile,
+      codex_write_mode: ($("#set-codex-write-mode")?.value || state.settings.codex_write_mode || "ask"),
     };
 
     // Detect which load-time keys actually changed → triggers a llama-server
@@ -10033,6 +10061,25 @@
     $("#btn-codex-open-verify")?.addEventListener("click", (ev) => {
       const href = $("#btn-codex-open-verify")?.getAttribute("href");
       if (!href || href === "#") ev.preventDefault();
+    });
+    $("#set-codex-write-mode")?.addEventListener("change", async () => {
+      const sel = $("#set-codex-write-mode");
+      const mode = sel?.value || "ask";
+      try {
+        await saveSettings({ codex_write_mode: mode });
+        toast(
+          mode === "chat_only"
+            ? "Codex writes: chat only"
+            : mode === "workspace_auto"
+              ? "Codex writes: auto-allow inside workspace"
+              : "Codex writes: ask before every write",
+          "ok",
+          2200
+        );
+        populateCodexAuthForm({ live: false });
+      } catch (err) {
+        toast("Could not save Codex write mode: " + (err.message || err), "error");
+      }
     });
     $("#set-provider")?.addEventListener("change", () => {
       // CRITICAL: do not call populateProviderForm() here. Rebuilding the

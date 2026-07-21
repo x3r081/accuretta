@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from codex.approvals import WRITE_MODE_ASK, WRITE_MODE_CHAT_ONLY, sandbox_for_write_mode
 from codex.discover import reset_discovery_cache
 from codex.flags import ENV_CODEX_INFERENCE_ENABLED
 from codex.protocol import build_thread_start_params
@@ -70,14 +71,17 @@ class CodexWorkspaceValidationTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_active_workspace_accepted(self):
-        r = validate_codex_cwd(str(self.ws), allowed_roots=[str(self.ws)])
+        with mock.patch(
+            "providers.codex_workspace.get_codex_write_mode",
+            return_value=WRITE_MODE_ASK,
+        ):
+            r = validate_codex_cwd(str(self.ws), allowed_roots=[str(self.ws)])
         self.assertTrue(r.ok)
         self.assertEqual(Path(r.cwd), self.ws.resolve())
-        self.assertFalse(r.coding_actions_allowed)
-        self.assertEqual(r.mode, "advisory_chat_only")
+        self.assertTrue(r.coding_actions_allowed)
+        self.assertEqual(r.mode, WRITE_MODE_ASK)
 
     def test_no_workspace_blocks_coding_safely(self):
-        r = resolve_codex_workspace()
         with mock.patch(
             "providers.codex_workspace._accuretta_workspace_folders",
             return_value=[],
@@ -121,24 +125,26 @@ class CodexWorkspaceValidationTest(unittest.TestCase):
         self.assertNotEqual(ra.cwd, rb.cwd)
         self.assertNotEqual(get_bound_codex_cwd("a"), get_bound_codex_cwd("b"))
 
-    def test_thread_start_forces_read_only_sandbox(self):
+    def test_thread_start_never_allows_danger_full_access(self):
         params = build_thread_start_params(
             cwd=str(self.ws),
             sandbox="danger-full-access",
             approval_policy="never",
         )
-        self.assertEqual(params["sandbox"], "read-only")
+        self.assertEqual(params["sandbox"], "workspace-write")
         self.assertEqual(params["cwd"], str(self.ws))
-        # approval policy may remain on-request when invalid "never" for our allowlist —
-        # we allow "never" in the set; force read-only sandbox is the critical bit.
         self.assertIn(params["approvalPolicy"], {"on-request", "never"})
 
-    def test_docs_describe_advisory_mode(self):
+    def test_chat_only_sandbox_is_read_only(self):
+        self.assertEqual(sandbox_for_write_mode(WRITE_MODE_CHAT_ONLY), "read-only")
+        params = build_thread_start_params(sandbox="read-only")
+        self.assertEqual(params["sandbox"], "read-only")
+
+    def test_docs_describe_write_modes(self):
         doc = (ROOT / "docs" / "codex-workspace-security.md").read_text(encoding="utf-8")
-        self.assertIn("advisory", doc.lower())
-        self.assertIn("declined", doc.lower())
-        self.assertIn("read-only", doc.lower())
-        self.assertIn("never", doc.lower())  # home/root / unrestricted guidance
+        self.assertIn("codex_write_mode", doc)
+        self.assertIn("workspace-write", doc.lower())
+        self.assertIn("never", doc.lower())
 
 
 class CodexWorkspaceIntegrationTest(unittest.TestCase):
@@ -191,6 +197,12 @@ class CodexWorkspaceIntegrationTest(unittest.TestCase):
             "providers.codex_workspace._accuretta_workspace_folders",
             return_value=[str(self.ws.resolve())],
         ), mock.patch(
+            "codex.inference.get_codex_write_mode",
+            return_value=WRITE_MODE_ASK,
+        ), mock.patch(
+            "codex.approvals.get_codex_write_mode",
+            return_value=WRITE_MODE_ASK,
+        ), mock.patch(
             "codex.inference.build_thread_start_params",
             side_effect=tracking,
         ):
@@ -206,24 +218,24 @@ class CodexWorkspaceIntegrationTest(unittest.TestCase):
                 )
             )
         self.assertEqual(Path(captured.get("cwd")), self.ws.resolve())
-        self.assertEqual(captured.get("sandbox"), "read-only")
+        self.assertEqual(captured.get("sandbox"), "workspace-write")
         self.assertTrue(get_bound_codex_cwd("chat-ws"))
         self.assertTrue(get_bound_codex_thread("chat-ws"))
 
-    def test_approvals_remain_declined(self):
-        src = (ROOT / "codex" / "inference.py").read_text(encoding="utf-8")
-        self.assertIn("item/fileChange/requestApproval", src)
-        self.assertIn("item/commandExecution/requestApproval", src)
-        self.assertIn('"decision": "decline"', src)
-        # No Accuretta write bridge from Codex approvals.
-        self.assertNotIn("request_approval", src)
+    def test_chat_only_still_declines_in_source_contract(self):
+        src = (ROOT / "codex" / "approvals.py").read_text(encoding="utf-8")
+        self.assertIn("WRITE_MODE_CHAT_ONLY", src)
+        self.assertIn('return {"decision": "decline"}', src)
+        inf = (ROOT / "codex" / "inference.py").read_text(encoding="utf-8")
+        self.assertIn("decide_file_change", inf)
+        self.assertIn("request_approval", inf)
 
     def test_no_unrestricted_write_introduced(self):
-        ws_src = (ROOT / "providers" / "codex_workspace.py").read_text(encoding="utf-8")
-        self.assertIn("coding_actions_allowed: bool = False", ws_src)
-        self.assertIn("advisory_chat_only", ws_src)
         proto = (ROOT / "codex" / "protocol.py").read_text(encoding="utf-8")
-        self.assertIn('sandbox_val = "read-only"', proto)
+        self.assertIn('sandbox_val = "workspace-write"', proto)
+        self.assertIn("danger-full-access", proto)
+        # Must never leave danger-full-access unclamped.
+        self.assertIn('if sandbox_val == "danger-full-access"', proto)
 
 
 if __name__ == "__main__":

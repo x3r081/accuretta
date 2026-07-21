@@ -71,7 +71,8 @@ It opens the model stream through `open_provider_chat_stream`:
 
 Tool definitions use the existing Accuretta OpenAI-compatible tool schema for
 local/OpenAI. Codex turns do **not** use Accuretta tools; Codex native
-file/shell approvals are declined (advisory chat-only).
+file/shell actions follow Settings → **Codex write access** (`codex_write_mode`:
+chat only / ask / workspace auto). Writes outside the workspace are always declined.
 
 Cancellation closes the active stream and uses `/api/cancel` (Codex →
 `turn/interrupt` for the owned turn).
@@ -139,7 +140,7 @@ pending device session. OpenAI / local credentials are untouched.
 - **API mode:** `codex_app_server` (stdio JSON-RPC)
 - **inference:** capability-gated (`ACCURETTA_CODEX_INFERENCE_ENABLED`); Settings-selectable when ready
 - **workspace:** official `thread/start` `cwd` only — see [codex-workspace-security.md](./codex-workspace-security.md)
-- **tools / writes:** Codex native file/shell approvals are **declined** (advisory chat-only). Accuretta’s local approval gates are unchanged and are not bypassed.
+- **tools / writes:** Codex native file/shell actions follow `codex_write_mode` (default: ask before every write). Paths outside the Accuretta workspace are always declined. Shell still requires approval. Accuretta’s local tool approval gates are unchanged.
 
 ### Authentication vs inference
 
@@ -250,7 +251,7 @@ credentials.
 ### Current limitations (verified / claimed)
 
 - Inference is **experimental** and **off by default**
-- Codex turns are **advisory chat-only** (native writes/shell declined)
+- Codex native writes follow `codex_write_mode` (never outside workspace; shell still prompts)
 - No claim of support for Codex CLI versions other than those tested (`0.144.6`)
 - Packaged `.app` / PyInstaller builds are not a separate verified ship artifact
   for Codex PATH beyond launcher PATH extension + `ACCURETTA_CODEX_BIN`
